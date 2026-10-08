@@ -1,6 +1,11 @@
 #include "common.h"
 #include "dequantize.h"
 
+#if defined(GGML_METAL_HAS_TENSOR) && __ENVIRONMENT_OS_VERSION_MIN_REQUIRED__ >= 260200
+// the NAX kernels (nax_mma) need the cooperative tensor layout of OS 26.2+: the host uses them only if this kernel exists
+kernel void kernel_nax_ok() {}
+#endif
+
 constant bool FC_mul_mm_bc_inp [[function_constant(FC_MUL_MM + 0)]];
 constant bool FC_mul_mm_bc_out [[function_constant(FC_MUL_MM + 1)]];
 constant short FC_mul_mm_ne12  [[function_constant(FC_MUL_MM + 2)]];

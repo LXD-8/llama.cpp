@@ -126,6 +126,7 @@
 #define FC_LIGHTNING_INDEXER           2200
 #define FC_MUL_MV_MMA                  2300
 #define FC_TOP_K_MASK                  2400
+#define FC_FLASH_ATTN_EXT_NAX          2500
 
 // op-specific constants
 #define OP_FLASH_ATTN_EXT_NQPSG 8
@@ -135,6 +136,10 @@
 #define OP_FLASH_ATTN_EXT_TENSOR_NQPSG_LARGE 16
 #define OP_FLASH_ATTN_EXT_TENSOR_NCPSG       64
 #define OP_FLASH_ATTN_EXT_TENSOR_NSG         8
+
+// register-resident NAX kernel: 16 queries per row group, head dim split across WN simdgroups
+#define OP_FLASH_ATTN_EXT_NAX_NQPSG 64
+#define OP_FLASH_ATTN_EXT_NAX_NCPSG 32
 
 #define OP_FLASH_ATTN_EXT_VEC_NQPSG 1
 #define OP_FLASH_ATTN_EXT_VEC_NCPSG 32

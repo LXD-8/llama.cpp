@@ -102,6 +102,8 @@ ggml_metal_library_t ggml_metal_library_init_from_source(ggml_metal_device_t dev
 
 void ggml_metal_library_free(ggml_metal_library_t lib);
 
+bool ggml_metal_library_has_function(ggml_metal_library_t lib, const char * name);
+
 ggml_metal_device_t ggml_metal_library_get_device(ggml_metal_library_t lib);
 
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline    (ggml_metal_library_t lib, const char * name);
@@ -206,6 +208,12 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_att
         bool has_bias,
         bool has_scap);
 
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_nax(
+        ggml_metal_library_t lib,
+        const struct ggml_tensor * op,
+        bool has_mask,
+        bool has_sinks);
+
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
         ggml_metal_library_t lib,
         const struct ggml_tensor * op,
@@ -303,6 +311,7 @@ struct ggml_metal_device_props {
     bool has_unified_memory;
     bool has_bfloat;
     bool has_tensor;
+    bool has_nax;
     bool use_residency_sets;
     bool use_shared_buffers;
 
