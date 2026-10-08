@@ -907,6 +907,8 @@ int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+static bool ggml_metal_op_mul_mat_use_f16_act(const ggml_tensor * op, bool has_tensor);
+
 int ggml_metal_op_glu(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -2731,7 +2733,53 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         //    default: break;
         //}
 
-        auto pipeline = ggml_metal_library_get_pipeline_mul_mm(lib, op);
+        ggml_metal_buffer_id bid_src1 = ggml_metal_get_buffer_id(op->src[1]);
+
+        uint64_t nb10_mm = nb10;
+        uint64_t nb11_mm = nb11;
+        uint64_t nb12_mm = nb12;
+        uint64_t nb13_mm = nb13;
+
+        const bool use_f16_act = ggml_metal_op_mul_mat_use_f16_act(op, props_dev->has_tensor);
+
+        if (use_f16_act) {
+            ggml_metal_buffer_id bid_act = ggml_metal_get_buffer_id(op);
+            bid_act.offs += ggml_nbytes(op);
+
+            ggml_metal_kargs_mul_mm_cvt args_cvt = {
+                /*.ne10 =*/ ne10,
+                /*.ne11 =*/ ne11,
+                /*.ne12 =*/ ne12,
+                /*.nb11 =*/ nb11,
+                /*.nb12 =*/ nb12,
+                /*.nb13 =*/ nb13,
+            };
+
+            auto pipeline_cvt = ggml_metal_library_get_pipeline_by_name(lib, "kernel_mul_mm_cvt_f32_f16");
+
+            // the extra buffer is not covered by the concurrency tracking
+            ggml_metal_op_concurrency_reset(ctx);
+
+            ggml_metal_encoder_set_pipeline(enc, pipeline_cvt);
+            ggml_metal_encoder_set_bytes   (enc, &args_cvt, sizeof(args_cvt), 0);
+            ggml_metal_encoder_set_buffer  (enc, bid_src1, 1);
+            ggml_metal_encoder_set_buffer  (enc, bid_act,  2);
+
+            const int nth = std::max(1, std::min(256, ne10/4));
+
+            ggml_metal_encoder_dispatch_threadgroups(enc, ne11, ne12, ne13, nth, 1, 1);
+
+            ggml_metal_op_concurrency_reset(ctx);
+
+            bid_src1 = bid_act;
+
+            nb10_mm = sizeof(ggml_fp16_t);
+            nb11_mm = nb10_mm*ne10;
+            nb12_mm = nb11_mm*ne11;
+            nb13_mm = nb12_mm*ne12;
+        }
+
+        auto pipeline = ggml_metal_library_get_pipeline_mul_mm_t1(lib, op, use_f16_act ? GGML_TYPE_F16 : op->src[1]->type);
 
         ggml_metal_kargs_mul_mm args = {
             /*.ne00 =*/ ne00,
@@ -2740,10 +2788,10 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
             /*.nb02 =*/ nb02,
             /*.nb03 =*/ nb03,
             /*.ne12 =*/ ne12,
-            /*.nb10 =*/ nb10,
-            /*.nb11 =*/ nb11,
-            /*.nb12 =*/ nb12,
-            /*.nb13 =*/ nb13,
+            /*.nb10 =*/ nb10_mm,
+            /*.nb11 =*/ nb11_mm,
+            /*.nb12 =*/ nb12_mm,
+            /*.nb13 =*/ nb13_mm,
             /*.ne0  =*/ ne0,
             /*.ne1  =*/ ne1,
             /*.r2   =*/ r2,
@@ -2753,7 +2801,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_pipeline(enc, pipeline);
         ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
-        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+        ggml_metal_encoder_set_buffer  (enc, bid_src1, 2);
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
 
         const size_t smem = pipeline.smem;
@@ -2783,6 +2831,40 @@ static int64_t ggml_metal_op_mul_mat_id_max_tiles(const ggml_tensor * op) {
     const int64_t tiles  = (n_rows + 31)/32 + (ne02 < n_rows ? ne02 : n_rows) - 1;
 
     return n_rows < tiles ? n_rows : tiles;
+}
+
+// the tensor mul_mm kernels are ~1.25x faster with half activations than with f32 ones (M5, Q4_K and Q8_0 prefill
+// shapes), so f32 activations are converted to f16 into the extra buffer first
+// GGML_METAL_MM_F16_ACT_DISABLE turns this off for comparisons
+static bool ggml_metal_op_mul_mat_f16_act_shape(const ggml_tensor * op) {
+    const ggml_tensor * src1 = op->src[1];
+
+    return src1->type == GGML_TYPE_F32 &&
+           op->src[0]->type != GGML_TYPE_F32 && op->src[0]->type != GGML_TYPE_BF16 &&
+           src1->ne[0] % 4 == 0 && src1->nb[0] == sizeof(float) &&
+           src1->nb[1] % 16 == 0 && src1->nb[2] % 16 == 0 && src1->nb[3] % 16 == 0 &&
+           ggml_metal_op_mul_mat_use_mm(op, true);
+}
+
+static bool ggml_metal_op_mul_mat_use_f16_act(const ggml_tensor * op, bool has_tensor) {
+    static const bool disabled = getenv("GGML_METAL_MM_F16_ACT_DISABLE") != nullptr; // read once per process
+
+    return has_tensor && !disabled && ggml_metal_op_mul_mat_f16_act_shape(op) &&
+           ((uintptr_t) op->src[1]->data) % 16 == 0;
+}
+
+// the extra buffer is only reserved for ops that can actually use it - the check above is a subset of this one,
+// so a conversion that runs always finds the buffer allocated
+size_t ggml_metal_op_mul_mat_extra_f16_act(const ggml_tensor * op, bool has_tensor) {
+    static const bool disabled = getenv("GGML_METAL_MM_F16_ACT_DISABLE") != nullptr; // read once per process
+
+    assert(op->op == GGML_OP_MUL_MAT);
+
+    if (disabled || !has_tensor || !ggml_metal_op_mul_mat_f16_act_shape(op)) {
+        return 0;
+    }
+
+    return GGML_PAD(ggml_nelements(op->src[1])*sizeof(ggml_fp16_t), 32);
 }
 
 size_t ggml_metal_op_mul_mat_id_extra_tpe(const ggml_tensor * op) {
