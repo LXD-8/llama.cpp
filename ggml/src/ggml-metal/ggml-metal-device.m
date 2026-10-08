@@ -197,6 +197,20 @@ static void ggml_metal_library_build_index(ggml_metal_library_t lib) {
     }
 }
 
+bool ggml_metal_library_has_function(ggml_metal_library_t lib, const char * name) {
+    @autoreleasepool {
+        NSString * fn = [NSString stringWithUTF8String:name];
+
+        if (lib->override_fns && [lib->override_fns containsObject:fn]) {
+            return true;
+        }
+        if (!lib->single_library) {
+            return lib->fn_to_lib[fn] != nil;
+        }
+        return [[lib->objs[0] functionNames] containsObject:fn];
+    }
+}
+
 // note: defined below, after struct ggml_metal_device
 static void ggml_metal_device_disable_tensor(ggml_metal_device_t dev);
 
@@ -1313,6 +1327,8 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
                     GGML_LOG_ERROR("%s: error: failed to create library\n", __func__);
                 }
 
+                dev->props.has_nax = dev->props.has_tensor && dev->library && ggml_metal_library_has_function(dev->library, "kernel_nax_ok");
+
                 if (dev->props.use_residency_sets) {
                     dev->rsets = ggml_metal_rsets_init(dev);
                 } else {
@@ -1356,6 +1372,7 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
                 GGML_LOG_INFO("%s: has unified memory    = %s\n", __func__, dev->props.has_unified_memory      ? "true" : "false");
                 GGML_LOG_INFO("%s: has bfloat            = %s\n", __func__, dev->props.has_bfloat              ? "true" : "false");
                 GGML_LOG_INFO("%s: has tensor            = %s\n", __func__, dev->props.has_tensor              ? "true" : "false");
+                GGML_LOG_INFO("%s: has nax               = %s\n", __func__, dev->props.has_nax                 ? "true" : "false");
                 GGML_LOG_INFO("%s: use residency sets    = %s\n", __func__, dev->props.use_residency_sets      ? "true" : "false");
                 GGML_LOG_INFO("%s: use shared buffers    = %s\n", __func__, dev->props.use_shared_buffers      ? "true" : "false");
 
