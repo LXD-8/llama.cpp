@@ -921,12 +921,27 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_mma(ggml_
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_cvt(ggml_metal_library_t lib) {
+    const char * name = "kernel_mul_mm_cvt_f32_f16";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_metal_library_t lib, const ggml_tensor * op) {
+    return ggml_metal_library_get_pipeline_mul_mm_t1(lib, op, op->src[1]->type);
+}
+
+// tsrc1 is the type the kernel reads src1 as - it differs from src1 when the activations were converted beforehand
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_t1(ggml_metal_library_t lib, const ggml_tensor * op, ggml_type tsrc1) {
     char base[256];
     char name[256];
 
     const ggml_type tsrc0 = op->src[0]->type;
-    const ggml_type tsrc1 = op->src[1]->type;
 
     const bool bc_inp = op->src[0]->ne[0] % 32 != 0;
 
