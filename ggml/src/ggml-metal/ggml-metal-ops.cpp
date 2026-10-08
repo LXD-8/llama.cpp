@@ -3173,6 +3173,38 @@ static bool ggml_metal_op_flash_attn_ext_use_tensor(const ggml_tensor * op, bool
     return op->src[1]->ne[1] % OP_FLASH_ATTN_EXT_TENSOR_NCPSG == 0;
 }
 
+// the register-resident NAX kernel covers the tensor kernel for equal K/V head sizes of 64, 128, 256 or 512, with or
+// without sinks, and no ALiBi or softcap. GGML_METAL_FA_NAX_DISABLE turns it off for comparisons
+static bool ggml_metal_op_flash_attn_ext_use_nax(const ggml_tensor * op) {
+    assert(op->op == GGML_OP_FLASH_ATTN_EXT);
+
+    static const bool disabled = getenv("GGML_METAL_FA_NAX_DISABLE") != nullptr;
+    if (disabled) {
+        return false;
+    }
+
+    const int64_t dk = op->src[1]->ne[0];
+    const int64_t dv = op->src[2]->ne[0];
+
+    if (dk != dv || (dk != 64 && dk != 128 && dk != 256 && dk != 512)) {
+        return false;
+    }
+
+    // f16 K/V only (or converted to f16): the BF16 cache takes the tensor kernel
+    if (op->src[1]->type == GGML_TYPE_BF16) {
+        return false;
+    }
+
+    float max_bias;
+    float logit_softcap;
+
+    memcpy(&max_bias,      ((const int32_t *) op->op_params) + 1, sizeof(float));
+    memcpy(&logit_softcap, ((const int32_t *) op->op_params) + 2, sizeof(float));
+
+    return max_bias == 0.0f && logit_softcap == 0.0f &&
+           op->src[1]->ne[1] % OP_FLASH_ATTN_EXT_NAX_NCPSG == 0;
+}
+
 // returns the n_kv_max hint if the sparse path is available for this op, or 0 otherwise
 // the mask (src[3]) remains the single source of truth: finite entries are the valid KV positions,
 // n_kv_max is only an upper bound on their number per mask row, used to size the index lists
@@ -3344,10 +3376,16 @@ size_t ggml_metal_op_flash_attn_ext_extra_blk(const ggml_tensor * op) {
     const int nqptg = is_vec ? OP_FLASH_ATTN_EXT_VEC_NQPSG : OP_FLASH_ATTN_EXT_NQPSG;
     const int ncpsg = is_vec ? OP_FLASH_ATTN_EXT_VEC_NCPSG : OP_FLASH_ATTN_EXT_NCPSG;
 
-    const int64_t ne1 = (ne01 + nqptg - 1)/nqptg;
-    const int64_t ne0 = (ne30 + ncpsg - 1)/ncpsg;
+    // the tensor kernels use their own block shapes - reserve for the largest
+    auto nblk_count = [&](int64_t q, int64_t c) {
+        return ((ne01 + q - 1)/q)*((ne30 + c - 1)/c);
+    };
 
-    res += GGML_PAD(ggml_type_size(GGML_TYPE_I8)*ne0*ne1*ne32*ne33, 32);
+    const int64_t nblk = std::max({nblk_count(nqptg, ncpsg),
+                                   nblk_count(OP_FLASH_ATTN_EXT_TENSOR_NQPSG_LARGE, OP_FLASH_ATTN_EXT_TENSOR_NCPSG),
+                                   nblk_count(OP_FLASH_ATTN_EXT_NAX_NQPSG, OP_FLASH_ATTN_EXT_NAX_NCPSG)});
+
+    res += GGML_PAD(ggml_type_size(GGML_TYPE_I8)*nblk*ne32*ne33, 32);
 
     return res;
 }
@@ -3612,9 +3650,17 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
 
     if (!use_sparse && ggml_metal_op_flash_attn_ext_use_tensor(op, props_dev->has_tensor)) {
         // tensor API kernel
-        const int nqptg = ne00 >= 512 ? OP_FLASH_ATTN_EXT_TENSOR_NQPSG_LARGE : OP_FLASH_ATTN_EXT_TENSOR_NQPSG; // queries per threadgroup
-        const int ncpsg = OP_FLASH_ATTN_EXT_TENSOR_NCPSG; // cache values per threadgroup
-        const int nsg   = OP_FLASH_ATTN_EXT_TENSOR_NSG;
+        const bool use_nax = ggml_metal_op_flash_attn_ext_use_nax(op);
+
+        // queries per threadgroup
+        const int nqptg = use_nax ? OP_FLASH_ATTN_EXT_NAX_NQPSG :
+                          ne00 >= 512 ? OP_FLASH_ATTN_EXT_TENSOR_NQPSG_LARGE : OP_FLASH_ATTN_EXT_TENSOR_NQPSG;
+        // cache values per threadgroup
+        const int ncpsg = use_nax ? OP_FLASH_ATTN_EXT_NAX_NCPSG : OP_FLASH_ATTN_EXT_TENSOR_NCPSG;
+
+        // the NAX kernel splits the head dim across nwn simdgroups, with 4 groups of 16 queries
+        const int nwn = use_nax ? std::max(1, (int) (ne00/128)) : 0;
+        const int nsg = use_nax ? 4*nwn : OP_FLASH_ATTN_EXT_TENSOR_NSG; // number of simdgroups
 
         if (has_mask) {
             assert(ggml_metal_op_flash_attn_ext_extra_blk(op) != 0);
@@ -3684,9 +3730,14 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         };
 
         // shared memory layout: queries (16-bit), scores (float), probabilities (16-bit), row scale (float), rescale flag (int)
-        const size_t smem = GGML_PAD(nqptg*ne00*sizeof(ggml_fp16_t) + nqptg*ncpsg*(sizeof(float) + sizeof(ggml_fp16_t)) + nqptg*sizeof(float) + sizeof(int32_t), 16);
+        // NAX: the partial scores of every simdgroup, one float per lane and fragment element
+        const size_t smem = use_nax ? (size_t) nsg*(ncpsg/16)*8*32*sizeof(float) :
+            GGML_PAD(nqptg*ne00*sizeof(ggml_fp16_t) + nqptg*ncpsg*(sizeof(float) + sizeof(ggml_fp16_t)) +
+                     nqptg*sizeof(float) + sizeof(int32_t), 16);
 
-        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_tensor(lib, op, has_mask, has_sinks, has_bias, has_scap);
+        auto pipeline = use_nax ?
+            ggml_metal_library_get_pipeline_flash_attn_ext_nax(lib, op, has_mask, has_sinks) :
+            ggml_metal_library_get_pipeline_flash_attn_ext_tensor(lib, op, has_mask, has_sinks, has_bias, has_scap);
 
         GGML_ASSERT(nsg*32 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
         GGML_ASSERT(smem <= props_dev->max_theadgroup_memory_size);
