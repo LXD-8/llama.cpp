@@ -14,6 +14,27 @@ constant short FC_mul_mm_r2    [[function_constant(FC_MUL_MM + 4)]];
 constant short FC_mul_mm_r3    [[function_constant(FC_MUL_MM + 5)]];
 constant int32_t FC_mul_mm_id_map0_ne02 [[function_constant(FC_MUL_MM + 7)]];
 
+// converts the f32 activations of a mul_mm to contiguous f16 rows, so that the tensor kernels take half operands
+// values are saturated to the half range - the simdgroup kernels round the activations to half as well
+kernel void kernel_mul_mm_cvt_f32_f16(
+        constant ggml_metal_kargs_mul_mm_cvt & args,
+        device const char * src1,
+        device       half * dst,
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tpitg [[thread_index_in_threadgroup]],
+        ushort3 ntg  [[threads_per_threadgroup]]) {
+    const int i1 = tgpig.x;
+    const int i2 = tgpig.y;
+    const int i3 = tgpig.z;
+
+    device const float4 * s = (device const float4 *) (src1 + i1*args.nb11 + i2*args.nb12 + i3*args.nb13);
+    device       half4  * d = (device       half4  *) (dst + (((uint64_t) i3*args.ne12 + i2)*args.ne11 + i1)*args.ne10);
+
+    for (int i = tpitg; i < args.ne10/4; i += ntg.x) {
+        d[i] = (half4) clamp(s[i], -65504.0f, 65504.0f);
+    }
+}
+
 // each block_q contains 16*nl weights
 #ifdef GGML_METAL_HAS_TENSOR
 template<
