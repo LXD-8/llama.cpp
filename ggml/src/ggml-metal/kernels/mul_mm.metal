@@ -31,6 +31,233 @@ kernel void kernel_mul_mm_cvt_f32_f16(
     }
 }
 
+#ifdef GGML_METAL_HAS_TENSOR
+// dequantizes a whole src0 matrix to contiguous f16 rows, one threadgroup per row
+template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread half4x4 &)>
+kernel void kernel_mul_mm_dq_f16(
+        constant ggml_metal_kargs_mul_mm_dq & args,
+        device const char * src0,
+        device       half * dst,
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tpitg [[thread_index_in_threadgroup]],
+        ushort3 ntg  [[threads_per_threadgroup]]) {
+    const int i01 = tgpig.x;
+
+    device const block_q * x = (device const block_q *) (src0 + i01*args.nb01);
+    device       half4x4 * d = (device       half4x4 *) (dst + (uint64_t) i01*args.ne00);
+
+    for (int i = tpitg; i < args.ne00/16; i += ntg.x) {
+        half4x4 t;
+        dequantize_func(x + i/nl, i%nl, t);
+        d[i] = t;
+    }
+}
+
+typedef decltype(kernel_mul_mm_dq_f16<block_q4_K, QK_NL, dequantize_q4_K>) mul_mm_dq_t;
+
+template [[host_name("kernel_mul_mm_dq_q4_0_f16")]] kernel mul_mm_dq_t kernel_mul_mm_dq_f16<block_q4_0, 2,     dequantize_q4_0>;
+template [[host_name("kernel_mul_mm_dq_q4_1_f16")]] kernel mul_mm_dq_t kernel_mul_mm_dq_f16<block_q4_1, 2,     dequantize_q4_1>;
+template [[host_name("kernel_mul_mm_dq_q5_0_f16")]] kernel mul_mm_dq_t kernel_mul_mm_dq_f16<block_q5_0, 2,     dequantize_q5_0>;
+template [[host_name("kernel_mul_mm_dq_q5_1_f16")]] kernel mul_mm_dq_t kernel_mul_mm_dq_f16<block_q5_1, 2,     dequantize_q5_1>;
+template [[host_name("kernel_mul_mm_dq_q8_0_f16")]] kernel mul_mm_dq_t kernel_mul_mm_dq_f16<block_q8_0, 2,     dequantize_q8_0>;
+template [[host_name("kernel_mul_mm_dq_q4_K_f16")]] kernel mul_mm_dq_t kernel_mul_mm_dq_f16<block_q4_K, QK_NL, dequantize_q4_K>;
+template [[host_name("kernel_mul_mm_dq_q5_K_f16")]] kernel mul_mm_dq_t kernel_mul_mm_dq_f16<block_q5_K, QK_NL, dequantize_q5_K>;
+template [[host_name("kernel_mul_mm_dq_q6_K_f16")]] kernel mul_mm_dq_t kernel_mul_mm_dq_f16<block_q6_K, QK_NL, dequantize_q6_K>;
+template [[host_name("kernel_mul_mm_dq_q1_0_f16")]] kernel mul_mm_dq_t kernel_mul_mm_dq_f16<block_q1_0, 8, dequantize_q1_0>;
+template [[host_name("kernel_mul_mm_dq_q2_0_f16")]] kernel mul_mm_dq_t kernel_mul_mm_dq_f16<block_q2_0, 4, dequantize_q2_0>;
+template [[host_name("kernel_mul_mm_dq_mxfp4_f16")]] kernel mul_mm_dq_t kernel_mul_mm_dq_f16<block_mxfp4, 2, dequantize_mxfp4>;
+template [[host_name("kernel_mul_mm_dq_q2_K_f16")]] kernel mul_mm_dq_t kernel_mul_mm_dq_f16<block_q2_K, QK_NL, dequantize_q2_K>;
+template [[host_name("kernel_mul_mm_dq_q3_K_f16")]] kernel mul_mm_dq_t kernel_mul_mm_dq_f16<block_q3_K, QK_NL, dequantize_q3_K>;
+template [[host_name("kernel_mul_mm_dq_iq2_xxs_f16")]] kernel mul_mm_dq_t kernel_mul_mm_dq_f16<block_iq2_xxs, QK_NL, dequantize_iq2_xxs>;
+template [[host_name("kernel_mul_mm_dq_iq2_xs_f16")]] kernel mul_mm_dq_t kernel_mul_mm_dq_f16<block_iq2_xs, QK_NL, dequantize_iq2_xs>;
+template [[host_name("kernel_mul_mm_dq_iq2_s_f16")]] kernel mul_mm_dq_t kernel_mul_mm_dq_f16<block_iq2_s, QK_NL, dequantize_iq2_s>;
+template [[host_name("kernel_mul_mm_dq_iq3_xxs_f16")]] kernel mul_mm_dq_t kernel_mul_mm_dq_f16<block_iq3_xxs, QK_NL, dequantize_iq3_xxs>;
+template [[host_name("kernel_mul_mm_dq_iq3_s_f16")]] kernel mul_mm_dq_t kernel_mul_mm_dq_f16<block_iq3_s, QK_NL, dequantize_iq3_s>;
+template [[host_name("kernel_mul_mm_dq_iq1_s_f16")]] kernel mul_mm_dq_t kernel_mul_mm_dq_f16<block_iq1_s, QK_NL, dequantize_iq1_s>;
+template [[host_name("kernel_mul_mm_dq_iq1_m_f16")]] kernel mul_mm_dq_t kernel_mul_mm_dq_f16<block_iq1_m, QK_NL, dequantize_iq1_m>;
+template [[host_name("kernel_mul_mm_dq_iq4_nl_f16")]] kernel mul_mm_dq_t kernel_mul_mm_dq_f16<block_iq4_nl, 2, dequantize_iq4_nl>;
+template [[host_name("kernel_mul_mm_dq_iq4_xs_f16")]] kernel mul_mm_dq_t kernel_mul_mm_dq_f16<block_iq4_xs, QK_NL, dequantize_iq4_xs>;
+template [[host_name("kernel_mul_mm_dq_tq2_0_f16")]] kernel mul_mm_dq_t kernel_mul_mm_dq_f16<block_tq2_0, QK_NL, dequantize_tq2_0>;
+
+static inline short2 mm_nax_coord(ushort lane) {
+    const short qid = lane >> 2;
+    const short fm  = (qid & 4) | ((lane >> 1) & 3);
+    const short fn  = ((qid & 2) | (lane & 1))*4;
+    return short2(fn, fm);
+}
+
+// C[16x32] += A[16x16] * B^T, with B given as two 16x16 fragments of rows along N
+static inline void mm_nax_mma(
+        thread vec<float, 8> & c0, thread vec<float, 8> & c1,
+        thread const vec<half, 8> & a,
+        thread const vec<half, 8> & b0, thread const vec<half, 8> & b1) {
+    constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(16, 32, 16, false, true, true,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+
+    mpp::tensor_ops::matmul2d<desc, execution_simdgroup> op;
+
+    auto ca = op.template get_left_input_cooperative_tensor <half, half, float>();
+    auto cb = op.template get_right_input_cooperative_tensor<half, half, float>();
+    auto cc = op.template get_destination_cooperative_tensor<remove_addrspace_t<decltype(ca)>, remove_addrspace_t<decltype(cb)>, float>();
+
+    FOR_UNROLL (short i = 0; i < 8; ++i) {
+        ca[i]     = a[i];
+        cb[i]     = b0[i];
+        cb[8 + i] = b1[i];
+        cc[i]     = c0[i];
+        cc[8 + i] = c1[i];
+    }
+
+    op.run(ca, cb, cc);
+
+    FOR_UNROLL (short i = 0; i < 8; ++i) {
+        c0[i] = cc[i];
+        c1[i] = cc[8 + i];
+    }
+}
+
+// dst[m][n] = sum_k src1[m][k] * src0[n][k] with f16 operands and the operands loaded straight into registers
+// no threadgroup memory: the BM x BN tile is split across WM x WN simdgroups, each owning a (BM/WM) x (BN/WN) block
+// of 16x16 fragments; the threadgroups are swizzled so that neighbouring ones share src0 rows in the cache
+template<short BM, short BN, short WM, short WN>
+[[kernel, max_total_threads_per_threadgroup(WM*WN*32)]]
+void kernel_mul_mm_nax_f16(
+        constant ggml_metal_kargs_mul_mm_nax & args,
+        device const half  * src0,
+        device const half  * src1,
+        device       float * dst,
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    constexpr short SM = BM/WM;
+    constexpr short SN = BN/WN;
+    constexpr short TM = SM/16;
+    constexpr short TN = SN/16;
+    constexpr short TK = 2;      // 16-wide K fragments per step
+    constexpr short SK = TK*16;
+
+    static_assert(TN % 2 == 0, "src0 fragments are consumed in pairs");
+
+    const int tile_m = (tgpig.y << args.swz) + (tgpig.x & ((1 << args.swz) - 1));
+    const int tile_n = tgpig.x >> args.swz;
+
+    if (tile_m >= args.tiles_m || tile_n >= args.tiles_n) {
+        return;
+    }
+
+    const int m0 = tile_m*BM + SM*(sgitg/WN);
+    const int n0 = tile_n*BN + SN*(sgitg%WN);
+
+    const short2 sc = mm_nax_coord(tiisg);
+
+    // per-lane row pointers, clamped to the last row - rows past the end are computed but never stored
+    device const half * pa[TM][2];
+    device const half * pb[TN][2];
+
+    FOR_UNROLL (short mm = 0; mm < TM; ++mm) {
+        FOR_UNROLL (short i = 0; i < 2; ++i) {
+            const int r = min(m0 + mm*16 + sc.y + i*8, args.M - 1);
+            pa[mm][i] = src1 + (uint64_t) r*args.lda + sc.x;
+        }
+    }
+    FOR_UNROLL (short nn = 0; nn < TN; ++nn) {
+        FOR_UNROLL (short i = 0; i < 2; ++i) {
+            const int r = min(n0 + nn*16 + sc.y + i*8, args.N - 1);
+            pb[nn][i] = src0 + (uint64_t) r*args.ldb + sc.x;
+        }
+    }
+
+    vec<float, 8> c[TM][TN];
+    FOR_UNROLL (short mm = 0; mm < TM; ++mm) {
+        FOR_UNROLL (short nn = 0; nn < TN; ++nn) {
+            c[mm][nn] = 0.0f;
+        }
+    }
+
+    const int BK = args.bk;
+
+    #pragma clang loop unroll(disable)
+    for (int k0 = args.k_beg; k0 < args.k_end; k0 += BK) {
+    // keep the simdgroups of the threadgroup close together so that they hit the same cache lines
+    threadgroup_barrier(mem_flags::mem_none);
+
+    const int k1 = min(args.k_end, k0 + BK);
+
+    #pragma clang loop unroll(disable)
+    for (int k = k0; k < k1; k += SK) {
+        volatile int compiler_barrier;
+
+        vec<half, 8> a[TM][TK];
+        vec<half, 8> b[TN][TK];
+
+        FOR_UNROLL (short mm = 0; mm < TM; ++mm) {
+            FOR_UNROLL (short kk = 0; kk < TK; ++kk) {
+                FOR_UNROLL (short i = 0; i < 2; ++i) {
+                    const half4 v = *((device const half4 *) (pa[mm][i] + k + kk*16));
+                    a[mm][kk][i*4 + 0] = v[0];
+                    a[mm][kk][i*4 + 1] = v[1];
+                    a[mm][kk][i*4 + 2] = v[2];
+                    a[mm][kk][i*4 + 3] = v[3];
+                }
+            }
+        }
+        FOR_UNROLL (short nn = 0; nn < TN; ++nn) {
+            FOR_UNROLL (short kk = 0; kk < TK; ++kk) {
+                FOR_UNROLL (short i = 0; i < 2; ++i) {
+                    const half4 v = *((device const half4 *) (pb[nn][i] + k + kk*16));
+                    b[nn][kk][i*4 + 0] = v[0];
+                    b[nn][kk][i*4 + 1] = v[1];
+                    b[nn][kk][i*4 + 2] = v[2];
+                    b[nn][kk][i*4 + 3] = v[3];
+                }
+            }
+        }
+
+        FOR_UNROLL (short mm = 0; mm < TM; ++mm) {
+            FOR_UNROLL (short nn = 0; nn < TN; nn += 2) {
+                FOR_UNROLL (short kk = 0; kk < TK; ++kk) {
+                    mm_nax_mma(c[mm][nn], c[mm][nn + 1], a[mm][kk], b[nn][kk], b[nn + 1][kk]);
+                }
+            }
+        }
+
+        (void) compiler_barrier;
+    }
+    }
+
+    FOR_UNROLL (short mm = 0; mm < TM; ++mm) {
+        FOR_UNROLL (short i = 0; i < 2; ++i) {
+            const int r = m0 + mm*16 + sc.y + i*8;
+            if (r >= args.M) {
+                continue;
+            }
+            device float * d = dst + (uint64_t) r*args.ldd;
+            FOR_UNROLL (short nn = 0; nn < TN; ++nn) {
+                const int col = n0 + nn*16 + sc.x;
+                const float4 v = float4(c[mm][nn][i*4 + 0], c[mm][nn][i*4 + 1], c[mm][nn][i*4 + 2], c[mm][nn][i*4 + 3]);
+                if (col + 3 < args.N) {
+                    if (args.accum) {
+                        *((device float4 *) (d + col)) += v;
+                    } else {
+                        *((device float4 *) (d + col)) = v;
+                    }
+                } else {
+                    for (short j = 0; j < 4; ++j) {
+                        if (col + j < args.N) {
+                            d[col + j] = args.accum ? d[col + j] + v[j] : v[j];
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+typedef decltype(kernel_mul_mm_nax_f16<OP_MUL_MM_NAX_BM, OP_MUL_MM_NAX_BN, OP_MUL_MM_NAX_WM, OP_MUL_MM_NAX_WN>) mul_mm_nax_t;
+
+template [[host_name("kernel_mul_mm_nax_f16")]] kernel mul_mm_nax_t kernel_mul_mm_nax_f16<OP_MUL_MM_NAX_BM, OP_MUL_MM_NAX_BN, OP_MUL_MM_NAX_WM, OP_MUL_MM_NAX_WN>;
+#endif // GGML_METAL_HAS_TENSOR
+
 // each block_q contains 16*nl weights
 #ifdef GGML_METAL_HAS_TENSOR
 template<

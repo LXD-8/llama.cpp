@@ -2587,6 +2587,8 @@ static int ggml_metal_op_mul_mat_mv(ggml_metal_op_t ctx, int idx) {
 }
 
 static bool ggml_metal_op_mul_mat_use_f16_act(const ggml_tensor * op, bool has_tensor);
+static bool ggml_metal_op_mul_mat_use_nax(const ggml_tensor * op, bool has_tensor);
+static size_t ggml_metal_op_mul_mat_extra_act(const ggml_tensor * op);
 
 int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
@@ -2779,6 +2781,94 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
             nb13_mm = nb12_mm*ne12;
         }
 
+        if (use_f16_act && ggml_metal_op_mul_mat_use_nax(op, props_dev->has_tensor)) {
+            ggml_metal_buffer_id bid_src0 = ggml_metal_get_buffer_id(op->src[0]);
+
+            int32_t ldb = nb01/sizeof(ggml_fp16_t);
+
+            if (op->src[0]->type != GGML_TYPE_F16) {
+                ggml_metal_buffer_id bid_w = ggml_metal_get_buffer_id(op);
+                bid_w.offs += ggml_nbytes(op) + ggml_metal_op_mul_mat_extra_act(op);
+
+                ggml_metal_kargs_mul_mm_dq args_dq = {
+                    /*.ne00 =*/ ne00,
+                    /*.nb01 =*/ nb01,
+                };
+
+                auto pipeline_dq = ggml_metal_library_get_pipeline_mul_mm_dq(lib, op->src[0]->type);
+
+                ggml_metal_encoder_set_pipeline(enc, pipeline_dq);
+                ggml_metal_encoder_set_bytes   (enc, &args_dq, sizeof(args_dq), 0);
+                ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
+                ggml_metal_encoder_set_buffer  (enc, bid_w,    2);
+
+                const int nth = std::max(1, std::min(128, ne00/16));
+
+                ggml_metal_encoder_dispatch_threadgroups(enc, ne01, 1, 1, nth, 1, 1);
+
+                ggml_metal_op_concurrency_reset(ctx);
+
+                bid_src0 = bid_w;
+                ldb = ne00;
+            }
+
+            const int tiles_m = (ne11 + OP_MUL_MM_NAX_BM - 1)/OP_MUL_MM_NAX_BM;
+            const int tiles_n = (ne01 + OP_MUL_MM_NAX_BN - 1)/OP_MUL_MM_NAX_BN;
+
+            // groups of 4 neighbouring src1 tiles run next to each other, so that they share the src0 tile in the cache
+            const int swz = tiles_m <= 1 ? 0 : 2;
+
+            // long K: split K into partitions processed by consecutive dispatches that accumulate into dst, so that the
+            // operand slices of a partition stay in the cache while the whole M x N grid sweeps over them
+            int n_part = 1;
+            if (ne00 >= 3*std::max<int>(ne11, ne01)) {
+                n_part = (ne00 + OP_MUL_MM_NAX_KSPLIT - 1)/OP_MUL_MM_NAX_KSPLIT;
+            }
+            const int k_chunk = GGML_PAD((ne00 + n_part - 1)/n_part, 32);
+
+            auto pipeline_nax = ggml_metal_library_get_pipeline_mul_mm_nax(lib);
+
+            for (int ip = 0; ip < n_part; ++ip) {
+                const int k_beg = ip*k_chunk;
+                const int k_end = std::min<int>(ne00, k_beg + k_chunk);
+                if (k_beg >= k_end) {
+                    break;
+                }
+
+                ggml_metal_kargs_mul_mm_nax args_nax = {
+                    /*.K       =*/ ne00,
+                    /*.M       =*/ ne11,
+                    /*.N       =*/ ne01,
+                    /*.lda     =*/ (int32_t) (nb11_mm/sizeof(ggml_fp16_t)),
+                    /*.ldb     =*/ ldb,
+                    /*.ldd     =*/ (int32_t) (nb1/sizeof(float)),
+                    /*.tiles_m =*/ tiles_m,
+                    /*.tiles_n =*/ tiles_n,
+                    /*.swz     =*/ swz,
+                    /*.bk      =*/ OP_MUL_MM_NAX_BK,
+                    /*.k_beg   =*/ k_beg,
+                    /*.k_end   =*/ k_end,
+                    /*.accum   =*/ ip > 0,
+                };
+
+                if (ip > 0) {
+                    ggml_metal_op_concurrency_reset(ctx);
+                }
+
+                ggml_metal_encoder_set_pipeline(enc, pipeline_nax);
+                ggml_metal_encoder_set_bytes   (enc, &args_nax, sizeof(args_nax), 0);
+                ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
+                ggml_metal_encoder_set_buffer  (enc, bid_src1, 2);
+                ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op), 3);
+
+                ggml_metal_encoder_dispatch_threadgroups(enc,
+                        tiles_n << swz, (tiles_m + (1 << swz) - 1) >> swz, 1,
+                        32, OP_MUL_MM_NAX_WM*OP_MUL_MM_NAX_WN, 1);
+            }
+
+            return 1;
+        }
+
         auto pipeline = ggml_metal_library_get_pipeline_mul_mm_t1(lib, op, use_f16_act ? GGML_TYPE_F16 : op->src[1]->type);
 
         ggml_metal_kargs_mul_mm args = {
@@ -2855,8 +2945,69 @@ static bool ggml_metal_op_mul_mat_use_f16_act(const ggml_tensor * op, bool has_t
 
 // the extra buffer is only reserved for ops that can actually use it - the check above is a subset of this one,
 // so a conversion that runs always finds the buffer allocated
+// the register-resident NAX mat-mat takes f16 operands only: quantized weights are first dequantized to f16 in the
+// extra buffer (after the converted activations), which pays off once there are enough src1 rows to amortize it
+// GGML_METAL_MM_NAX_DISABLE turns this off for comparisons
+static bool ggml_metal_op_mul_mat_nax_shape(const ggml_tensor * op) {
+    const ggml_tensor * src0 = op->src[0];
+    const ggml_tensor * src1 = op->src[1];
+
+    switch (src0->type) {
+        case GGML_TYPE_F16:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+        case GGML_TYPE_Q1_0:
+        case GGML_TYPE_Q2_0:
+        case GGML_TYPE_MXFP4:
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ1_S:
+        case GGML_TYPE_IQ1_M:
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_IQ4_XS:
+        case GGML_TYPE_TQ2_0:
+            break;
+        default:
+            return false;
+    }
+
+    // below ~1000 src1 rows the f16 copy of the weights costs more than it saves (512 rows: 11-13% slower)
+    // GGML_METAL_MM_NAX_MIN_ROWS lowers the threshold, e.g. so that test-backend-ops covers the kernels
+    static const int64_t min_rows = getenv("GGML_METAL_MM_NAX_MIN_ROWS") ? atoi(getenv("GGML_METAL_MM_NAX_MIN_ROWS")) : 1024;
+
+    return ggml_metal_op_mul_mat_f16_act_shape(op) &&
+           src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+           src0->ne[0] % 32 == 0 && src1->ne[1] >= min_rows &&
+           (src0->type != GGML_TYPE_F16 || (src0->nb[0] == sizeof(ggml_fp16_t) && src0->nb[1] % 16 == 0)) &&
+           op->nb[0] == sizeof(float) && op->nb[1] == op->ne[0]*sizeof(float) &&
+           // bound the f16 copy of the weights
+           src0->ne[0]*src0->ne[1]*sizeof(ggml_fp16_t) <= 512u*1024*1024;
+}
+
+static bool ggml_metal_op_mul_mat_use_nax(const ggml_tensor * op, bool has_tensor) {
+    static const bool disabled = getenv("GGML_METAL_MM_NAX_DISABLE") != nullptr; // read once per process
+
+    return !disabled && ggml_metal_op_mul_mat_use_f16_act(op, has_tensor) && ggml_metal_op_mul_mat_nax_shape(op);
+}
+
+static size_t ggml_metal_op_mul_mat_extra_act(const ggml_tensor * op) {
+    return GGML_PAD(ggml_nelements(op->src[1])*sizeof(ggml_fp16_t), 32);
+}
+
 size_t ggml_metal_op_mul_mat_extra_f16_act(const ggml_tensor * op, bool has_tensor) {
-    static const bool disabled = getenv("GGML_METAL_MM_F16_ACT_DISABLE") != nullptr; // read once per process
+    static const bool disabled     = getenv("GGML_METAL_MM_F16_ACT_DISABLE") != nullptr; // read once per process
+    static const bool disabled_nax = getenv("GGML_METAL_MM_NAX_DISABLE")     != nullptr;
 
     assert(op->op == GGML_OP_MUL_MAT);
 
@@ -2864,7 +3015,13 @@ size_t ggml_metal_op_mul_mat_extra_f16_act(const ggml_tensor * op, bool has_tens
         return 0;
     }
 
-    return GGML_PAD(ggml_nelements(op->src[1])*sizeof(ggml_fp16_t), 32);
+    size_t res = ggml_metal_op_mul_mat_extra_act(op);
+
+    if (!disabled_nax && ggml_metal_op_mul_mat_nax_shape(op) && op->src[0]->type != GGML_TYPE_F16) {
+        res += GGML_PAD(op->src[0]->ne[0]*op->src[0]->ne[1]*sizeof(ggml_fp16_t), 32);
+    }
+
+    return res;
 }
 
 size_t ggml_metal_op_mul_mat_id_extra_tpe(const ggml_tensor * op) {
