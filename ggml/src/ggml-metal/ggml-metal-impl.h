@@ -141,6 +141,14 @@
 #define OP_FLASH_ATTN_EXT_NAX_NQPSG 64
 #define OP_FLASH_ATTN_EXT_NAX_NCPSG 32
 
+// register-resident NAX mat-mat for f16 operands: BM src1 rows x BN src0 rows per threadgroup, WM x WN simdgroups
+#define OP_MUL_MM_NAX_BM 64
+#define OP_MUL_MM_NAX_BN 128
+#define OP_MUL_MM_NAX_WM 2
+#define OP_MUL_MM_NAX_WN 4
+#define OP_MUL_MM_NAX_BK 256      // K step between threadgroup barriers
+#define OP_MUL_MM_NAX_KSPLIT 4096 // K partition of the split-K dispatches
+
 #define OP_FLASH_ATTN_EXT_VEC_NQPSG 1
 #define OP_FLASH_ATTN_EXT_VEC_NCPSG 32
 
@@ -531,6 +539,27 @@ typedef struct {
     uint64_t nb12;
     uint64_t nb13;
 } ggml_metal_kargs_mul_mm_cvt;
+
+typedef struct {
+    int32_t  ne00;
+    uint64_t nb01;
+} ggml_metal_kargs_mul_mm_dq;
+
+typedef struct {
+    int32_t  K;
+    int32_t  M;      // src1 rows (tokens)
+    int32_t  N;      // src0 rows
+    int32_t  lda;    // src1 row stride, in halfs
+    int32_t  ldb;    // src0 row stride, in halfs
+    int32_t  ldd;    // dst row stride, in floats
+    int32_t  tiles_m;
+    int32_t  tiles_n;
+    int32_t  swz;
+    int32_t  bk;     // K step between threadgroup barriers
+    int32_t  k_beg;  // K range of this dispatch (split-K)
+    int32_t  k_end;
+    int32_t  accum;  // add to dst instead of overwriting it
+} ggml_metal_kargs_mul_mm_nax;
 
 typedef struct {
     int32_t  ne00;
