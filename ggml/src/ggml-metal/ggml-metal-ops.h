@@ -31,7 +31,7 @@ int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx);
 // available ops:
 //
 
-// extra buffer for the f16 activations of the tensor mul_mm path
+// extra buffer of a MUL_MAT for the tensor paths: the f16 activations, then the dequantized weights of the NAX mat-mat
 size_t ggml_metal_op_mul_mat_extra_f16_act(const struct ggml_tensor * op, bool has_tensor);
 
 // tokens per expert
