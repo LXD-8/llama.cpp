@@ -34,6 +34,12 @@ int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx);
 // extra buffer of a MUL_MAT for the tensor paths: the f16 activations, then the dequantized weights of the NAX mat-mat
 size_t ggml_metal_op_mul_mat_extra_f16_act(const struct ggml_tensor * op, bool has_tensor);
 
+// whether the GATED_DELTA_NET op uses the kernel with a few lanes per state row
+bool ggml_metal_op_gated_delta_net_use_lpr(const struct ggml_tensor * op);
+
+// lanes per state row of that kernel
+int ggml_metal_op_gated_delta_net_lpr(const struct ggml_tensor * op);
+
 // tokens per expert
 size_t ggml_metal_op_mul_mat_id_extra_tpe(const struct ggml_tensor * op);
 
