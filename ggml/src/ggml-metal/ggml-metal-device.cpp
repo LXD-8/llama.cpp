@@ -932,6 +932,29 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_cvt(ggml_
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_dq(ggml_metal_library_t lib, ggml_type tsrc0) {
+    char name[256];
+    snprintf(name, 256, "kernel_mul_mm_dq_%s_f16", ggml_type_name(tsrc0));
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_nax(ggml_metal_library_t lib) {
+    const char * name = "kernel_mul_mm_nax_f16";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_metal_library_t lib, const ggml_tensor * op) {
     return ggml_metal_library_get_pipeline_mul_mm_t1(lib, op, op->src[1]->type);
 }
