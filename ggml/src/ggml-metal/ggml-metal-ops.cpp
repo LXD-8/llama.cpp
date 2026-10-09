@@ -1927,6 +1927,29 @@ int ggml_metal_op_rwkv(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+bool ggml_metal_op_gated_delta_net_use_lpr(const ggml_tensor * op) {
+    static const bool disabled = getenv("GGML_METAL_GDN_R8_DISABLE") != nullptr; // read once per process
+    if (disabled) {
+        return false;
+    }
+
+    const int64_t S_v = op->src[2]->ne[0];
+
+    return (S_v == 64 || S_v == 128 || S_v == 256) &&
+           op->src[3]->ne[0] == 1 &&
+           op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+           op->src[0]->nb[0] == sizeof(float) && op->src[1]->nb[0] == sizeof(float) &&
+           op->src[0]->nb[1] % 16 == 0 && op->src[0]->nb[2] % 16 == 0 && op->src[0]->nb[3] % 16 == 0 &&
+           op->src[1]->nb[1] % 16 == 0 && op->src[1]->nb[2] % 16 == 0 && op->src[1]->nb[3] % 16 == 0 &&
+           ((uintptr_t) op->src[0]->data) % 16 == 0 && ((uintptr_t) op->src[1]->data) % 16 == 0;
+}
+
+// 4 lanes per row is the fastest for S_v <= 128 (M5 Max, Qwen3.8-27B prefill: 1.98x vs the 32-lane kernel, 8 lanes 1.87x);
+// S_v = 256 would need 64 state registers per lane with 4 lanes, so it takes 8
+int ggml_metal_op_gated_delta_net_lpr(const ggml_tensor * op) {
+    return op->src[2]->ne[0] >= 256 ? 8 : 4;
+}
+
 int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -2026,7 +2049,12 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
 
     const int nsg = pipeline.nsg;
 
-    ggml_metal_encoder_dispatch_threadgroups(enc, op->src[2]->ne[0]/nsg, op->src[2]->ne[1], op->src[2]->ne[3], 32, nsg, 1);
+    if (ggml_metal_op_gated_delta_net_use_lpr(op)) {
+        // 32/LPR rows per simdgroup, 4 simdgroups per threadgroup
+        ggml_metal_encoder_dispatch_threadgroups(enc, op->src[2]->ne[0]/(4*(32/ggml_metal_op_gated_delta_net_lpr(op))), op->src[2]->ne[1], op->src[2]->ne[3], 32, 4, 1);
+    } else {
+        ggml_metal_encoder_dispatch_threadgroups(enc, op->src[2]->ne[0]/nsg, op->src[2]->ne[1], op->src[2]->ne[3], 32, nsg, 1);
+    }
 
     return n_fuse;
 }

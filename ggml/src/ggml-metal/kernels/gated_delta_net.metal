@@ -151,6 +151,129 @@ template [[host_name("kernel_gated_delta_net_f32_1")]] kernel kernel_gated_delta
 template [[host_name("kernel_gated_delta_net_f32_2")]] kernel kernel_gated_delta_net_t kernel_gated_delta_net_impl<2>;
 template [[host_name("kernel_gated_delta_net_f32_4")]] kernel kernel_gated_delta_net_t kernel_gated_delta_net_impl<4>;
 
+// same recurrence with LPR lanes per state row instead of 32: each lane keeps S_v/LPR state elements, so the two
+// per-token dot products need log2(LPR) shuffle steps instead of 5 and the q/k loads are amortized over more state
+// a simdgroup handles 32/LPR rows, the threadgroup NSG simdgroups; only for G == 1 and 16-byte aligned q/k
+template<short SV, short NSG, short LPR>
+kernel void kernel_gated_delta_net_lpr_impl(
+        constant ggml_metal_kargs_gated_delta_net & args,
+        device const char * q,
+        device const char * k,
+        device const char * v,
+        device const char * g,
+        device const char * b,
+        device const char * s,
+        device       char * dst,
+        device       char * dst_fuse,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+#define K FC_gated_delta_net_K
+    constexpr short NE4 = SV/(4*LPR); // float4 chunks per lane
+    constexpr short RPS = 32/LPR;     // rows per simdgroup
+
+    const short sub = tiisg % LPR;
+    const short rg  = tiisg / LPR;
+
+    const uint i23 = tgpig.z;                     // seq
+    const uint i21 = tgpig.y;                     // head
+    const uint i20 = (tgpig.x*NSG + sgitg)*RPS + rg; // state row
+
+    const uint i01 = i21 % args.ne01;
+    const uint i11 = i21 % args.ne11;
+
+    const float scale = 1.0f / sqrt((float) SV);
+
+    // state is stored transposed: row i20 is contiguous
+    const uint state_base = (i23*args.ne21 + i21)*SV*SV + i20*SV;
+    device const float4 * s_ptr = (device const float4 *) ((device const float *) (s) + state_base + sub*4);
+
+    float4 ls[NE4];
+    FOR_UNROLL (short j = 0; j < NE4; j++) {
+        ls[j] = s_ptr[LPR*j];
+    }
+
+    device float * dst_attn = (device float *) (dst) + (i23*args.ne22*args.ne21 + i21)*SV + i20;
+
+    device const float * q_ptr = (device const float *) (q + i23*args.nb03 + i01*args.nb01) + sub*4;
+    device const float * k_ptr = (device const float *) (k + i23*args.nb13 + i11*args.nb11) + sub*4;
+    device const float * v_ptr = (device const float *) (v + i23*args.nb23 + i21*args.nb21);
+
+    device const float * b_ptr = (device const float *) (b) + (i23*args.ne22*args.ne21 + i21);
+    device const float * g_ptr = (device const float *) (g) + (i23*args.ne22*args.ne21 + i21);
+
+    const uint attn_size           = args.ne22*args.ne21*SV*args.ne23;
+    const uint state_size_per_snap = SV*SV*args.ne21*args.ne23;
+
+    const bool fused = args.nb_out > 0;
+    device float * state_out = fused ? (device float *) dst_fuse : (device float *) dst + attn_size;
+    const uint slot_stride = fused ? (uint) args.nb_out : state_size_per_snap;
+
+    for (int t = 0; t < args.ne22; t++) {
+        float4 kv[NE4];
+        FOR_UNROLL (short j = 0; j < NE4; j++) {
+            kv[j] = *((device const float4 *) (k_ptr + 4*LPR*j));
+        }
+
+        const float g_exp = exp(g_ptr[0]);
+
+        float s_k = 0.0f;
+        FOR_UNROLL (short j = 0; j < NE4; j++) {
+            ls[j] *= g_exp;
+            s_k += dot(ls[j], kv[j]);
+        }
+        FOR_UNROLL (short m = 1; m < LPR; m *= 2) {
+            s_k += simd_shuffle_xor(s_k, m);
+        }
+
+        const float d = (v_ptr[i20] - s_k)*b_ptr[0];
+
+        float y = 0.0f;
+        FOR_UNROLL (short j = 0; j < NE4; j++) {
+            ls[j] += kv[j]*d;
+            y += dot(ls[j], *((device const float4 *) (q_ptr + 4*LPR*j)));
+        }
+        FOR_UNROLL (short m = 1; m < LPR; m *= 2) {
+            y += simd_shuffle_xor(y, m);
+        }
+
+        if (sub == 0) {
+            dst_attn[t*args.ne21*SV] = y*scale;
+        }
+
+        q_ptr += args.ns02;
+        k_ptr += args.ns12;
+        v_ptr += args.ns22;
+
+        b_ptr += args.ne21;
+        g_ptr += args.ne21;
+
+        if (K > 1) {
+            const int target_slot = (int) args.ne22 - 1 - t;
+            if (target_slot >= 0 && target_slot < (int) K) {
+                device float4 * dst_state = (device float4 *) (state_out + (uint) target_slot*slot_stride + state_base + sub*4);
+                FOR_UNROLL (short j = 0; j < NE4; j++) {
+                    dst_state[LPR*j] = ls[j];
+                }
+            }
+        }
+    }
+
+    if (K == 1) {
+        device float4 * dst_state = (device float4 *) (state_out + state_base + sub*4);
+        FOR_UNROLL (short j = 0; j < NE4; j++) {
+            dst_state[LPR*j] = ls[j];
+        }
+    }
+#undef K
+}
+
+typedef decltype(kernel_gated_delta_net_lpr_impl<128, 4, 8>) kernel_gated_delta_net_lpr_t;
+
+template [[host_name("kernel_gated_delta_net_r8_f32_256")]] kernel kernel_gated_delta_net_lpr_t kernel_gated_delta_net_lpr_impl<256, 4, 8>;
+template [[host_name("kernel_gated_delta_net_r4_f32_128")]] kernel kernel_gated_delta_net_lpr_t kernel_gated_delta_net_lpr_impl<128, 4, 4>;
+template [[host_name("kernel_gated_delta_net_r4_f32_64")]] kernel kernel_gated_delta_net_lpr_t kernel_gated_delta_net_lpr_impl<64, 4, 4>;
+
 #else
 // a simplified version of the above
 // no performance improvement, so keep the above version for now
