@@ -452,7 +452,10 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		);
 		const budgetTokens = REASONING_EFFORT_TOKENS[effort];
 
-		if (effort !== ReasoningEffort.DEFAULT) {
+		if (effort === ReasoningEffort.OFF && currentConfig.keepCacheThinkingOff) {
+			// a zero budget keeps the rendered prompt, so the server reuses the cached conversation
+			apiOptions.thinkingBudgetTokens = 0;
+		} else if (effort !== ReasoningEffort.DEFAULT) {
 			apiOptions.enableThinking = effort !== ReasoningEffort.OFF;
 		}
 
