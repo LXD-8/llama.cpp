@@ -2,6 +2,7 @@
 
 #include "ggml-metal-common.h"
 #include "ggml-metal-device.h"
+#include "ggml-metal-ops.h"
 
 #include "ggml-backend-impl.h"
 
@@ -711,6 +712,36 @@ static bool ggml_metal_fusion_check_mul_mat_add(
         (add->data == res->data || !ggml_metal_fusion_overlap(add, res));
 }
 
+// GLU + MUL_MAT: the GLU result is only read by the mat-mat (as src1), which converts its activations to f16 first;
+// the GLU then writes them in f16 (or int8) directly and its own f32 result is never materialized
+static bool ggml_metal_fusion_check_glu_mul_mat(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(fusion);
+    GGML_UNUSED(mode);
+
+    const ggml_tensor * glu = nodes[0];
+    const ggml_tensor * mm  = nodes[1];
+
+    if (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || glu->type != GGML_TYPE_F32 || glu->src[0]->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    if (mm->src[1] != glu || mm->src[0] == glu) {
+        return false;
+    }
+
+    if ((glu->flags & GGML_TENSOR_FLAG_OUTPUT) || !ggml_node_has_n_uses(gf, node_idxs[idx], 1)) {
+        return false;
+    }
+
+    return ggml_is_contiguous(glu) && ggml_metal_op_mul_mat_nax_shape(mm);
+}
+
 // ---- patterns ------------------------------------------------------------
 
 static const std::vector<ggml_op> ops_norm_mul         = { GGML_OP_NORM, GGML_OP_MUL };
@@ -731,6 +762,8 @@ static const std::vector<ggml_op> ops_snake = { GGML_OP_MUL, GGML_OP_SIN, GGML_O
 static const std::vector<ggml_op> ops_gdn_cache = { GGML_OP_GATED_DELTA_NET, GGML_OP_CPY };
 
 static const std::vector<ggml_op> ops_ssm_conv_silu = { GGML_OP_SSM_CONV, GGML_OP_UNARY };
+
+static const std::vector<ggml_op> ops_glu_mul_mat = { GGML_OP_GLU, GGML_OP_MUL_MAT };
 
 static const std::vector<ggml_op> ops_moe_reduce_2 = {
     GGML_OP_MUL, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_ADD
@@ -790,6 +823,7 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_8,           {},     true,  ggml_metal_fusion_check_moe_reduce },
     { GGML_METAL_FUSION_SSM_CONV_SILU,  ops_ssm_conv_silu,          {},     false, ggml_metal_fusion_check_ssm_conv_silu },
     { GGML_METAL_FUSION_MUL_MAT_ADD,    ops_mul_mat_add,            {},     false, ggml_metal_fusion_check_mul_mat_add },
+    { GGML_METAL_FUSION_GLU_MUL_MAT,    ops_glu_mul_mat,            {},     true,  ggml_metal_fusion_check_glu_mul_mat },
 };
 
 // ---- alloc deps -----------------------------------------------------------

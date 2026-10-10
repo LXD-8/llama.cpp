@@ -285,6 +285,65 @@ typedef decltype(kernel_swiglu<float>) kernel_swiglu_t;
 template [[host_name("kernel_swiglu_f32")]] kernel kernel_swiglu_t kernel_swiglu<float>;
 template [[host_name("kernel_swiglu_f16")]] kernel kernel_swiglu_t kernel_swiglu<half>;
 
+// f32 inputs, output quantized for the int8 NAX mat-mat: int8 rows + one scale per (row, OP_MUL_MM_I8_G), scales
+// group-major (see kernel_mul_mm_q8a_f32); one simdgroup per group of 128
+kernel void kernel_swiglu_q8a(
+        constant ggml_metal_kargs_glu & args,
+        device const char * src0,
+        device const char * src1,
+        device     int8_t * dst,
+        device      float * dsc,
+        constant  int32_t & nrows,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
+        ushort3  ntg[[threads_per_threadgroup]]) {
+    const int i1 = tgpig.x;
+    const int ng = args.ne0/OP_MUL_MM_I8_G;
+
+    device const float4 * x0 = (device const float4 *) ((device const float *) (src0 + i1*args.nb01) + args.i00);
+    device const float4 * x1 = (device const float4 *) ((device const float *) (src1 + i1*args.nb11) + args.i10);
+    device       char4  * q  = (device       char4  *) (dst + (uint64_t) i1*args.ne0);
+
+    for (int g = sgitg; g < ng; g += ntg.y) {
+        const int i = g*(OP_MUL_MM_I8_G/4) + tiisg;
+
+        const float4 a = x0[i];
+        const float4 v = i8_wht128(a/(1.0f + exp(-a))*x1[i], tiisg);
+
+        const float amax = simd_max(max(max(fabs(v[0]), fabs(v[1])), max(fabs(v[2]), fabs(v[3]))));
+        const float id = amax > 0.0f ? 127.0f/amax : 0.0f;
+
+        q[i] = char4(rint(v*id));
+
+        if (tiisg == 0) {
+            dsc[g*nrows + i1] = amax/(127.0f*OP_MUL_MM_I8_G);
+        }
+    }
+}
+
+kernel void kernel_swiglu_f32_f16(
+        constant ggml_metal_kargs_glu & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint tgpig[[threadgroup_position_in_grid]],
+        uint tpitg[[thread_position_in_threadgroup]],
+        uint   ntg[[threads_per_threadgroup]]) {
+    device const float * src0_row = (device const float *) ((device const char *) src0 + tgpig*args.nb01) + args.i00;
+    device const float * src1_row = (device const float *) ((device const char *) src1 + tgpig*args.nb11) + args.i10;
+    device       half  * dst_row  = (device       half  *) ((device       char *) dst  + tgpig*args.nb1);
+
+    for (int i0 = tpitg; i0 < args.ne0; i0 += ntg) {
+        const float x0 = src0_row[i0];
+        const float x1 = src1_row[i0];
+
+        const float silu = x0 / (1.0f + exp(-x0));
+
+        dst_row[i0] = (half) clamp(silu*x1, -65504.0f, 65504.0f);
+    }
+}
+
 template<typename T>
 kernel void kernel_swiglu_oai(
         constant ggml_metal_kargs_glu & args,
