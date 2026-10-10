@@ -2023,6 +2023,10 @@ struct ggml_metal_buffer {
     bool is_shared;
     bool owned;
 
+    // the data is still all zeros from vm_allocate: nothing wrote to the buffer or bound it to a GPU command since
+    // a clear to zero can then be skipped, instead of touching every page
+    atomic_bool is_zero;
+
     // multiple buffers are used only to avoid the maximum buffer size limitation when using mmap
     int n_buffers;
     struct ggml_metal_buffer_wrapper buffers[GGML_METAL_MAX_BUFFERS];
@@ -2156,6 +2160,9 @@ ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size,
     if (shared) {
         res->all_data = ggml_metal_host_malloc(size_aligned);
         res->is_shared = true;
+#if TARGET_OS_OSX
+        atomic_init(&res->is_zero, true);
+#endif
     } else {
         // use virtual address
         res->all_data = (void *) atomic_fetch_add_explicit(&dev->addr_virt, size_aligned, memory_order_relaxed);
@@ -2331,7 +2338,21 @@ bool ggml_metal_buffer_is_shared(ggml_metal_buffer_t buf) {
     return buf->is_shared;
 }
 
+// called for every host write and every GPU use of the buffer
+static void ggml_metal_buffer_mark_written(ggml_metal_buffer_t buf) {
+    if (atomic_load_explicit(&buf->is_zero, memory_order_relaxed)) {
+        atomic_store_explicit(&buf->is_zero, false, memory_order_relaxed);
+    }
+}
+
+static void ggml_metal_buffer_mark_written_tensor(const struct ggml_tensor * tensor) {
+    ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+    ggml_metal_buffer_mark_written((ggml_metal_buffer_t) buf->context);
+}
+
 void ggml_metal_buffer_memset_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
+    ggml_metal_buffer_mark_written(buf);
+
     if (buf->is_shared) {
         memset((char *) tensor->data + offset, value, size);
         return;
@@ -2360,6 +2381,8 @@ void ggml_metal_buffer_memset_tensor(ggml_metal_buffer_t buf, struct ggml_tensor
 }
 
 void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    ggml_metal_buffer_mark_written(buf);
+
     if (buf->is_shared) {
         memcpy((char *) tensor->data + offset, data, size);
         return;
@@ -2484,6 +2507,10 @@ static bool ggml_metal_buffer_data_span(const void * const * data, const size_t 
 
 void ggml_metal_buffer_set_tensor_n(ggml_metal_buffer_t buf, struct ggml_tensor * const * tensors, const void * const * data,
         const size_t * offsets, const size_t * sizes, size_t n_tensors) {
+    for (size_t i = 0; i < n_tensors; i++) {
+        ggml_metal_buffer_mark_written_tensor(tensors[i]);
+    }
+
     if (buf->is_shared) {
         for (size_t i = 0; i < n_tensors; i++) {
             if (sizes[i] == 0) {
@@ -2598,6 +2625,8 @@ void ggml_metal_buffer_get_tensor_n(ggml_metal_buffer_t buf, const struct ggml_t
 }
 
 bool ggml_metal_buffer_cpy_tensor(ggml_metal_buffer_t buf_dst, const struct ggml_tensor * src, struct ggml_tensor * dst) {
+    ggml_metal_buffer_mark_written(buf_dst);
+
     ggml_metal_buffer_t buf_src = (ggml_metal_buffer_t)src->buffer->context;
 
     const size_t size = ggml_nbytes(src);
@@ -2641,6 +2670,10 @@ bool ggml_metal_buffer_cpy_tensor(ggml_metal_buffer_t buf_dst, const struct ggml
 bool ggml_metal_buffer_cpy_tensor_n(ggml_metal_buffer_t buf_dst, const struct ggml_tensor * const * srcs, struct ggml_tensor * const * dsts, size_t n_tensors) {
     if (n_tensors == 0) {
         return true;
+    }
+
+    for (size_t i = 0; i < n_tensors; ++i) {
+        ggml_metal_buffer_mark_written_tensor(dsts[i]);
     }
 
     bool all_shared = true;
@@ -2707,6 +2740,12 @@ bool ggml_metal_buffer_cpy_tensor_n(ggml_metal_buffer_t buf_dst, const struct gg
 }
 
 void ggml_metal_buffer_clear(ggml_metal_buffer_t buf, uint8_t value) {
+    if (value == 0 && atomic_load_explicit(&buf->is_zero, memory_order_relaxed)) {
+        return;
+    }
+
+    ggml_metal_buffer_mark_written(buf);
+
     if (buf->is_shared) {
         memset(buf->all_data, value, buf->all_size);
         return;
@@ -2731,6 +2770,8 @@ void ggml_metal_buffer_clear(ggml_metal_buffer_t buf, uint8_t value) {
 }
 
 struct ggml_metal_buffer_id ggml_metal_buffer_get_id(ggml_metal_buffer_t buf, const struct ggml_tensor * t) {
+    ggml_metal_buffer_mark_written(buf);
+
     struct ggml_metal_buffer_id res = { nil, 0 };
 
     const int64_t tsize = ggml_nbytes(t);

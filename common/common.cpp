@@ -1570,7 +1570,9 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
             common_batch_set_zero_state(batch, model, zeros);
             llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
         }
-        llama_memory_clear(llama_get_memory(lctx), true);
+        // the warmup K/V are finite and masked out, and recurrent states are zeroed when a sequence takes a cell
+        // so a reset without wiping the data is enough, and does not touch every page of the cache
+        llama_memory_clear(llama_get_memory(lctx), false);
         llama_synchronize(lctx);
         llama_perf_context_reset(lctx);
 
