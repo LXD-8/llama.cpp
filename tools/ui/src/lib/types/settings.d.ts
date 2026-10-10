@@ -89,6 +89,8 @@ export interface SettingsChatServiceOptions {
 	excludeReasoningFromContext?: boolean;
 	// Enable model thinking/reasoning via chat_template_kwargs
 	enableThinking?: boolean;
+	// Thinking off through a zero reasoning budget, leaving the chat template (and so the cached prompt) unchanged
+	thinkingOffByBudget?: boolean;
 	// Reasoning effort level (low/medium/high/max) for thinking models
 	reasoningEffort?: ReasoningEffort;
 	tools?: OpenAIToolDefinition[];
