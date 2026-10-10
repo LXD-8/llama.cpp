@@ -86,18 +86,24 @@ template [[host_name("kernel_mul_mm_dq_" #name "_f16")]] kernel mul_mm_dq_t kern
 
 NAX_QTYPES(DQ_F16_INSTANCE)
 
-// dst[m][n] = sum_k src1[m][k] * src0[n][k] with f16 operands loaded straight into registers
+// dst[m][n] = sum_k src1[m][k] * src0[n][k] with f16 or int8 operands loaded straight into registers
 // no threadgroup memory: the BM x BN tile is split across WM x WN simdgroups, each owning a (BM/WM) x (BN/WN) block
 // of 16x16 fragments; the threadgroups are swizzled so that neighbouring ones share src0 rows in the cache
+// int8 (see kernel_mul_mm_q8a_f32): each OP_MUL_MM_I8_G group of K is accumulated in int32 and folded into the f32
+// accumulators with the scales s1 (src1 rows) and s0 (src0 rows); the K ranges are multiples of OP_MUL_MM_I8_G
 template<typename T, short BM, short BN, short WM, short WN>
 static inline void kernel_mul_mm_nax_impl(
         constant ggml_metal_kargs_mul_mm_nax & args,
         device const T     * src0,
         device const T     * src1,
         device       float * dst,
+        device const float * s0,
+        device const float * s1,
         uint3  tgpig,
         ushort tiisg,
         ushort sgitg) {
+    constexpr bool I8 = is_same<T, int8_t>::value;
+
     constexpr short SM = BM/WM;
     constexpr short SN = BN/WN;
     constexpr short TM = SM/16;
@@ -122,10 +128,13 @@ static inline void kernel_mul_mm_nax_impl(
     // per-lane row pointers, clamped to the last row - rows past the end are computed but never stored
     device const T * pa[TM][2];
     device const T * pb[TN][2];
+    int ra[TM][2]; // the clamped rows and the first of the 4 columns of the lane, for the int8 scales
+    int rb[TN];
 
     FOR_UNROLL (short mm = 0; mm < TM; ++mm) {
         FOR_UNROLL (short i = 0; i < 2; ++i) {
             const int r = min(m0 + mm*16 + sc.y + i*8, args.M - 1);
+            ra[mm][i] = r;
             pa[mm][i] = src1 + (uint64_t) r*args.lda + sc.x;
         }
     }
@@ -134,6 +143,7 @@ static inline void kernel_mul_mm_nax_impl(
             const int r = min(n0 + nn*16 + sc.y + i*8, args.N - 1);
             pb[nn][i] = src0 + (uint64_t) r*args.ldb + sc.x;
         }
+        rb[nn] = n0 + nn*16 + sc.x;
     }
 
     vec<float, 8> c[TM][TN];
@@ -151,6 +161,15 @@ static inline void kernel_mul_mm_nax_impl(
         threadgroup_barrier(mem_flags::mem_none);
 
         const int k1 = min(args.k_end, k0 + BK);
+
+        vec<int, 8> ci[TM][TN];
+        if constexpr (I8) {
+            FOR_UNROLL (short mm = 0; mm < TM; ++mm) {
+                FOR_UNROLL (short nn = 0; nn < TN; ++nn) {
+                    ci[mm][nn] = 0;
+                }
+            }
+        }
 
         #pragma clang loop unroll(disable)
         for (int k = k0; k < k1; k += SK) {
@@ -185,7 +204,11 @@ static inline void kernel_mul_mm_nax_impl(
             FOR_UNROLL (short mm = 0; mm < TM; ++mm) {
                 FOR_UNROLL (short nn = 0; nn < TN; nn += 2) {
                     FOR_UNROLL (short kk = 0; kk < TK; ++kk) {
-                        nax_mma<float, T, T, true>(c[mm][nn], c[mm][nn + 1], a[mm][kk], b[nn][kk], b[nn + 1][kk]);
+                        if constexpr (I8) {
+                            nax_mma<int, T, T, true>(ci[mm][nn], ci[mm][nn + 1], a[mm][kk], b[nn][kk], b[nn + 1][kk]);
+                        } else {
+                            nax_mma<float, T, T, true>(c[mm][nn], c[mm][nn + 1], a[mm][kk], b[nn][kk], b[nn + 1][kk]);
+                        }
                     }
                 }
             }
@@ -193,6 +216,36 @@ static inline void kernel_mul_mm_nax_impl(
             (void) compiler_barrier;
         }
 
+        if constexpr (I8) {
+            // fold the group into the f32 accumulators
+            const int g = k0/OP_MUL_MM_I8_G;
+
+            float sa[TM][2];
+            FOR_UNROLL (short mm = 0; mm < TM; ++mm) {
+                FOR_UNROLL (short i = 0; i < 2; ++i) {
+                    sa[mm][i] = s1[g*args.M + ra[mm][i]];
+                }
+            }
+
+            FOR_UNROLL (short nn = 0; nn < TN; ++nn) {
+                float4 sw;
+                if (rb[nn] + 3 < args.N) {
+                    sw = *((device const float4 *) (s0 + g*args.N + rb[nn]));
+                } else {
+                    FOR_UNROLL (short j = 0; j < 4; ++j) {
+                        sw[j] = s0[g*args.N + min(rb[nn] + j, args.N - 1)];
+                    }
+                }
+
+                FOR_UNROLL (short mm = 0; mm < TM; ++mm) {
+                    FOR_UNROLL (short i = 0; i < 2; ++i) {
+                        FOR_UNROLL (short j = 0; j < 4; ++j) {
+                            c[mm][nn][i*4 + j] = fma(sa[mm][i]*sw[j], float(ci[mm][nn][i*4 + j]), c[mm][nn][i*4 + j]);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     FOR_UNROLL (short mm = 0; mm < TM; ++mm) {
@@ -233,8 +286,108 @@ void kernel_mul_mm_nax_f16(
         ushort tiisg [[thread_index_in_simdgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
     kernel_mul_mm_nax_impl<half, OP_MUL_MM_NAX_BM, OP_MUL_MM_NAX_BN, OP_MUL_MM_NAX_WM, OP_MUL_MM_NAX_WN>(
-            args, src0, src1, dst, tgpig, tiisg, sgitg);
+            args, src0, src1, dst, nullptr, nullptr, tgpig, tiisg, sgitg);
 }
+#endif // GGML_METAL_HAS_TENSOR
+
+#ifdef GGML_METAL_HAS_TENSOR
+// ---- int8 NAX mat-mat ---------------------------------------------------------------------------------------------
+// both operands are quantized to symmetric int8 with one scale per (row, OP_MUL_MM_I8_G consecutive K): q = round(x/s),
+// s = amax/127, after a Walsh-Hadamard transform of each group (i8_wht128, same on both sides, so the dot product is
+// kept). the NAX int8 matmul accumulates a group in int32, which is then folded into the f32 accumulators
+// with s_a(m, g)*s_w(n, g). scales are stored group-major: s[g*rows + row]
+
+// f32 activations -> int8 rows [M][K] + scales [K/G][M]; one simdgroup per group of 128 (32 lanes x float4)
+kernel void kernel_mul_mm_q8a_f32(
+        constant ggml_metal_kargs_mul_mm_q8a & args,
+        device const char   * src1,
+        device       int8_t * dst,
+        device       float  * dsc,
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort3 ntg  [[threads_per_threadgroup]]) {
+    const int i1 = tgpig.x;
+    const int ng = args.ne10/OP_MUL_MM_I8_G;
+
+    device const float4 * x = (device const float4 *) (src1 + i1*args.nb11);
+    device       char4  * q = (device       char4  *) (dst + (uint64_t) i1*args.ne10);
+
+    for (int g = sgitg; g < ng; g += ntg.y) {
+        const float4 v = i8_wht128(x[g*(OP_MUL_MM_I8_G/4) + tiisg], tiisg);
+
+        const float amax = simd_max(max(max(fabs(v[0]), fabs(v[1])), max(fabs(v[2]), fabs(v[3]))));
+        const float d  = amax/(127.0f*OP_MUL_MM_I8_G); // the 1/128 of the transform is folded into the activations
+        const float id = amax > 0.0f ? 127.0f/amax : 0.0f;
+
+        q[g*(OP_MUL_MM_I8_G/4) + tiisg] = char4(rint(v*id));
+
+        if (tiisg == 0) {
+            dsc[g*args.ne11 + i1] = d;
+        }
+    }
+}
+
+// quantized weights -> dequantized -> int8 rows [N][K] + scales [K/G][N]; one simdgroup per group of 128:
+// lane l dequantizes the 16-value chunk l/4 and keeps its row l%4 (4 values)
+template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread float4x4 &)>
+kernel void kernel_mul_mm_dq_i8(
+        constant ggml_metal_kargs_mul_mm_dq_i8 & args,
+        device const char   * src0,
+        device       int8_t * dst,
+        device       float  * dsc,
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort3 ntg  [[threads_per_threadgroup]]) {
+    const int i01 = tgpig.x;
+    const int ng  = args.ne00/OP_MUL_MM_I8_G;
+
+    device const block_q * x = (device const block_q *) (src0 + i01*args.nb01);
+    device       char4   * q = (device       char4   *) (dst + (uint64_t) i01*args.ne00);
+
+    for (int g = sgitg; g < ng; g += ntg.y) {
+        const int ic = g*(OP_MUL_MM_I8_G/16) + tiisg/4; // 16-value chunk
+
+        float4x4 t;
+        dequantize_func(x + ic/nl, ic%nl, t);
+
+        const float4 v = i8_wht128(t[tiisg%4], tiisg);
+
+        const float amax = simd_max(max(max(fabs(v[0]), fabs(v[1])), max(fabs(v[2]), fabs(v[3]))));
+        const float d  = amax/127.0f;
+        const float id = amax > 0.0f ? 127.0f/amax : 0.0f;
+
+        q[ic*4 + tiisg%4] = char4(rint(v*id));
+
+        if (tiisg == 0) {
+            dsc[g*args.ne01 + i01] = d;
+        }
+    }
+}
+
+typedef decltype(kernel_mul_mm_dq_i8<block_q4_K, QK_NL, dequantize_q4_K>) mul_mm_dq_i8_t;
+
+#define DQ_I8_INSTANCE(name, block_q, nl, deq) \
+template [[host_name("kernel_mul_mm_dq_" #name "_i8")]] kernel mul_mm_dq_i8_t kernel_mul_mm_dq_i8<block_q, nl, deq>;
+
+NAX_QTYPES(DQ_I8_INSTANCE)
+
+[[kernel, max_total_threads_per_threadgroup(OP_MUL_MM_NAX_WM*OP_MUL_MM_NAX_WN*32)]]
+void kernel_mul_mm_nax_i8(
+        constant ggml_metal_kargs_mul_mm_nax & args,
+        device const int8_t * src0,
+        device const int8_t * src1,
+        device       float  * dst,
+        device const float  * s0,
+        device const float  * s1,
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mm_nax_impl<int8_t, OP_MUL_MM_NAX_BM, OP_MUL_MM_NAX_BN, OP_MUL_MM_NAX_WM, OP_MUL_MM_NAX_WN>(
+            args, src0, src1, dst, s0, s1, tgpig, tiisg, sgitg);
+}
+
 #endif // GGML_METAL_HAS_TENSOR
 
 // each block_q contains 16*nl weights
