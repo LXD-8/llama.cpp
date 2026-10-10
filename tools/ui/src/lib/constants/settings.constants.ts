@@ -606,6 +606,13 @@ export const SETTINGS_REGISTRY: SettingsSectionEntry[] = [
 				type: SettingsFieldType.CHECKBOX
 			},
 			{
+				defaultValue: true,
+				help: 'Turn thinking off with a zero thinking budget instead of the chat template switch. Templates that put reasoning instructions at the top of the prompt (e.g. Qwen3.8) otherwise change the whole prompt, and the server re-processes the entire conversation each time thinking is switched on or off.',
+				key: SETTINGS_KEYS.KEEP_CACHE_THINKING_OFF,
+				label: 'Keep conversation cache when thinking is off',
+				type: SettingsFieldType.CHECKBOX
+			},
+			{
 				defaultValue: false,
 				help: 'Send reasoning_format=none so the server returns thinking tokens inline instead of extracting them into a separate field.',
 				key: SETTINGS_KEYS.DISABLE_REASONING_PARSING,

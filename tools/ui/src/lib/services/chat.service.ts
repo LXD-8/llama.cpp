@@ -29,6 +29,7 @@ import {
 	AttachmentType,
 	ContentPartType,
 	MessageRole,
+	ReasoningEffort,
 	ReasoningFormat,
 	StreamConnectionState
 } from '$lib/enums';
@@ -903,6 +904,24 @@ export class ChatService {
 		}
 	}
 
+	/**
+	 * The thinking_budget_tokens to send, -1 for none. A zero budget makes the server close the
+	 * thinking block right away: the same output as enable_thinking=false, but the rendered prompt
+	 * stays the same, so the server keeps reusing the KV cache of the conversation.
+	 */
+	static reasoningBudgetTokens(options: {
+		enableThinking?: boolean;
+		reasoningEffort?: ReasoningEffort;
+		thinkingOffByBudget?: boolean;
+	}): number {
+		if (options.thinkingOffByBudget) return 0;
+
+		if (options.enableThinking && options.reasoningEffort)
+			return REASONING_EFFORT_TOKENS[options.reasoningEffort] ?? -1;
+
+		return -1;
+	}
+
 	static async resumeStream(
 		conversationId: string,
 		signal?: AbortSignal,
@@ -1062,6 +1081,7 @@ export class ChatService {
 			stream,
 			// Generation parameters
 			temperature,
+			thinkingOffByBudget,
 			timings_per_token,
 			// Tools for function calling
 			tools,
@@ -1133,8 +1153,11 @@ export class ChatService {
 			? ReasoningFormat.NONE
 			: ReasoningFormat.AUTO;
 
-		const reasoningBudgetTokens =
-			enableThinking && reasoningEffort ? (REASONING_EFFORT_TOKENS[reasoningEffort] ?? -1) : -1;
+		const reasoningBudgetTokens = ChatService.reasoningBudgetTokens({
+			enableThinking,
+			reasoningEffort,
+			thinkingOffByBudget
+		});
 
 		// an explicit user choice injects the kwarg, otherwise it is omitted so
 		// the server default applies (--reasoning flag or chat template)
