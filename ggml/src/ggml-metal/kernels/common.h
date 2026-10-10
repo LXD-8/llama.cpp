@@ -124,3 +124,16 @@ template<> inline float4 elu_approx<float4>(float4 x) {
 
     return res;
 }
+
+// int8 NAX mat-mat: unnormalized Walsh-Hadamard transform of a group of 128 values held as one float4 per lane of a
+// simdgroup (lane l holds values 4l..4l+3). applied to both operands it keeps their dot product (times 128) and spreads
+// outliers over the group, so that the per-group int8 scale fits the bulk of the values
+static inline float4 i8_wht128(float4 v, ushort lane) {
+    v = float4(v[0] + v[1], v[0] - v[1], v[2] + v[3], v[2] - v[3]);
+    v = float4(v[0] + v[2], v[1] + v[3], v[0] - v[2], v[1] - v[3]);
+    for (ushort o = 1; o < 32; o <<= 1) {
+        const float4 p = simd_shuffle_xor(v, o);
+        v = (lane & o) ? p - v : v + p;
+    }
+    return v;
+}

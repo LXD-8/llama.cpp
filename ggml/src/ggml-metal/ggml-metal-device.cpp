@@ -949,6 +949,16 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_dq(ggml_m
     return res;
 }
 
+// pipelines without function constants, by kernel name
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_by_name(ggml_metal_library_t lib, const char * name) {
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_nax(ggml_metal_library_t lib) {
     const char * name = "kernel_mul_mm_nax_f16";
 
