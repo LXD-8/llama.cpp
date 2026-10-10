@@ -386,7 +386,9 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		// an explicit reasoning choice overrides the server default, DEFAULT sends nothing
 		const effort = conversationsStore.preferences.getReasoningEffort();
 
-		if (effort !== ReasoningEffort.DEFAULT) {
+		if (effort === ReasoningEffort.OFF && currentConfig.keepCacheThinkingOff) {
+			apiOptions.thinkingOffByBudget = true;
+		} else if (effort !== ReasoningEffort.DEFAULT) {
 			apiOptions.enableThinking = effort !== ReasoningEffort.OFF;
 
 			if (effort !== ReasoningEffort.OFF) apiOptions.reasoningEffort = effort;
