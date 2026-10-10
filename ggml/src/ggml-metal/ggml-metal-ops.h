@@ -34,6 +34,9 @@ int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx);
 // extra buffer of a MUL_MAT for the tensor paths: the f16 (or int8) activations, then the dequantized weights of the NAX mat-mat
 size_t ggml_metal_op_mul_mat_extra_f16_act(const struct ggml_tensor * op, bool has_tensor);
 
+// whether a MUL_MAT has the shape and types of the NAX mat-mat (independent of the device)
+bool ggml_metal_op_mul_mat_nax_shape(const struct ggml_tensor * op);
+
 // whether the GATED_DELTA_NET op uses the kernel with a few lanes per state row
 bool ggml_metal_op_gated_delta_net_use_lpr(const struct ggml_tensor * op);
 
