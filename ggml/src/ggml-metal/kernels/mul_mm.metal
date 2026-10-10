@@ -258,6 +258,316 @@ typedef decltype(kernel_mul_mm_nax_f16<OP_MUL_MM_NAX_BM, OP_MUL_MM_NAX_BN, OP_MU
 template [[host_name("kernel_mul_mm_nax_f16")]] kernel mul_mm_nax_t kernel_mul_mm_nax_f16<OP_MUL_MM_NAX_BM, OP_MUL_MM_NAX_BN, OP_MUL_MM_NAX_WM, OP_MUL_MM_NAX_WN>;
 #endif // GGML_METAL_HAS_TENSOR
 
+#ifdef GGML_METAL_HAS_TENSOR
+// ---- int8 NAX mat-mat ---------------------------------------------------------------------------------------------
+// both operands are quantized to symmetric int8 with one scale per (row, OP_MUL_MM_I8_G consecutive K): q = round(x/s),
+// s = amax/127, after a Walsh-Hadamard transform of each group (i8_wht128, same on both sides, so the dot product is
+// kept). the NAX int8 matmul accumulates a group in int32, which is then folded into the f32 accumulators
+// with s_a(m, g)*s_w(n, g). scales are stored group-major: s[g*rows + row]
+
+// f32 activations -> int8 rows [M][K] + scales [K/G][M]; one simdgroup per group of 128 (32 lanes x float4)
+kernel void kernel_mul_mm_q8a_f32(
+        constant ggml_metal_kargs_mul_mm_q8a & args,
+        device const char   * src1,
+        device       int8_t * dst,
+        device       float  * dsc,
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort3 ntg  [[threads_per_threadgroup]]) {
+    const int i1 = tgpig.x;
+    const int ng = args.ne10/OP_MUL_MM_I8_G;
+
+    device const float4 * x = (device const float4 *) (src1 + i1*args.nb11);
+    device       char4  * q = (device       char4  *) (dst + (uint64_t) i1*args.ne10);
+
+    for (int g = sgitg; g < ng; g += ntg.y) {
+        const float4 v = i8_wht128(x[g*(OP_MUL_MM_I8_G/4) + tiisg], tiisg);
+
+        const float amax = simd_max(max(max(fabs(v[0]), fabs(v[1])), max(fabs(v[2]), fabs(v[3]))));
+        const float d  = amax/(127.0f*OP_MUL_MM_I8_G); // the 1/128 of the transform is folded into the activations
+        const float id = amax > 0.0f ? 127.0f/amax : 0.0f;
+
+        q[g*(OP_MUL_MM_I8_G/4) + tiisg] = char4(rint(v*id));
+
+        if (tiisg == 0) {
+            dsc[g*args.ne11 + i1] = d;
+        }
+    }
+}
+
+// quantized weights -> dequantized -> int8 rows [N][K] + scales [K/G][N]; one simdgroup per group of 128:
+// lane l dequantizes the 16-value chunk l/4 and keeps its row l%4 (4 values)
+template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread float4x4 &)>
+kernel void kernel_mul_mm_dq_i8(
+        constant ggml_metal_kargs_mul_mm_dq_i8 & args,
+        device const char   * src0,
+        device       int8_t * dst,
+        device       float  * dsc,
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort3 ntg  [[threads_per_threadgroup]]) {
+    const int i01 = tgpig.x;
+    const int ng  = args.ne00/OP_MUL_MM_I8_G;
+
+    device const block_q * x = (device const block_q *) (src0 + i01*args.nb01);
+    device       char4   * q = (device       char4   *) (dst + (uint64_t) i01*args.ne00);
+
+    for (int g = sgitg; g < ng; g += ntg.y) {
+        const int ic = g*(OP_MUL_MM_I8_G/16) + tiisg/4; // 16-value chunk
+
+        float4x4 t;
+        dequantize_func(x + ic/nl, ic%nl, t);
+
+        const float4 v = i8_wht128(t[tiisg%4], tiisg);
+
+        const float amax = simd_max(max(max(fabs(v[0]), fabs(v[1])), max(fabs(v[2]), fabs(v[3]))));
+        const float d  = amax/127.0f;
+        const float id = amax > 0.0f ? 127.0f/amax : 0.0f;
+
+        q[ic*4 + tiisg%4] = char4(rint(v*id));
+
+        if (tiisg == 0) {
+            dsc[g*args.ne01 + i01] = d;
+        }
+    }
+}
+
+typedef decltype(kernel_mul_mm_dq_i8<block_q4_K, QK_NL, dequantize_q4_K>) mul_mm_dq_i8_t;
+
+template [[host_name("kernel_mul_mm_dq_q4_0_i8")]] kernel mul_mm_dq_i8_t kernel_mul_mm_dq_i8<block_q4_0, 2,     dequantize_q4_0>;
+template [[host_name("kernel_mul_mm_dq_q4_1_i8")]] kernel mul_mm_dq_i8_t kernel_mul_mm_dq_i8<block_q4_1, 2,     dequantize_q4_1>;
+template [[host_name("kernel_mul_mm_dq_q5_0_i8")]] kernel mul_mm_dq_i8_t kernel_mul_mm_dq_i8<block_q5_0, 2,     dequantize_q5_0>;
+template [[host_name("kernel_mul_mm_dq_q5_1_i8")]] kernel mul_mm_dq_i8_t kernel_mul_mm_dq_i8<block_q5_1, 2,     dequantize_q5_1>;
+template [[host_name("kernel_mul_mm_dq_q8_0_i8")]] kernel mul_mm_dq_i8_t kernel_mul_mm_dq_i8<block_q8_0, 2,     dequantize_q8_0>;
+template [[host_name("kernel_mul_mm_dq_q4_K_i8")]] kernel mul_mm_dq_i8_t kernel_mul_mm_dq_i8<block_q4_K, QK_NL, dequantize_q4_K>;
+template [[host_name("kernel_mul_mm_dq_q5_K_i8")]] kernel mul_mm_dq_i8_t kernel_mul_mm_dq_i8<block_q5_K, QK_NL, dequantize_q5_K>;
+template [[host_name("kernel_mul_mm_dq_q6_K_i8")]] kernel mul_mm_dq_i8_t kernel_mul_mm_dq_i8<block_q6_K, QK_NL, dequantize_q6_K>;
+template [[host_name("kernel_mul_mm_dq_q1_0_i8")]] kernel mul_mm_dq_i8_t kernel_mul_mm_dq_i8<block_q1_0, 8, dequantize_q1_0>;
+template [[host_name("kernel_mul_mm_dq_q2_0_i8")]] kernel mul_mm_dq_i8_t kernel_mul_mm_dq_i8<block_q2_0, 4, dequantize_q2_0>;
+template [[host_name("kernel_mul_mm_dq_mxfp4_i8")]] kernel mul_mm_dq_i8_t kernel_mul_mm_dq_i8<block_mxfp4, 2, dequantize_mxfp4>;
+template [[host_name("kernel_mul_mm_dq_q2_K_i8")]] kernel mul_mm_dq_i8_t kernel_mul_mm_dq_i8<block_q2_K, QK_NL, dequantize_q2_K>;
+template [[host_name("kernel_mul_mm_dq_q3_K_i8")]] kernel mul_mm_dq_i8_t kernel_mul_mm_dq_i8<block_q3_K, QK_NL, dequantize_q3_K>;
+template [[host_name("kernel_mul_mm_dq_iq2_xxs_i8")]] kernel mul_mm_dq_i8_t kernel_mul_mm_dq_i8<block_iq2_xxs, QK_NL, dequantize_iq2_xxs>;
+template [[host_name("kernel_mul_mm_dq_iq2_xs_i8")]] kernel mul_mm_dq_i8_t kernel_mul_mm_dq_i8<block_iq2_xs, QK_NL, dequantize_iq2_xs>;
+template [[host_name("kernel_mul_mm_dq_iq2_s_i8")]] kernel mul_mm_dq_i8_t kernel_mul_mm_dq_i8<block_iq2_s, QK_NL, dequantize_iq2_s>;
+template [[host_name("kernel_mul_mm_dq_iq3_xxs_i8")]] kernel mul_mm_dq_i8_t kernel_mul_mm_dq_i8<block_iq3_xxs, QK_NL, dequantize_iq3_xxs>;
+template [[host_name("kernel_mul_mm_dq_iq3_s_i8")]] kernel mul_mm_dq_i8_t kernel_mul_mm_dq_i8<block_iq3_s, QK_NL, dequantize_iq3_s>;
+template [[host_name("kernel_mul_mm_dq_iq1_s_i8")]] kernel mul_mm_dq_i8_t kernel_mul_mm_dq_i8<block_iq1_s, QK_NL, dequantize_iq1_s>;
+template [[host_name("kernel_mul_mm_dq_iq1_m_i8")]] kernel mul_mm_dq_i8_t kernel_mul_mm_dq_i8<block_iq1_m, QK_NL, dequantize_iq1_m>;
+template [[host_name("kernel_mul_mm_dq_iq4_nl_i8")]] kernel mul_mm_dq_i8_t kernel_mul_mm_dq_i8<block_iq4_nl, 2, dequantize_iq4_nl>;
+template [[host_name("kernel_mul_mm_dq_iq4_xs_i8")]] kernel mul_mm_dq_i8_t kernel_mul_mm_dq_i8<block_iq4_xs, QK_NL, dequantize_iq4_xs>;
+template [[host_name("kernel_mul_mm_dq_tq2_0_i8")]] kernel mul_mm_dq_i8_t kernel_mul_mm_dq_i8<block_tq2_0, QK_NL, dequantize_tq2_0>;
+
+static inline void mm_nax_mma_i8(
+        thread vec<int, 8> & c0, thread vec<int, 8> & c1,
+        thread const vec<int8_t, 8> & a,
+        thread const vec<int8_t, 8> & b0, thread const vec<int8_t, 8> & b1) {
+    constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(16, 32, 16, false, true, true,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+
+    mpp::tensor_ops::matmul2d<desc, execution_simdgroup> op;
+
+    auto ca = op.template get_left_input_cooperative_tensor <int8_t, int8_t, int>();
+    auto cb = op.template get_right_input_cooperative_tensor<int8_t, int8_t, int>();
+    auto cc = op.template get_destination_cooperative_tensor<remove_addrspace_t<decltype(ca)>, remove_addrspace_t<decltype(cb)>, int>();
+
+    FOR_UNROLL (short i = 0; i < 8; ++i) {
+        ca[i]     = a[i];
+        cb[i]     = b0[i];
+        cb[8 + i] = b1[i];
+        cc[i]     = c0[i];
+        cc[8 + i] = c1[i];
+    }
+
+    op.run(ca, cb, cc);
+
+    FOR_UNROLL (short i = 0; i < 8; ++i) {
+        c0[i] = cc[i];
+        c1[i] = cc[8 + i];
+    }
+}
+
+// same tiling as kernel_mul_mm_nax_f16 (BM x BN per threadgroup, WM x WN simdgroups, swizzle, split-K), with int8
+// operands; K ranges are multiples of OP_MUL_MM_I8_G
+template<short BM, short BN, short WM, short WN>
+[[kernel, max_total_threads_per_threadgroup(WM*WN*32)]]
+void kernel_mul_mm_nax_i8(
+        constant ggml_metal_kargs_mul_mm_nax & args,
+        device const int8_t * src0,
+        device const int8_t * src1,
+        device       float  * dst,
+        device const float  * s0,
+        device const float  * s1,
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    constexpr short SM = BM/WM;
+    constexpr short SN = BN/WN;
+    constexpr short TM = SM/16;
+    constexpr short TN = SN/16;
+    constexpr short TK = 2;
+    constexpr short SK = TK*16;
+    constexpr short G  = OP_MUL_MM_I8_G;
+
+    static_assert(TN % 2 == 0, "src0 fragments are consumed in pairs");
+
+    const int tile_m = (tgpig.y << args.swz) + (tgpig.x & ((1 << args.swz) - 1));
+    const int tile_n = tgpig.x >> args.swz;
+
+    if (tile_m >= args.tiles_m || tile_n >= args.tiles_n) {
+        return;
+    }
+
+    const int m0 = tile_m*BM + SM*(sgitg/WN);
+    const int n0 = tile_n*BN + SN*(sgitg%WN);
+
+    const short2 sc = mm_nax_coord(tiisg);
+
+    device const int8_t * pa[TM][2];
+    device const int8_t * pb[TN][2];
+    int ra[TM][2]; // clamped rows, for the scales
+    int rb[TN];    // first column of the 4 owned by the lane in each fragment
+
+    FOR_UNROLL (short mm = 0; mm < TM; ++mm) {
+        FOR_UNROLL (short i = 0; i < 2; ++i) {
+            const int r = min(m0 + mm*16 + sc.y + i*8, args.M - 1);
+            ra[mm][i] = r;
+            pa[mm][i] = src1 + (uint64_t) r*args.lda + sc.x;
+        }
+    }
+    FOR_UNROLL (short nn = 0; nn < TN; ++nn) {
+        FOR_UNROLL (short i = 0; i < 2; ++i) {
+            const int r = min(n0 + nn*16 + sc.y + i*8, args.N - 1);
+            pb[nn][i] = src0 + (uint64_t) r*args.ldb + sc.x;
+        }
+        rb[nn] = n0 + nn*16 + sc.x;
+    }
+
+    vec<float, 8> c[TM][TN];
+    FOR_UNROLL (short mm = 0; mm < TM; ++mm) {
+        FOR_UNROLL (short nn = 0; nn < TN; ++nn) {
+            c[mm][nn] = 0.0f;
+        }
+    }
+
+    #pragma clang loop unroll(disable)
+    for (int k0 = args.k_beg; k0 < args.k_end; k0 += G) {
+        // keep the simdgroups of the threadgroup close together so that they hit the same cache lines
+        threadgroup_barrier(mem_flags::mem_none);
+
+        vec<int, 8> ci[TM][TN];
+        FOR_UNROLL (short mm = 0; mm < TM; ++mm) {
+            FOR_UNROLL (short nn = 0; nn < TN; ++nn) {
+                ci[mm][nn] = 0;
+            }
+        }
+
+        #pragma clang loop unroll(disable)
+        for (int k = k0; k < k0 + G; k += SK) {
+            volatile int compiler_barrier;
+
+            vec<int8_t, 8> a[TM][TK];
+            vec<int8_t, 8> b[TN][TK];
+
+            FOR_UNROLL (short mm = 0; mm < TM; ++mm) {
+                FOR_UNROLL (short kk = 0; kk < TK; ++kk) {
+                    FOR_UNROLL (short i = 0; i < 2; ++i) {
+                        const char4 v = *((device const char4 *) (pa[mm][i] + k + kk*16));
+                        a[mm][kk][i*4 + 0] = v[0];
+                        a[mm][kk][i*4 + 1] = v[1];
+                        a[mm][kk][i*4 + 2] = v[2];
+                        a[mm][kk][i*4 + 3] = v[3];
+                    }
+                }
+            }
+            FOR_UNROLL (short nn = 0; nn < TN; ++nn) {
+                FOR_UNROLL (short kk = 0; kk < TK; ++kk) {
+                    FOR_UNROLL (short i = 0; i < 2; ++i) {
+                        const char4 v = *((device const char4 *) (pb[nn][i] + k + kk*16));
+                        b[nn][kk][i*4 + 0] = v[0];
+                        b[nn][kk][i*4 + 1] = v[1];
+                        b[nn][kk][i*4 + 2] = v[2];
+                        b[nn][kk][i*4 + 3] = v[3];
+                    }
+                }
+            }
+
+            FOR_UNROLL (short mm = 0; mm < TM; ++mm) {
+                FOR_UNROLL (short nn = 0; nn < TN; nn += 2) {
+                    FOR_UNROLL (short kk = 0; kk < TK; ++kk) {
+                        mm_nax_mma_i8(ci[mm][nn], ci[mm][nn + 1], a[mm][kk], b[nn][kk], b[nn + 1][kk]);
+                    }
+                }
+            }
+
+            (void) compiler_barrier;
+        }
+
+        // fold the group into the f32 accumulators
+        const int g = k0/G;
+
+        float sa[TM][2];
+        FOR_UNROLL (short mm = 0; mm < TM; ++mm) {
+            FOR_UNROLL (short i = 0; i < 2; ++i) {
+                sa[mm][i] = s1[g*args.M + ra[mm][i]];
+            }
+        }
+
+        FOR_UNROLL (short nn = 0; nn < TN; ++nn) {
+            float4 sw;
+            if (rb[nn] + 3 < args.N) {
+                sw = *((device const float4 *) (s0 + g*args.N + rb[nn]));
+            } else {
+                FOR_UNROLL (short j = 0; j < 4; ++j) {
+                    sw[j] = s0[g*args.N + min(rb[nn] + j, args.N - 1)];
+                }
+            }
+
+            FOR_UNROLL (short mm = 0; mm < TM; ++mm) {
+                FOR_UNROLL (short i = 0; i < 2; ++i) {
+                    FOR_UNROLL (short j = 0; j < 4; ++j) {
+                        c[mm][nn][i*4 + j] = fma(sa[mm][i]*sw[j], float(ci[mm][nn][i*4 + j]), c[mm][nn][i*4 + j]);
+                    }
+                }
+            }
+        }
+    }
+
+    FOR_UNROLL (short mm = 0; mm < TM; ++mm) {
+        FOR_UNROLL (short i = 0; i < 2; ++i) {
+            const int r = m0 + mm*16 + sc.y + i*8;
+            if (r >= args.M) {
+                continue;
+            }
+            device float * d = dst + (uint64_t) r*args.ldd;
+            FOR_UNROLL (short nn = 0; nn < TN; ++nn) {
+                const int col = n0 + nn*16 + sc.x;
+                const float4 v = float4(c[mm][nn][i*4 + 0], c[mm][nn][i*4 + 1], c[mm][nn][i*4 + 2], c[mm][nn][i*4 + 3]);
+                if (col + 3 < args.N) {
+                    if (args.accum) {
+                        *((device float4 *) (d + col)) += v;
+                    } else {
+                        *((device float4 *) (d + col)) = v;
+                    }
+                } else {
+                    for (short j = 0; j < 4; ++j) {
+                        if (col + j < args.N) {
+                            d[col + j] = args.accum ? d[col + j] + v[j] : v[j];
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+typedef decltype(kernel_mul_mm_nax_i8<OP_MUL_MM_NAX_BM, OP_MUL_MM_NAX_BN, OP_MUL_MM_NAX_WM, OP_MUL_MM_NAX_WN>) mul_mm_nax_i8_t;
+
+template [[host_name("kernel_mul_mm_nax_i8")]] kernel mul_mm_nax_i8_t kernel_mul_mm_nax_i8<OP_MUL_MM_NAX_BM, OP_MUL_MM_NAX_BN, OP_MUL_MM_NAX_WM, OP_MUL_MM_NAX_WN>;
+#endif // GGML_METAL_HAS_TENSOR
+
 // each block_q contains 16*nl weights
 #ifdef GGML_METAL_HAS_TENSOR
 template<
