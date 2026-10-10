@@ -562,6 +562,21 @@ typedef struct {
     int32_t  accum;  // add to dst instead of overwriting it
 } ggml_metal_kargs_mul_mm_nax;
 
+// int8 NAX mat-mat: symmetric int8 operands with one f32 scale per (row, OP_MUL_MM_I8_G columns)
+#define OP_MUL_MM_I8_G 128
+
+typedef struct {
+    int32_t  ne10;   // K
+    int32_t  ne11;   // M
+    uint64_t nb11;
+} ggml_metal_kargs_mul_mm_q8a;
+
+typedef struct {
+    int32_t  ne00;   // K
+    int32_t  ne01;   // N
+    uint64_t nb01;
+} ggml_metal_kargs_mul_mm_dq_i8;
+
 typedef struct {
     int32_t  ne00;
     int32_t  ne01;
