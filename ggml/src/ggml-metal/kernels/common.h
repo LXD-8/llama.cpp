@@ -166,3 +166,26 @@ template<> inline float4 elu_approx<float4>(float4 x) {
 
     return res;
 }
+
+// unnormalized Walsh-Hadamard transform of 128 values, one float4 per lane; applied to both operands it keeps the dot product
+// (times 128) and spreads the outliers over the group, so that the int8 scale fits the bulk of the values
+static inline float4 i8_wht128(float4 v, ushort lane) {
+    v = float4(v[0] + v[1], v[0] - v[1], v[2] + v[3], v[2] - v[3]);
+    v = float4(v[0] + v[2], v[1] + v[3], v[0] - v[2], v[1] - v[3]);
+    for (ushort o = 1; o < 32; o <<= 1) {
+        const float4 p = simd_shuffle_xor(v, o);
+        v = (lane & o) ? p - v : v + p;
+    }
+    return v;
+}
+
+// a group of 128 values, one float4 per lane: transform, then quantize to symmetric int8 with the scale d (divided by fold)
+static inline char4 i8_quantize128(float4 v, ushort lane, float fold, thread float & d) {
+    v = i8_wht128(v, lane);
+
+    const float amax = simd_max(max(max(fabs(v[0]), fabs(v[1])), max(fabs(v[2]), fabs(v[3]))));
+
+    d = amax/(127.0f*fold);
+
+    return char4(rint(v*(amax > 0.0f ? 127.0f/amax : 0.0f)));
+}
