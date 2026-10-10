@@ -33,6 +33,7 @@ export const SETTINGS_KEYS = {
 	FREQUENCY_PENALTY: 'frequency_penalty',
 	FULL_HEIGHT_CODE_BLOCKS: 'fullHeightCodeBlocks',
 	GROUP_MODELS_BY_FAMILY: 'groupModelsByFamily',
+	KEEP_CACHE_THINKING_OFF: 'keepCacheThinkingOff',
 	LIVE_MARKDOWN_PREVIEW: 'liveMarkdownPreview',
 	MAX_IMAGE_RESOLUTION: 'maxImageMPixels',
 	MAX_TOKENS: 'max_tokens',
