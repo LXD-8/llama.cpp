@@ -744,6 +744,21 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net(
     return res;
 }
 
+// f32 GLU writing f16 (only SWIGLU, used when fused with the NAX mat-mat that consumes it)
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_glu_f16(ggml_metal_library_t lib, const ggml_tensor * op) {
+    GGML_ASSERT(ggml_get_glu_op(op) == GGML_GLU_OP_SWIGLU);
+    GGML_UNUSED(op);
+
+    const char * name = "kernel_swiglu_f32_f16";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_solve_tri(ggml_metal_library_t lib, const ggml_tensor * op) {
     char base[256];
     char name[256];
