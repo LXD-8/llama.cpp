@@ -314,6 +314,62 @@ typedef decltype(kernel_swiglu<float>) kernel_swiglu_t;
 template [[host_name("kernel_swiglu_f32")]] kernel kernel_swiglu_t kernel_swiglu<float>;
 template [[host_name("kernel_swiglu_f16")]] kernel kernel_swiglu_t kernel_swiglu<half>;
 
+// output quantized for the int8 NAX mat-mat, in the layout of kernel_mul_mm_q8a_f32
+kernel void kernel_swiglu_q8a(
+        constant ggml_metal_kargs_glu & args,
+        device const char * src0,
+        device const char * src1,
+        device     int8_t * dst,
+        device      float * dsc,
+        constant  int32_t & nrows,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
+        ushort3  ntg[[threads_per_threadgroup]]) {
+    const int i1 = tgpig.x;
+    const int ng = args.ne0/OP_MUL_MM_I8_G;
+
+    device const float4 * x0 = (device const float4 *) ((device const float *) (src0 + i1*args.nb01) + args.i00);
+    device const float4 * x1 = (device const float4 *) ((device const float *) (src1 + i1*args.nb11) + args.i10);
+    device       char4  * q  = (device       char4  *) (dst + (uint64_t) i1*args.ne0);
+
+    for (int g = sgitg; g < ng; g += ntg.y) {
+        const int i = g*(OP_MUL_MM_I8_G/4) + tiisg;
+
+        const float4 a = x0[i];
+
+        float d;
+        q[i] = i8_quantize128(a/(1.0f + exp(-a))*x1[i], tiisg, OP_MUL_MM_I8_G, d);
+
+        if (tiisg == 0) {
+            dsc[g*nrows + i1] = d;
+        }
+    }
+}
+
+kernel void kernel_swiglu_f32_f16(
+        constant ggml_metal_kargs_glu & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint2 tgpig[[threadgroup_position_in_grid]],
+        uint2 tpitg[[thread_position_in_threadgroup]],
+        uint2   ntg[[threads_per_threadgroup]],
+        uint2  ntgs[[threadgroups_per_grid]]) {
+    device const float * src0_row = (device const float *) ((device const char *) src0 + tgpig.y*args.nb01) + args.i00;
+    device const float * src1_row = (device const float *) ((device const char *) src1 + tgpig.y*args.nb11) + args.i10;
+    device       half  * dst_row  = (device       half  *) ((device       char *) dst  + tgpig.y*args.nb1);
+
+    for (int i0 = tgpig.x*ntg.x + tpitg.x; i0 < args.ne0; i0 += ntg.x*ntgs.x) {
+        const float x0 = src0_row[i0];
+        const float x1 = src1_row[i0];
+
+        const float silu = x0 / (1.0f + exp(-x0));
+
+        dst_row[i0] = (half) clamp(silu*x1, -65504.0f, 65504.0f);
+    }
+}
+
 template<typename T>
 kernel void kernel_swiglu_oai(
         constant ggml_metal_kargs_glu & args,
