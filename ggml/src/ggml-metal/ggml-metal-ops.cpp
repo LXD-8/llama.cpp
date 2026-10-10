@@ -980,6 +980,14 @@ static bool ggml_metal_op_mul_mat_use_nax(const ggml_tensor * op, bool has_nax) 
     return ggml_metal_op_mul_mat_use_f16_act(op, has_nax) && ggml_metal_op_mul_mat_nax_shape(op);
 }
 
+// int8 operands for the NAX mat-mat; GGML_METAL_MM_I8_DISABLE keeps the f16 operands, which are more accurate
+static bool ggml_metal_op_mul_mat_use_i8(const ggml_tensor * op, bool has_tensor) {
+    static const bool disabled = getenv("GGML_METAL_MM_I8_DISABLE") != nullptr; // read once per process
+
+    return !disabled && op->src[0]->type != GGML_TYPE_F16 && op->src[0]->ne[0] % OP_MUL_MM_I8_G == 0 &&
+        ggml_metal_op_mul_mat_use_nax(op, has_tensor);
+}
+
 static size_t ggml_metal_op_mul_mat_extra_act(const ggml_tensor * op) {
     return GGML_PAD(ggml_nelements(op->src[1])*sizeof(ggml_fp16_t), 32);
 }
@@ -2831,12 +2839,16 @@ static int ggml_metal_op_mul_mat_mv(ggml_metal_op_t ctx, int idx) {
 static void ggml_metal_op_mul_mat_nax_dispatch(ggml_metal_op_t ctx, const ggml_tensor * op,
         ggml_metal_pipeline_with_params pipeline,
         ggml_metal_buffer_id bid_src0, int32_t ldb,
-        ggml_metal_buffer_id bid_src1, int32_t lda) {
+        ggml_metal_buffer_id bid_src1, int32_t lda,
+        const ggml_metal_buffer_id * bid_s = nullptr) {
     ggml_metal_encoder_t enc = ctx->enc;
 
     const int32_t K = op->src[0]->ne[0];
     const int32_t M = op->src[1]->ne[1];
     const int32_t N = op->src[0]->ne[1];
+
+    const int32_t bk      = bid_s ? OP_MUL_MM_I8_G : OP_MUL_MM_NAX_BK;
+    const int32_t k_align = bid_s ? OP_MUL_MM_I8_G : 32;
 
     const int tiles_m = (M + OP_MUL_MM_NAX_BM - 1)/OP_MUL_MM_NAX_BM;
     const int tiles_n = (N + OP_MUL_MM_NAX_BN - 1)/OP_MUL_MM_NAX_BN;
@@ -2846,7 +2858,7 @@ static void ggml_metal_op_mul_mat_nax_dispatch(ggml_metal_op_t ctx, const ggml_t
     if (K >= 3*std::max(M, N)) {
         n_part = (K + OP_MUL_MM_NAX_KSPLIT - 1)/OP_MUL_MM_NAX_KSPLIT;
     }
-    const int k_chunk = GGML_PAD((K + n_part - 1)/n_part, 32);
+    const int k_chunk = GGML_PAD((K + n_part - 1)/n_part, k_align);
 
     for (int ip = 0; ip < n_part; ++ip) {
         const int k_beg = ip*k_chunk;
@@ -2865,7 +2877,7 @@ static void ggml_metal_op_mul_mat_nax_dispatch(ggml_metal_op_t ctx, const ggml_t
             /*.tiles_m =*/ tiles_m,
             /*.tiles_n =*/ tiles_n,
             /*.swz     =*/ swz,
-            /*.bk      =*/ OP_MUL_MM_NAX_BK,
+            /*.bk      =*/ bk,
             /*.k_beg   =*/ k_beg,
             /*.k_end   =*/ k_end,
             /*.accum   =*/ ip > 0,
@@ -2880,11 +2892,87 @@ static void ggml_metal_op_mul_mat_nax_dispatch(ggml_metal_op_t ctx, const ggml_t
         ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
         ggml_metal_encoder_set_buffer  (enc, bid_src1, 2);
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op), 3);
+        if (bid_s) {
+            ggml_metal_encoder_set_buffer(enc, bid_s[0], 4);
+            ggml_metal_encoder_set_buffer(enc, bid_s[1], 5);
+        }
 
         ggml_metal_encoder_dispatch_threadgroups(enc,
                 tiles_n << swz, (tiles_m + (1 << swz) - 1) >> swz, 1,
                 32, OP_MUL_MM_NAX_WM*OP_MUL_MM_NAX_WN, 1);
     }
+}
+
+// int8 NAX mat-mat: quantize the activations and the (dequantized) weights to int8 with per-128 scales, then run the
+// int8 kernel. layout of the extra buffer (within the f16 reservation): [act i8][act scales] | [w i8][w scales]
+static int ggml_metal_op_mul_mat_nax_i8(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
+    GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
+    GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
+    GGML_TENSOR_LOCALS(uint64_t, nb1, op->src[1], nb);
+
+    const int K = ne00;
+    const int M = ne11;
+    const int N = ne01;
+
+    ggml_metal_buffer_id bid_base = ggml_metal_get_buffer_id(op);
+    bid_base.offs += ggml_nbytes(op);
+
+    ggml_metal_buffer_id bid_a  = bid_base;
+    ggml_metal_buffer_id bid_sa = bid_base; bid_sa.offs += GGML_PAD((size_t) M*K, 32);
+    ggml_metal_buffer_id bid_w  = bid_base; bid_w.offs  += ggml_metal_op_mul_mat_extra_act(op);
+    ggml_metal_buffer_id bid_sw = bid_w;    bid_sw.offs += GGML_PAD((size_t) N*K, 32);
+
+    // the extra buffer is not covered by the concurrency tracking
+    ggml_metal_op_concurrency_reset(ctx);
+
+    {
+        ggml_metal_kargs_mul_mm_q8a args = {
+            /*.ne10 =*/ K,
+            /*.ne11 =*/ M,
+            /*.nb11 =*/ nb11,
+        };
+
+        ggml_metal_encoder_set_pipeline(enc, ggml_metal_library_get_pipeline_by_name(lib, "kernel_mul_mm_q8a_f32"));
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 1);
+        ggml_metal_encoder_set_buffer  (enc, bid_a,  2);
+        ggml_metal_encoder_set_buffer  (enc, bid_sa, 3);
+
+        ggml_metal_encoder_dispatch_threadgroups(enc, M, 1, 1, 32, 4, 1);
+    }
+    {
+        ggml_metal_kargs_mul_mm_dq_i8 args = {
+            /*.ne00 =*/ K,
+            /*.ne01 =*/ N,
+            /*.nb01 =*/ nb01,
+        };
+
+        char name[64];
+        snprintf(name, sizeof(name), "kernel_mul_mm_dq_%s_i8", ggml_type_name(op->src[0]->type));
+
+        ggml_metal_encoder_set_pipeline(enc, ggml_metal_library_get_pipeline_by_name(lib, name));
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+        ggml_metal_encoder_set_buffer  (enc, bid_w,  2);
+        ggml_metal_encoder_set_buffer  (enc, bid_sw, 3);
+
+        ggml_metal_encoder_dispatch_threadgroups(enc, N, 1, 1, 32, 4, 1);
+    }
+
+    ggml_metal_op_concurrency_reset(ctx);
+
+    const ggml_metal_buffer_id bid_s[2] = { bid_sw, bid_sa };
+
+    ggml_metal_op_mul_mat_nax_dispatch(ctx, op, ggml_metal_library_get_pipeline_by_name(lib, "kernel_mul_mm_nax_i8"),
+            bid_w, K, bid_a, K, bid_s);
+
+    return 1;
 }
 
 int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
@@ -3040,6 +3128,10 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         uint64_t nb13_mm = nb13;
 
         const bool use_f16_act = ggml_metal_op_mul_mat_use_f16_act(op, props_dev->has_tensor);
+
+        if (ggml_metal_op_mul_mat_use_i8(op, props_dev->has_nax)) {
+            return ggml_metal_op_mul_mat_nax_i8(ctx, idx);
+        }
 
         if (use_f16_act) {
             ggml_metal_buffer_id bid_act = ggml_metal_get_buffer_id(op);
