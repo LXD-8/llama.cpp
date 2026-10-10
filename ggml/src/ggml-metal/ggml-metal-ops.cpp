@@ -114,6 +114,9 @@ struct ggml_metal_op {
 
     int debug_graph;
 
+    // MUL_MAT whose f16/int8 activations were already written by the preceding fused GLU
+    const ggml_tensor * mm_act_ready = nullptr;
+
 private:
     ggml_cgraph * gf;
 
@@ -929,7 +932,36 @@ int ggml_metal_op_glu(ggml_metal_op_t ctx, int idx) {
         GGML_ASSERT(ggml_are_same_shape(op->src[0], op->src[1]));
     }
 
-    auto pipeline = ggml_metal_library_get_pipeline_glu(lib, op);
+    // GLU + MUL_MAT: write the f16 (or int8) activations of the NAX mat-mat directly into its buffer
+    ggml_tensor * mm = nullptr;
+    bool mm_i8 = false;
+
+    static const bool glu_mm_disabled = getenv("GGML_METAL_GLU_MM_DISABLE") != nullptr; // read once per process
+
+    if (ctx->use_fusion() && !glu_mm_disabled) {
+        int n = 1;
+        const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
+
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_GLU_MUL_MAT) {
+            const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx->dev);
+
+            ggml_tensor * next = ctx->node(idx + 1);
+
+            if (ggml_metal_op_mul_mat_use_nax(next, props_dev->has_tensor)) {
+                const bool i8 = ggml_metal_op_mul_mat_use_i8(next, props_dev->has_tensor);
+
+                // the int8 variant reads its inputs in 16-byte vectors
+                if (!i8 || (op->src[0]->nb[1] % 16 == 0 && (!op->src[1] || op->src[1]->nb[1] % 16 == 0))) {
+                    mm    = next;
+                    mm_i8 = i8;
+                    ctx->count_fusions(fusion);
+                }
+            }
+        }
+    }
+
+    auto pipeline = mm_i8 ? ggml_metal_library_get_pipeline_by_name(lib, "kernel_swiglu_q8a") :
+                    mm    ? ggml_metal_library_get_pipeline_by_name(lib, "kernel_swiglu_f32_f16") : ggml_metal_library_get_pipeline_glu(lib, op);
 
     const int32_t swp = ggml_get_op_params_i32(op, 1);
     const float alpha = ggml_get_op_params_f32(op, 2);
@@ -944,7 +976,7 @@ int ggml_metal_op_glu(ggml_metal_op_t ctx, int idx) {
         /*.ne10 =*/ op->src[1] ? ne10 : ne00,
         /*.nb11 =*/ op->src[1] ? nb11 : nb01,
         /*.ne0  =*/ ne0,
-        /*.nb1  =*/ nb1,
+        /*.nb1  =*/ mm ? ne0*sizeof(ggml_fp16_t) : nb1,
         /*.i00  =*/ op->src[1] ? 0 : i00,
         /*.i10  =*/ op->src[1] ? 0 : i10,
         /*.alpha=*/ alpha,
@@ -963,9 +995,41 @@ int ggml_metal_op_glu(ggml_metal_op_t ctx, int idx) {
     } else {
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 2);
     }
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+    if (mm) {
+        ggml_metal_buffer_id bid_act = ggml_metal_get_buffer_id(mm);
+        bid_act.offs += ggml_nbytes(mm);
 
-    ggml_metal_encoder_dispatch_threadgroups(enc, nrows, 1, 1, nth, 1, 1);
+        ggml_metal_encoder_set_buffer(enc, bid_act, 3);
+
+        if (mm_i8) {
+            ggml_metal_buffer_id bid_sc = bid_act;
+            bid_sc.offs += GGML_PAD((size_t) ne0*nrows, 32);
+
+            const int32_t nr = (int32_t) nrows;
+
+            ggml_metal_encoder_set_buffer(enc, bid_sc, 4);
+            ggml_metal_encoder_set_bytes (enc, (void *) &nr, sizeof(nr), 5);
+        }
+    } else {
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 3);
+    }
+
+    if (mm_i8) {
+        ggml_metal_encoder_dispatch_threadgroups(enc, nrows, 1, 1, 32, 4, 1);
+    } else {
+        ggml_metal_encoder_dispatch_threadgroups(enc, nrows, 1, 1, nth, 1, 1);
+    }
+
+    if (mm) {
+        // the extra buffer is not covered by the concurrency tracking
+        ggml_metal_op_concurrency_reset(ctx);
+
+        ctx->mm_act_ready = mm;
+        ggml_metal_op_mul_mat(ctx, idx + 1);
+        ctx->mm_act_ready = nullptr;
+
+        return 2;
+    }
 
     return 1;
 }
@@ -2717,10 +2781,13 @@ static int ggml_metal_op_mul_mat_nax_i8(ggml_metal_op_t ctx, int idx) {
     ggml_metal_buffer_id bid_w  = bid_base; bid_w.offs  += ggml_metal_op_mul_mat_extra_act(op);
     ggml_metal_buffer_id bid_sw = bid_w;    bid_sw.offs += GGML_PAD((size_t) N*K, 32);
 
+    // the activations may have been quantized already by a fused GLU
+    const bool act_ready = ctx->mm_act_ready == op;
+
     // the extra buffer is not covered by the concurrency tracking
     ggml_metal_op_concurrency_reset(ctx);
 
-    {
+    if (!act_ready) {
         ggml_metal_kargs_mul_mm_q8a args = {
             /*.ne10 =*/ K,
             /*.ne11 =*/ M,
@@ -2923,7 +2990,18 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
             return ggml_metal_op_mul_mat_nax_i8(ctx, idx);
         }
 
-        if (use_f16_act) {
+        // the f16 activations may have been written already by a fused GLU
+        const bool act_ready = ctx->mm_act_ready == op && ggml_metal_op_mul_mat_use_nax(op, props_dev->has_tensor);
+
+        if (use_f16_act && act_ready) {
+            bid_src1 = ggml_metal_get_buffer_id(op);
+            bid_src1.offs += ggml_nbytes(op);
+
+            nb10_mm = sizeof(ggml_fp16_t);
+            nb11_mm = nb10_mm*ne10;
+            nb12_mm = nb11_mm*ne11;
+            nb13_mm = nb12_mm*ne12;
+        } else if (use_f16_act) {
             ggml_metal_buffer_id bid_act = ggml_metal_get_buffer_id(op);
             bid_act.offs += ggml_nbytes(op);
 
@@ -3079,7 +3157,7 @@ static bool ggml_metal_op_mul_mat_use_f16_act(const ggml_tensor * op, bool has_t
 // the register-resident NAX mat-mat takes f16 operands only: quantized weights are first dequantized to f16 in the
 // extra buffer (after the converted activations), which pays off once there are enough src1 rows to amortize it
 // GGML_METAL_MM_NAX_DISABLE turns this off for comparisons
-static bool ggml_metal_op_mul_mat_nax_shape(const ggml_tensor * op) {
+bool ggml_metal_op_mul_mat_nax_shape(const ggml_tensor * op) {
     const ggml_tensor * src0 = op->src[0];
     const ggml_tensor * src1 = op->src[1];
 
