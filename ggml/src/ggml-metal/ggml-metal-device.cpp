@@ -1146,11 +1146,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             {
                 nsg = N_SG_Q4_K;
                 nr0 = N_R0_Q4_K;
+                nr1 = std::max(1, ggml_metal_op_mul_mat_xr_rows(op));
             } break;
         case GGML_TYPE_Q5_K:
             {
                 nsg = N_SG_Q5_K;
                 nr0 = N_R0_Q5_K;
+                nr1 = std::max(1, ggml_metal_op_mul_mat_xr_rows(op));
             } break;
         case GGML_TYPE_Q6_K:
             {
@@ -1267,7 +1269,12 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
     const int16_t r2 = (int16_t) (ne12 / ne02);
     const int16_t r3 = (int16_t) (ne13 / ne03);
 
-    snprintf(base, 256, "kernel_mul_mv_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
+    char suffix_xr[16] = "";
+    if (nr1 > 1) {
+        snprintf(suffix_xr, sizeof(suffix_xr), "_xr%d", nr1);
+    }
+
+    snprintf(base, 256, "kernel_mul_mv_%s_%s%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix, suffix_xr);
     snprintf(name, 256, "%s_nsg=%d_ne12=%d_r2=%d_r3=%d_split=%d", base, nsg, ne12, r2, r3, split);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
