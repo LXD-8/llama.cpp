@@ -927,9 +927,16 @@ static bool ggml_metal_op_mul_mat_f16_act_shape(const ggml_tensor * op) {
            ggml_metal_op_mul_mat_use_mm(op, true);
 }
 
+// whether the mul_mm is large enough to pay for the conversion of its activations
+static bool ggml_metal_op_mul_mat_f16_act_rows(const ggml_tensor * op) {
+    // the conversion is an extra dispatch with a barrier on each side, which costs more than it saves for small products
+    const double flop = 2.0*op->src[0]->ne[0]*op->src[0]->ne[1]*ggml_nrows(op->src[1]);
+
+    return op->src[0]->type != GGML_TYPE_BF16 && op->src[1]->ne[1] >= 128 && flop >= 4e9;
+}
+
 static bool ggml_metal_op_mul_mat_use_f16_act(const ggml_tensor * op, bool has_tensor) {
-    return has_tensor && ggml_metal_op_mul_mat_f16_act_shape(op) &&
-           ((uintptr_t) op->src[1]->data) % 16 == 0;
+    return has_tensor && ggml_metal_op_mul_mat_f16_act_shape(op) && ((uintptr_t) op->src[1]->data) % 16 == 0;
 }
 
 // the register-resident NAX mat-mat takes f16 operands only, so quantized weights are first dequantized to f16 in the extra buffer
