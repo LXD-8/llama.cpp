@@ -2008,6 +2008,9 @@ struct ggml_metal_buffer {
     // note: cannot use explicitly "id<MTLResidencySet>" here because it is not available on certain OSes
     id rset;
 
+    // set while the first residency request of a fresh buffer runs in the background (see ggml_metal_buffer_rset_add)
+    dispatch_group_t rset_group;
+
     // pointers to global device
     ggml_metal_device_t dev;
 };
@@ -2038,7 +2041,7 @@ static void ggml_metal_log_allocated_size(id<MTLDevice> device, size_t size_alig
 }
 
 // rset init
-static bool ggml_metal_buffer_rset_init(ggml_metal_buffer_t buf) {
+static bool ggml_metal_buffer_rset_init(ggml_metal_buffer_t buf, bool request) {
     buf->rset = nil;
 
     if (!buf->use_residency_sets) {
@@ -2066,13 +2069,45 @@ static bool ggml_metal_buffer_rset_init(ggml_metal_buffer_t buf) {
         }
 
         [buf->rset commit];
-        [buf->rset requestResidency];
+
+        if (request) {
+            [buf->rset requestResidency];
+        }
 
         return true;
     }
 #endif
 
     return true;
+}
+
+// the first residency request maps every page of the buffer for the GPU: ~0.4 s for a fresh 16 GiB KV cache (M5 Max).
+// for a buffer that has not been touched yet it runs in the background and the set joins the keep-alive collection after,
+// so that the keep-alive loop does not hold the collection lock meanwhile. GGML_METAL_RSET_ASYNC_DISABLE turns this off
+static bool ggml_metal_buffer_rset_async(ggml_metal_buffer_t buf) {
+    const bool disabled = getenv("GGML_METAL_RSET_ASYNC_DISABLE") != NULL;
+
+    return !disabled && buf->is_shared && atomic_load_explicit(&buf->is_zero, memory_order_relaxed);
+}
+
+static void ggml_metal_buffer_rset_add(ggml_metal_buffer_t buf, bool async) {
+    if (!async || buf->rset == nil) {
+        ggml_metal_device_rsets_add(buf->dev, buf->rset);
+        return;
+    }
+
+#if defined(GGML_METAL_HAS_RESIDENCY_SETS)
+    if (@available(macOS 15.0, iOS 18.0, tvOS 18.0, visionOS 2.0, *)) {
+        id<MTLResidencySet> rset = buf->rset;
+        ggml_metal_device_t dev  = buf->dev;
+
+        buf->rset_group = dispatch_group_create();
+        dispatch_group_async(buf->rset_group, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            [rset requestResidency];
+            ggml_metal_device_rsets_add(dev, rset);
+        });
+    }
+#endif
 }
 
 // rset free
@@ -2171,13 +2206,15 @@ ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size,
 
     res->use_residency_sets = props_dev->use_residency_sets;
 
-    if (!ggml_metal_buffer_rset_init(res)) {
+    const bool rset_async = ggml_metal_buffer_rset_async(res);
+
+    if (!ggml_metal_buffer_rset_init(res, !rset_async)) {
         GGML_LOG_ERROR("%s: error: failed to initialize residency set\n", __func__);
         free(res);
         return NULL;
     }
 
-    ggml_metal_device_rsets_add(dev, res->rset);
+    ggml_metal_buffer_rset_add(res, rset_async);
 
     //ggml_metal_log_allocated_size(device, size_aligned);
 
@@ -2268,7 +2305,7 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
 
     res->use_residency_sets = props_dev->use_residency_sets;
 
-    if (!ggml_metal_buffer_rset_init(res)) {
+    if (!ggml_metal_buffer_rset_init(res, true)) {
         GGML_LOG_ERROR("%s: error: failed to initialize residency set\n", __func__);
         free(res);
         return NULL;
@@ -2281,6 +2318,11 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
 
 void ggml_metal_buffer_free(ggml_metal_buffer_t buf) {
     @autoreleasepool {
+        if (buf->rset_group) {
+            dispatch_group_wait(buf->rset_group, DISPATCH_TIME_FOREVER);
+            dispatch_release(buf->rset_group);
+        }
+
         ggml_metal_device_rsets_rm(buf->dev, buf->rset);
 
         for (int i = 0; i < buf->n_buffers; i++) {
