@@ -215,6 +215,12 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_att
         const struct ggml_tensor * op,
         bool has_mask,
         bool has_sinks);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_nax_gqa(
+        ggml_metal_library_t lib,
+        const struct ggml_tensor * op,
+        bool has_mask,
+        bool has_sinks,
+        int  wm);
 
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
         ggml_metal_library_t lib,
