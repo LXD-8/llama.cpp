@@ -1940,7 +1940,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_n
         ggml_metal_library_t lib,
         const ggml_tensor * op,
         bool has_mask,
-        bool has_sinks) {
+        bool has_sinks,
+        int  wm) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
     char base[256];
@@ -1949,7 +1950,12 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_n
     const int32_t dk = (int32_t) op->src[1]->ne[0];
     const int32_t dv = (int32_t) op->src[2]->ne[0];
 
-    snprintf(base, 256, "kernel_flash_attn_ext_nax_f16_dk%d_dv%d", dk, dv);
+    // wm > 0: the GQA variant with wm tiles of 16 query rows
+    if (wm > 0) {
+        snprintf(base, 256, "kernel_flash_attn_ext_nax_gqa_f16_dk%d_dv%d_wm%d", dk, dv, wm);
+    } else {
+        snprintf(base, 256, "kernel_flash_attn_ext_nax_f16_dk%d_dv%d", dk, dv);
+    }
     snprintf(name, 256, "%s_mask=%d_sinks=%d", base, has_mask, has_sinks);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
