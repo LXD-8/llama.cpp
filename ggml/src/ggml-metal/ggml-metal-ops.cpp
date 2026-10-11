@@ -3149,10 +3149,24 @@ static bool ggml_metal_op_mul_mat_f16_act_shape(const ggml_tensor * op) {
            ggml_metal_op_mul_mat_use_mm(op, true);
 }
 
+// the conversion is an extra dispatch with a barrier on each side, a fixed cost per mul_mm: below 128 src1 rows it
+// costs more than the half activations save (M5, Qwen3.8 27B Q4_K_M: +8-13 ms per step at 17-96 rows, break-even at
+// 128, -4% at 256), and so it does for small products (below 4 GFLOP, e.g. the K/V projections at 128-512 rows:
+// gpt-oss-20b pp128 -7%, Llama-3.1-8B Q8_0 -10%). The NAX mat-mat takes f16 activations only, so its shapes always
+// convert. GGML_METAL_MM_F16_ACT_ROWS_128_DISABLE converts at any size
+static bool ggml_metal_op_mul_mat_f16_act_rows(const ggml_tensor * op) {
+    static const bool disabled = getenv("GGML_METAL_MM_F16_ACT_ROWS_128_DISABLE") != nullptr; // read once per process
+
+    const double flop = 2.0*op->src[0]->ne[0]*op->src[0]->ne[1]*ggml_nrows(op->src[1]);
+
+    return disabled || (op->src[1]->ne[1] >= 128 && flop >= 4e9) || ggml_metal_op_mul_mat_nax_shape(op);
+}
+
 static bool ggml_metal_op_mul_mat_use_f16_act(const ggml_tensor * op, bool has_tensor) {
     static const bool disabled = getenv("GGML_METAL_MM_F16_ACT_DISABLE") != nullptr; // read once per process
 
     return has_tensor && !disabled && ggml_metal_op_mul_mat_f16_act_shape(op) &&
+           ggml_metal_op_mul_mat_f16_act_rows(op) &&
            ((uintptr_t) op->src[1]->data) % 16 == 0;
 }
 
@@ -3232,7 +3246,7 @@ size_t ggml_metal_op_mul_mat_extra_f16_act(const ggml_tensor * op, bool has_tens
 
     assert(op->op == GGML_OP_MUL_MAT);
 
-    if (disabled || !has_tensor || !ggml_metal_op_mul_mat_f16_act_shape(op)) {
+    if (disabled || !has_tensor || !ggml_metal_op_mul_mat_f16_act_shape(op) || !ggml_metal_op_mul_mat_f16_act_rows(op)) {
         return 0;
     }
 
