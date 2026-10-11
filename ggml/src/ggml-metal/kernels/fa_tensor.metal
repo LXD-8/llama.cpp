@@ -596,4 +596,294 @@ template [[host_name("kernel_flash_attn_ext_nax_f16_dk128_dv128")]] kernel flash
 template [[host_name("kernel_flash_attn_ext_nax_f16_dk256_dv256")]] kernel flash_attn_ext_nax_t kernel_flash_attn_ext_nax<256, 256, 2>;
 template [[host_name("kernel_flash_attn_ext_nax_f16_dk512_dv512")]] kernel flash_attn_ext_nax_t kernel_flash_attn_ext_nax<512, 512, 4>;
 
+// small batches (decode, MTP verify): the G query heads that share a KV head and the ne01 queries are packed into the
+// rows of one tile (packed row p = g*ne01 + i), so every K/V block is loaded once for all of them. the KV range is
+// split over NWG threadgroups; each writes its unnormalized O and its S, M into the temp buffer of the vec kernels,
+// and kernel_flash_attn_ext_vec_reduce combines them; the first one also folds in the sink. no ALiBi or softcap
+template<
+    short DK,
+    short DV,
+    short WN,
+    short WM,
+    short NWG = 32,
+    short BK  = OP_FLASH_ATTN_EXT_NAX_NCPSG>
+kernel void kernel_flash_attn_ext_nax_gqa(
+        constant ggml_metal_kargs_flash_attn_ext & args,
+        device const char * q,
+        device const char * k,
+        device const char * v,
+        device const char * mask,
+        device const char * sinks,
+        device       char * tmp,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    constexpr short kU  = 16;
+    constexpr short TK  = BK/kU;
+    constexpr short TDh = DK/kU/WN;
+    constexpr short BDh = DK/WN;
+
+    static_assert(DK == DV,     "DK must equal DV");
+    static_assert(TK % 2 == 0,  "scores are computed in pairs of fragments");
+    static_assert(TDh % 2 == 0, "O is accumulated in pairs of fragments");
+
+    const int iwg = tgpig[0];
+    const int hk  = tgpig[1];
+    const int iq3 = tgpig[2];
+
+    const int G = args.ne02/args.ne_12_2; // query heads per KV head
+    const int R = G*args.ne01;            // packed rows
+
+    const short row_group = sgitg/WN;
+    const short d_group   = sgitg%WN;
+
+    const short2 sc = nax_coord(tiisg);
+    const short fn = sc.x;
+    const short fm = sc.y;
+
+    // the two packed rows of this lane: query i, head h
+    int  ri[2];
+    int  rh[2];
+    bool rok[2];
+
+    FOR_UNROLL (short i = 0; i < 2; ++i) {
+        const int p = row_group*kU + fm + 8*i;
+        rok[i] = p < R;
+        const int pp = rok[i] ? p : 0;
+        ri[i] = pp % args.ne01;
+        rh[i] = hk*G + pp/args.ne01;
+    }
+
+    vec<half, 8> qf[TDh];
+    {
+        const float qs = args.scale*M_LOG2E_F;
+
+        FOR_UNROLL (short i = 0; i < 2; ++i) {
+            device const char * q0 = q + ri[i]*args.nb01 + rh[i]*args.nb02 + iq3*args.nb03;
+
+            FOR_UNROLL (short id = 0; id < TDh; ++id) {
+                float4 x = 0.0f;
+                if (rok[i]) {
+                    x = *((device const float4 *) q0 + (d_group*BDh + id*kU + fn)/4);
+                }
+
+                const half4 h = (half4) (x*qs);
+
+                FOR_UNROLL (short j = 0; j < 4; ++j) {
+                    qf[id][4*i + j] = h[j];
+                }
+            }
+        }
+    }
+
+    {
+        const int ikv3 = iq3/(args.ne03/args.ne_12_3);
+
+        k += hk*args.nb12 + ikv3*args.nb13;
+        v += hk*args.nb22 + ikv3*args.nb23;
+    }
+
+    const int sk = args.ns10;
+    const int sv = args.ns20;
+
+    device const half * pk = (device const half *) k + fm*sk + d_group*BDh + fn;
+    device const half * pv = (device const half *) v + fm*sv + d_group*BDh + fn;
+
+    device const half * pm[2];
+    FOR_UNROLL (short i = 0; i < 2; ++i) {
+        pm[i] = (device const half *) (mask + ri[i]*args.nb31 + (rh[i]%args.ne32)*args.nb32 + (iq3%args.ne33)*args.nb33) + fn;
+    }
+
+    vec<float, 8> of[TDh];
+    FOR_UNROLL (short id = 0; id < TDh; ++id) {
+        of[id] = 0.0f;
+    }
+
+    float M[2] = { -FLT_MAX/2, -FLT_MAX/2 };
+    float S[2] = { 0.0f, 0.0f };
+
+    threadgroup float * sx     = (threadgroup float *) shmem;
+    threadgroup float * sx_own = sx + (row_group*WN + d_group)*(TK*8*32) + tiisg*(TK*8);
+    threadgroup float * sx_row = sx + (row_group*WN          )*(TK*8*32) + tiisg*(TK*8);
+
+    // the host guarantees ne11 % BK == 0
+    const int nblk_k  = args.ne11/BK;
+    const int nblk_wg = (nblk_k + NWG - 1)/NWG;
+    const int ib0 = iwg*nblk_wg;
+    const int ib1 = min(nblk_k, ib0 + nblk_wg);
+
+    for (int ib = ib0; ib < ib1; ++ib) {
+        const int ic = ib*BK;
+
+        vec<float, 8> sf[TK];
+        FOR_UNROLL (short ik = 0; ik < TK; ++ik) {
+            sf[ik] = 0.0f;
+        }
+
+        FOR_UNROLL (short ik = 0; ik < TK; ik += 2) {
+            FOR_UNROLL (short id = 0; id < TDh; ++id) {
+                vec<half, 8> k0;
+                vec<half, 8> k1;
+
+                device const half * pk0 = pk + (ic + ik*kU)*sk + id*kU;
+                device const half * pk1 = pk0 + kU*sk;
+
+                FOR_UNROLL (short i = 0; i < 2; ++i) {
+                    const half4 a = *((device const half4 *) (pk0 + 8*i*sk));
+                    const half4 b = *((device const half4 *) (pk1 + 8*i*sk));
+
+                    FOR_UNROLL (short j = 0; j < 4; ++j) {
+                        k0[4*i + j] = a[j];
+                        k1[4*i + j] = b[j];
+                    }
+                }
+
+                nax_mma<float, half, half, true>(sf[ik], sf[ik + 1], qf[id], k0, k1);
+            }
+        }
+
+        if (WN > 1) {
+            FOR_UNROLL (short ik = 0; ik < TK; ++ik) {
+                FOR_UNROLL (short i = 0; i < 8; ++i) {
+                    sx_own[ik*8 + i] = sf[ik][i];
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            FOR_UNROLL (short ik = 0; ik < TK; ++ik) {
+                FOR_UNROLL (short i = 0; i < 8; ++i) {
+                    float s = sx_row[ik*8 + i];
+                    FOR_UNROLL (short g = 1; g < WN; ++g) {
+                        s += sx_row[g*(TK*8*32) + ik*8 + i];
+                    }
+                    sf[ik][i] = s;
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (FC_flash_attn_ext_nax_has_mask) {
+            FOR_UNROLL (short i = 0; i < 2; ++i) {
+                FOR_UNROLL (short ik = 0; ik < TK; ++ik) {
+                    device const half * pmi = pm[i] + ic + ik*kU;
+
+                    FOR_UNROLL (short j = 0; j < 4; ++j) {
+                        sf[ik][4*i + j] += M_LOG2E_F*(float) pmi[j];
+                    }
+                }
+            }
+        }
+
+        FOR_UNROLL (short i = 0; i < 2; ++i) {
+            float m = M[i];
+
+            FOR_UNROLL (short ik = 0; ik < TK; ++ik) {
+                m = max(m, max(max(sf[ik][4*i + 0], sf[ik][4*i + 1]), max(sf[ik][4*i + 2], sf[ik][4*i + 3])));
+            }
+
+            m = max(m, simd_shuffle_xor(m, 1));
+            m = max(m, simd_shuffle_xor(m, 8));
+
+            const float ms = fast::exp2(M[i] - m);
+            M[i] = m;
+
+            float sum = 0.0f;
+
+            FOR_UNROLL (short ik = 0; ik < TK; ++ik) {
+                FOR_UNROLL (short j = 0; j < 4; ++j) {
+                    const float p = fast::exp2(sf[ik][4*i + j] - m);
+                    sf[ik][4*i + j] = p;
+                    sum += p;
+                }
+            }
+
+            sum += simd_shuffle_xor(sum, 1);
+            sum += simd_shuffle_xor(sum, 8);
+
+            S[i] = S[i]*ms + sum;
+
+            FOR_UNROLL (short id = 0; id < TDh; ++id) {
+                FOR_UNROLL (short j = 0; j < 4; ++j) {
+                    of[id][4*i + j] *= ms;
+                }
+            }
+        }
+
+        FOR_UNROLL (short id = 0; id < TDh; id += 2) {
+            FOR_UNROLL (short ik = 0; ik < TK; ++ik) {
+                vec<half, 8> v0;
+                vec<half, 8> v1;
+
+                device const half * pv0 = pv + (ic + ik*kU)*sv + id*kU;
+
+                FOR_UNROLL (short i = 0; i < 2; ++i) {
+                    const half4 a = *((device const half4 *) (pv0 + 8*i*sv));
+                    const half4 b = *((device const half4 *) (pv0 + 8*i*sv + kU));
+
+                    FOR_UNROLL (short j = 0; j < 4; ++j) {
+                        v0[4*i + j] = a[j];
+                        v1[4*i + j] = b[j];
+                    }
+                }
+
+                nax_mma<float, float, half, false>(of[id], of[id + 1], sf[ik], v0, v1);
+            }
+        }
+    }
+
+    // partial results in the layout of kernel_flash_attn_ext_vec_reduce: O as float4 chunks interleaved over the NWG
+    // workgroups, then S and M (natural log) per row and workgroup
+    const int nrows = args.ne1*args.ne2*args.ne3;
+
+    device float4 * o4 = (device float4 *) tmp;
+    device float  * ss = (device float  *) tmp + (uint64_t) nrows*DV*NWG;
+
+    FOR_UNROLL (short i = 0; i < 2; ++i) {
+        if (!rok[i]) {
+            continue;
+        }
+
+        const uint64_t rid = ((uint64_t) iq3*args.ne2 + ri[i])*args.ne1 + rh[i];
+
+        if (FC_flash_attn_ext_nax_has_sinks && iwg == 0) {
+            const float s = M_LOG2E_F*((device const float *) sinks)[rh[i]];
+            const float m = max(M[i], s);
+            const float ms = fast::exp2(M[i] - m);
+
+            S[i] = S[i]*ms + fast::exp2(s - m);
+            M[i] = m;
+
+            FOR_UNROLL (short id = 0; id < TDh; ++id) {
+                FOR_UNROLL (short j = 0; j < 4; ++j) {
+                    of[id][4*i + j] *= ms;
+                }
+            }
+        }
+
+        FOR_UNROLL (short id = 0; id < TDh; ++id) {
+            const int c4 = (d_group*BDh + id*kU + fn)/4;
+            o4[(rid*(DV/4) + c4)*NWG + iwg] = float4(of[id][4*i + 0], of[id][4*i + 1], of[id][4*i + 2], of[id][4*i + 3]);
+        }
+
+        if (fn == 0 && d_group == 0) {
+            ss[rid*(2*NWG) + 2*iwg + 0] = S[i];
+            ss[rid*(2*NWG) + 2*iwg + 1] = M[i]*M_LN2_F;
+        }
+    }
+}
+
+typedef decltype(kernel_flash_attn_ext_nax_gqa<256, 256, 2, 1>) flash_attn_ext_nax_gqa_t;
+
+template [[host_name("kernel_flash_attn_ext_nax_gqa_f16_dk64_dv64_wm1")]]   kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<64,  64,  1, 1>;
+template [[host_name("kernel_flash_attn_ext_nax_gqa_f16_dk64_dv64_wm2")]]   kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<64,  64,  1, 2>;
+template [[host_name("kernel_flash_attn_ext_nax_gqa_f16_dk128_dv128_wm1")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<128, 128, 1, 1>;
+template [[host_name("kernel_flash_attn_ext_nax_gqa_f16_dk128_dv128_wm2")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<128, 128, 1, 2>;
+template [[host_name("kernel_flash_attn_ext_nax_gqa_f16_dk256_dv256_wm1")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<256, 256, 2, 1>;
+template [[host_name("kernel_flash_attn_ext_nax_gqa_f16_dk256_dv256_wm2")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<256, 256, 2, 2>;
+template [[host_name("kernel_flash_attn_ext_nax_gqa_f16_dk512_dv512_wm1")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<512, 512, 4, 1>;
+template [[host_name("kernel_flash_attn_ext_nax_gqa_f16_dk512_dv512_wm2")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<512, 512, 4, 2>;
+
 #endif // GGML_METAL_HAS_TENSOR
