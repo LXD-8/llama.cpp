@@ -3056,6 +3056,10 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         return ggml_metal_op_mul_mat_mma(ctx, idx);
     }
 
+    if (ggml_metal_op_mul_mat_xr_rows(op) > 0) {
+        return ggml_metal_op_mul_mat_mv(ctx, idx);
+    }
+
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);

@@ -140,9 +140,25 @@ static int64_t ggml_metal_mul_mv_mma_rows_min(enum ggml_type type) {
     }
 }
 
+// q4_K with 2-3 src1 rows and q5_K with 2: the cross-row mat-vec unpacks each block once for all rows
+int ggml_metal_op_mul_mat_xr_rows(const struct ggml_tensor * op) {
+    const ggml_tensor * src0 = op->src[0];
+    const ggml_tensor * src1 = op->src[1];
+
+    const int64_t rows_max = src0->type == GGML_TYPE_Q4_K ? 3 : src0->type == GGML_TYPE_Q5_K ? 2 : 0;
+
+    const bool ok = src1->type == GGML_TYPE_F32 && src1->ne[1] >= 2 && src1->ne[1] <= rows_max;
+
+    return ok ? (int) src1->ne[1] : 0;
+}
+
 bool ggml_metal_op_mul_mat_use_mma(const struct ggml_tensor * op) {
     const ggml_tensor * src0 = op->src[0];
     const ggml_tensor * src1 = op->src[1];
+
+    if (ggml_metal_op_mul_mat_xr_rows(op) > 0) {
+        return false;
+    }
 
     // the batch shape goes into int16 function constants
     const bool batch_ok = src1->ne[2] <= INT16_MAX && src1->ne[2]/src0->ne[2] <= INT16_MAX && src1->ne[3]/src0->ne[3] <= INT16_MAX;
