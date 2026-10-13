@@ -53,7 +53,7 @@ void ggml_graph_optimize(struct ggml_cgraph * gf);
 // mat-mat vs mat-vec dispatch; used by both supports_op and ggml_metal_op_mul_mat*
 bool ggml_metal_op_mul_mat_use_fwht (const struct ggml_tensor * op, size_t max_tg_mem);
 bool ggml_metal_op_mul_mat_use_mm   (const struct ggml_tensor * op, bool has_simdgroup_mm);
-bool ggml_metal_op_mul_mat_id_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm);
+bool ggml_metal_op_mul_mat_id_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm, bool has_tensor);
 
 bool ggml_metal_op_mul_mat_use_mma    (const struct ggml_tensor * op);
 int  ggml_metal_op_mul_mat_xr_rows    (const struct ggml_tensor * op); // src1 rows per threadgroup of the few-token mat-vec, 0 if not used
