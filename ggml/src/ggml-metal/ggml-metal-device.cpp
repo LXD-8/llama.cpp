@@ -924,6 +924,21 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_mma_auto(
     return pipeline;
 }
 
+// few-row NAX kernel: 32 src0 rows and 16*mr src1 rows per threadgroup of 4 simdgroups
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_nax(ggml_metal_library_t lib, const ggml_tensor * op, int mr, bool add) {
+    char name[64];
+    snprintf(name, sizeof(name), "kernel_mul_mv_nax_%s_f32_mr%d_add%d", ggml_type_name(op->src[0]->type), mr, add ? 1 : 0);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline_by_name(lib, name);
+
+    res.nsg  = 4;
+    res.nr0  = 32;
+    res.nr1  = 16*mr;
+    res.smem = (size_t) res.nsg*mr*2*8*32*sizeof(float);
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_mma(ggml_metal_library_t lib, const ggml_tensor * op, int nsg, int nt, int rt, bool add) {
     char base[256];
     char name[256];
