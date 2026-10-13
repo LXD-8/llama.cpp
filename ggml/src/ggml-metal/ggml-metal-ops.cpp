@@ -2564,7 +2564,7 @@ static int ggml_metal_op_mul_mat_mma(ggml_metal_op_t ctx, int idx) {
     GGML_TENSOR_LOCALS(uint64_t, nb1, op->src[1], nb);
     GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
 
-    // the MMA store adds the residual when the table fuses the ADD after this mat-mul
+    // the MMA or NAX store adds the residual when the table fuses the ADD after this mat-mul
     const int  n_fuse   = ggml_metal_op_try_fusion(ctx, idx, GGML_METAL_FUSION_MUL_MAT_ADD);
     const bool fuse_add = n_fuse > 1;
 
@@ -2575,6 +2575,51 @@ static int ggml_metal_op_mul_mat_mma(ggml_metal_op_t ctx, int idx) {
         dst = ctx->node(idx + n_fuse - 1);
         // the residual is the other operand of the ADD, by identity: it can itself be a MUL_MAT output
         res = dst->src[0] == op ? dst->src[1] : dst->src[0];
+    }
+
+    // a few src1 rows: dequantize into half fragments and multiply on the NAX units
+    const int mr = ggml_metal_device_get_props(ctx->dev)->has_tensor ? ggml_metal_op_mul_mat_mv_nax_mr(op) : 0;
+    if (mr > 0) {
+        const int nsg = 4;
+
+        char name[64];
+        snprintf(name, sizeof(name), "kernel_mul_mv_nax_%s_f32_mr%d_add%d", ggml_type_name(op->src[0]->type), mr, fuse_add ? 1 : 0);
+
+        auto pipeline_nax = ggml_metal_library_get_pipeline_by_name(lib, name);
+
+        ggml_metal_kargs_mul_mv_ext args = {
+            /*.ne00  =*/ ne00,
+            /*.ne01  =*/ ne01,
+            /*.ne02  =*/ ne02,
+            /*.nb00  =*/ nb00,
+            /*.nb01  =*/ nb01,
+            /*.nb02  =*/ nb02,
+            /*.nb03  =*/ nb03,
+            /*.ne10  =*/ ne10,
+            /*.ne11  =*/ ne11,
+            /*.ne12  =*/ ne12,
+            /*.nb10  =*/ nb10,
+            /*.nb11  =*/ nb11,
+            /*.nb12  =*/ nb12,
+            /*.nb13  =*/ nb13,
+            /*.ne0   =*/ ne0,
+            /*.ne1   =*/ ne1,
+            /*.r2    =*/ (int16_t) (ne12/ne02),
+            /*.r3    =*/ (int16_t) (ne13/ne03),
+        };
+
+        ggml_metal_encoder_set_pipeline(enc, pipeline_nax);
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dst),        3);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(res),        4);
+
+        ggml_metal_encoder_set_threadgroup_memory_size(enc, (size_t) nsg*mr*2*8*32*sizeof(float), 0);
+
+        ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + 31)/32, (ne11 + 16*mr - 1)/(16*mr), ne12*ne13, 32, nsg, 1);
+
+        return n_fuse;
     }
 
     auto pipeline = ggml_metal_library_get_pipeline_mul_mv_mma_auto(lib, op, fuse_add);
@@ -2843,7 +2888,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         return ggml_metal_op_fwht(ctx, idx);
     }
 
-    if (props_dev->has_simdgroup_mm && ggml_metal_op_mul_mat_use_mma(op)) {
+    if (props_dev->has_simdgroup_mm && (ggml_metal_op_mul_mat_use_mma(op) || (props_dev->has_tensor && ggml_metal_op_mul_mat_mv_nax_mr(op) > 0))) {
         return ggml_metal_op_mul_mat_mma(ctx, idx);
     }
 
