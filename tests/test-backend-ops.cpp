@@ -10862,9 +10862,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // token-tile boundary coverage. With n_used == n_mats every token routes to every expert, so
     // each expert receives exactly n rows, with no dependence on the random draw. mul_mm_id is used
-    // from 32 tokens up: n = 32, 33, 47, 48, 49 reach it, leaving a last tile of 32, 1, 15, 16 and
-    // 17 rows - 16 and 17 straddle the point where the upper half stops being skipped. The smaller
-    // n cover the same row counts on the mat-vec path.
+    // from 16 tokens up (Metal): n = 32, 33, 47, 48, 49 leave a last tile of 32, 1, 15, 16 and 17
+    // rows - 16 and 17 straddle the point where the upper half stops being skipped - and n = 16, 17,
+    // 31 a single tile. n = 1 and 15 cover the mat-vec path.
     for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_IQ2_XS, GGML_TYPE_F16}) {
         for (int n : {1, 15, 16, 17, 31, 32, 33, 47, 48, 49}) {
             test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 4, false, 512, n, 256));
