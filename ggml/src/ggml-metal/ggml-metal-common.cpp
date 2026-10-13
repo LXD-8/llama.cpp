@@ -178,6 +178,89 @@ bool ggml_metal_op_mul_mat_may_use_mma(const struct ggml_tensor * op) {
     return ggml_metal_mul_mv_mma_type_supported(op->src[0]->type) && op->src[1]->type == GGML_TYPE_F32;
 }
 
+// the most src1 rows for which the NAX few-row kernel, in passes of 32 rows, beats the mat-mat kernels (M5 Max,
+// synthetic weights); past 64 rows it is slower for every type
+static int64_t ggml_metal_mul_mv_nax_rows_max(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_F32:
+            return 32;
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ1_M:
+            return 40;
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ1_S:
+            return 48;
+        case GGML_TYPE_MXFP4:
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_IQ4_XS:
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_S:
+            return 56;
+        default:
+            return 64;
+    }
+}
+
+// whether the NAX few-row kernel beats the other kernels at ne11 src1 rows (M5 Max, every weight type on synthetic
+// weights): from 17 rows the mat-mat kernels for every type, from 9 rows the few-row MMA kernels for every quantized
+// type, and below that only for the types whose dequantization costs the MMA kernels the most
+static bool ggml_metal_mul_mv_nax_rows_ok(enum ggml_type type, int64_t ne11) {
+    if (ne11 < 2 || ne11 > ggml_metal_mul_mv_nax_rows_max(type)) {
+        return false;
+    }
+    if (ne11 > GGML_METAL_MMA_ROWS_MAX) {
+        return true;
+    }
+    if (type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16) {
+        return false;
+    }
+    if (ne11 >= 9) {
+        return true;
+    }
+
+    switch (type) {
+        case GGML_TYPE_Q1_0:
+        case GGML_TYPE_Q2_0:
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ1_S:
+        case GGML_TYPE_IQ1_M:
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_IQ4_XS:
+            return true;
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_TQ2_0:
+        case GGML_TYPE_Q5_K:
+            return ne11 >= 3;
+        case GGML_TYPE_Q6_K:
+            return ne11 <= 4;
+        default:
+            return false;
+    }
+}
+
+int ggml_metal_op_mul_mat_mv_nax_mr(const struct ggml_tensor * op) {
+    static const bool disabled = getenv("GGML_METAL_MV_NAX_DISABLE") != nullptr; // read once per process
+
+    const ggml_tensor * src0 = op->src[0];
+    const ggml_tensor * src1 = op->src[1];
+
+    const int64_t ne11 = src1->ne[1];
+
+    const bool ok = !disabled && ggml_metal_mul_mv_mma_type_supported(src0->type) && src1->type == GGML_TYPE_F32 &&
+        ggml_metal_mul_mv_nax_rows_ok(src0->type, ne11) &&
+        src0->ne[0] % 64 == 0 && src0->ne[0] % ggml_blck_size(src0->type) == 0 &&
+        src0->nb[0] == ggml_type_size(src0->type) && !ggml_is_transposed(src0) &&
+        src1->nb[0] == sizeof(float) && src1->nb[1] % 16 == 0 && ggml_is_contiguous_rows(src1);
+
+    return ok ? (ne11 <= GGML_METAL_MMA_ROWS_MAX ? 1 : 2) : 0;
+}
+
 // represents a memory range (i.e. an interval from a starting address p0 to an ending address p1 in a given buffer pb)
 // the type indicates whether it is a source range (i.e. ops read data from it) or a destination range (i.e. ops write data to it)
 struct ggml_mem_range {
