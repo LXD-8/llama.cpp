@@ -9,6 +9,7 @@ constant short FC_mul_mm_r2    [[function_constant(FC_MUL_MM + 4)]];
 constant short FC_mul_mm_r3    [[function_constant(FC_MUL_MM + 5)]];
 constant bool FC_mul_mm_id_amax [[function_constant(FC_MUL_MM + 6)]];
 constant int32_t FC_mul_mm_id_map0_ne02 [[function_constant(FC_MUL_MM + 7)]];
+constant bool FC_mul_mm_id_wide [[function_constant(FC_MUL_MM + 8)]]; // tiles of 64 entries instead of 32 (tensor kernel)
 
 // converts the f32 activations of a mul_mm to contiguous f16 rows, so that the tensor kernels take half operands
 // values are saturated to the half range - the simdgroup kernels round the activations to half as well
@@ -979,7 +980,11 @@ kernel void kernel_mul_mm_id_map0(
     // every slice is padded by one entry for the uniform dummy store of pass 2 - and emit the
     // entry tile descriptors of kernel_mul_mm_id: (expert, first entry, valid rows) per tile
     if (tpitg == 0) {
+#ifdef GGML_METAL_HAS_TENSOR
+        const uint32_t NTILE = FC_mul_mm_id_wide ? 64 : 32; // must match the tiles of kernel_mul_mm_id
+#else
         constexpr uint32_t NTILE = 32; // must match NR1 of kernel_mul_mm_id
+#endif
 
         uint32_t base = 0;
         uint32_t tile = 0;
@@ -1178,7 +1183,12 @@ kernel void kernel_mul_mm_id(
 #endif
 
     constexpr int NR0 = 64;
+#ifdef GGML_METAL_HAS_TENSOR
+    // up to 64 entries per tile (FC_mul_mm_id_wide): an expert with many tokens dequantizes its weights half as often
+    constexpr int NR1 = 64;
+#else
     constexpr int NR1 = 32;
+#endif
 
     constexpr int NK  = 32;
     constexpr int NL0 = NK/16;
@@ -1217,9 +1227,6 @@ kernel void kernel_mul_mm_id(
 
     const short iy = 8*(tiitg % NL1);
 
-    // skip the upper half of the token tile when the expert did not fill it
-    constexpr short NR1H = NR1/2;
-
     // power-of-two rescaling
     const float s1_inv   = FC_mul_mm_id_amax ? ((device const float *) amax)[0] : 1.0f;
     const float s1_scale = FC_mul_mm_id_amax ? ((device const float *) amax)[1] : 1.0f;
@@ -1232,13 +1239,20 @@ kernel void kernel_mul_mm_id(
 #else
     auto tA  = tensor<threadgroup S0, dextents<int32_t, 2>, tensor_inline>(sa, dextents<int32_t, 2>(NK, NR0));
 
-    // sb is [NR1][NK] row-major
-    auto tB0 = tensor<threadgroup S1, dextents<int32_t, 2>, tensor_inline>(sb,             dextents<int32_t, 2>(NK, NR1H));
-    auto tB1 = tensor<threadgroup S1, dextents<int32_t, 2>, tensor_inline>(sb + NR1H*NK,   dextents<int32_t, 2>(NK, NR1H));
+    // sb is [NR1][NK] row-major, multiplied in quarters of 16 rows - the quarters past the entries are skipped
+    constexpr short NR1Q = NR1/4;
+
+    auto tB0 = tensor<threadgroup S1, dextents<int32_t, 2>, tensor_inline>(sb,            dextents<int32_t, 2>(NK, NR1Q));
+    auto tB1 = tensor<threadgroup S1, dextents<int32_t, 2>, tensor_inline>(sb + 1*NR1Q*NK, dextents<int32_t, 2>(NK, NR1Q));
+    auto tB2 = tensor<threadgroup S1, dextents<int32_t, 2>, tensor_inline>(sb + 2*NR1Q*NK, dextents<int32_t, 2>(NK, NR1Q));
+    auto tB3 = tensor<threadgroup S1, dextents<int32_t, 2>, tensor_inline>(sb + 3*NR1Q*NK, dextents<int32_t, 2>(NK, NR1Q));
 
     mpp::tensor_ops::matmul2d<
-        mpp::tensor_ops::matmul2d_descriptor(NR1H, NR0, NK, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
+        mpp::tensor_ops::matmul2d_descriptor(NR1Q, NR0, NK, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
         execution_simdgroups<4>> mm;
+
+    // with wide tiles each thread also loads the src1 row lr1 + 32
+    const short lr1b = ((short)tiitg/NL1 + 32) < nr1 ? ((short)tiitg/NL1 + 32) : nr1 - 1;
 
 #endif
 
@@ -1259,9 +1273,12 @@ kernel void kernel_mul_mm_id(
         + args.nb11*i11
         + args.nb10*iy);
 
+#ifndef GGML_METAL_HAS_TENSOR
+    // skip the upper half of the token tile when the expert did not fill it
+    constexpr short NR1H = NR1/2;
+
     const bool has_hi = nr1 > NR1H;
 
-#ifndef GGML_METAL_HAS_TENSOR
     for (short i = 0; i < 8; i++){
         mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
     }
@@ -1269,8 +1286,18 @@ kernel void kernel_mul_mm_id(
     // simdgroups 2,3 own rows NR1H..NR1-1
     const bool sg_active = has_hi || sgitg < 2;
 #else
+    const int id2 = FC_mul_mm_id_wide ? ids_i32[idb + lr1b] : 0;
+
+    device const T1 * y2 = (device const T1 *)(src1
+        + args.nb13*i13
+        + args.nb12*(id2 / args.ne20)
+        + args.nb11*((id2 % args.ne20) % args.ne11)
+        + args.nb10*iy);
+
     auto cT0 = mm.get_destination_cooperative_tensor<decltype(tA), decltype(tB0), float>();
     auto cT1 = mm.get_destination_cooperative_tensor<decltype(tA), decltype(tB1), float>();
+    auto cT2 = mm.get_destination_cooperative_tensor<decltype(tA), decltype(tB2), float>();
+    auto cT3 = mm.get_destination_cooperative_tensor<decltype(tA), decltype(tB3), float>();
 #endif
 
     for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
@@ -1390,7 +1417,10 @@ kernel void kernel_mul_mm_id(
                 //const short lx = (tiitg/NL1)%8;
                 //const short ly = i;
 
-                *(sb + NK*(8*sy + ly) + 8*sx + lx) = loop_k + iy + i < args.ne00 ? (S1) (*((device T1 *) y + i) * (T1) s1_inv) : 0;
+                *(sb + NK*(8*sy + ly) + 8*sx + lx)         = loop_k + iy + i < args.ne00 ? (S1) (*((device T1 *) y  + i) * (T1) s1_inv) : 0;
+                if (FC_mul_mm_id_wide) {
+                    *(sb + NK*(8*sy + ly + 32) + 8*sx + lx) = loop_k + iy + i < args.ne00 ? (S1) (*((device T1 *) y2 + i) * (T1) s1_inv) : 0;
+                }
             }
         } else {
             const short sx = (tiitg%NL1);
@@ -1401,8 +1431,13 @@ kernel void kernel_mul_mm_id(
             //const short lx = (tiitg/NL1)%8;
             //const short ly = i;
 
-            *(threadgroup S1_2x4 *)(sb + NK*(8*sy + ly) + 8*sx) = (S1_2x4)((*((device T1_2x4 *) y)) * (T1) s1_inv);
+            *(threadgroup S1_2x4 *)(sb + NK*(8*sy + ly) + 8*sx)      = (S1_2x4)((*((device T1_2x4 *) y))  * (T1) s1_inv);
+            if (FC_mul_mm_id_wide) {
+                *(threadgroup S1_2x4 *)(sb + NK*(8*sy + ly + 32) + 8*sx) = (S1_2x4)((*((device T1_2x4 *) y2)) * (T1) s1_inv);
+            }
         }
+
+        y2 += NK;
 #endif
 
         il = (il + 2 < nl) ? il + 2 : il % 2;
@@ -1447,10 +1482,17 @@ kernel void kernel_mul_mm_id(
 
         mm.run(sB0, sA, cT0);
 
-        if (has_hi) {
+        if (nr1 > 1*NR1Q) {
             auto sB1 = tB1.slice(0, 0);
-
             mm.run(sB1, sA, cT1);
+        }
+        if (nr1 > 2*NR1Q) {
+            auto sB2 = tB2.slice(0, 0);
+            mm.run(sB2, sA, cT2);
+        }
+        if (nr1 > 3*NR1Q) {
+            auto sB3 = tB3.slice(0, 0);
+            mm.run(sB3, sA, cT3);
         }
 #endif
     }
@@ -1459,12 +1501,20 @@ kernel void kernel_mul_mm_id(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
 #ifdef GGML_METAL_HAS_TENSOR
-    auto tC0 = tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline>(sc,             dextents<int32_t, 2>(NR0, NR1H));
+    auto tC0 = tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline>(sc, dextents<int32_t, 2>(NR0, NR1Q));
     cT0.store(tC0);
 
-    if (has_hi) {
-        auto tC1 = tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline>(sc + NR1H*NR0, dextents<int32_t, 2>(NR0, NR1H));
+    if (nr1 > 1*NR1Q) {
+        auto tC1 = tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline>(sc + 1*NR1Q*NR0, dextents<int32_t, 2>(NR0, NR1Q));
         cT1.store(tC1);
+    }
+    if (nr1 > 2*NR1Q) {
+        auto tC2 = tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline>(sc + 2*NR1Q*NR0, dextents<int32_t, 2>(NR0, NR1Q));
+        cT2.store(tC2);
+    }
+    if (nr1 > 3*NR1Q) {
+        auto tC3 = tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline>(sc + 3*NR1Q*NR0, dextents<int32_t, 2>(NR0, NR1Q));
+        cT3.store(tC3);
     }
 #else
     if (sg_active) {
