@@ -1858,7 +1858,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_MUL_MAT_ID:
             return ggml_metal_supports_mul_mat_op(
                     has_simdgroup_reduction, op, false,
-                    ggml_metal_op_mul_mat_id_use_mm(op, has_simdgroup_mm));
+                    ggml_metal_op_mul_mat_id_use_mm(op, has_simdgroup_mm, dev->props.has_tensor));
         case GGML_OP_SET:
         case GGML_OP_CPY:
         case GGML_OP_DUP:
