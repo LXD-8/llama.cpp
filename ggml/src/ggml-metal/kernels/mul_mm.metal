@@ -53,7 +53,8 @@ kernel void kernel_mul_mm_dq_f16(
     }
 }
 
-// the quantized weight types of the NAX mat-mat paths (name, block, nl, dequantize)
+// the quantized weight types of the NAX mat-mat paths (name, block, nl, dequantize); q5_K is listed per path, because
+// the few-row kernel dequantizes it with dequantize_q5_K_nax
 #define NAX_QTYPES(X) \
     X(q4_0,    block_q4_0,    2,     dequantize_q4_0) \
     X(q4_1,    block_q4_1,    2,     dequantize_q4_1) \
@@ -61,7 +62,6 @@ kernel void kernel_mul_mm_dq_f16(
     X(q5_1,    block_q5_1,    2,     dequantize_q5_1) \
     X(q8_0,    block_q8_0,    2,     dequantize_q8_0) \
     X(q4_K,    block_q4_K,    QK_NL, dequantize_q4_K) \
-    X(q5_K,    block_q5_K,    QK_NL, dequantize_q5_K) \
     X(q6_K,    block_q6_K,    QK_NL, dequantize_q6_K) \
     X(q1_0,    block_q1_0,    8,     dequantize_q1_0) \
     X(q2_0,    block_q2_0,    4,     dequantize_q2_0) \
@@ -85,6 +85,7 @@ typedef decltype(kernel_mul_mm_dq_f16<block_q4_K, QK_NL, dequantize_q4_K>) mul_m
 template [[host_name("kernel_mul_mm_dq_" #name "_f16")]] kernel mul_mm_dq_t kernel_mul_mm_dq_f16<block_q, nl, deq>;
 
 NAX_QTYPES(DQ_F16_INSTANCE)
+DQ_F16_INSTANCE(q5_K, block_q5_K, QK_NL, dequantize_q5_K)
 
 // dst[m][n] = sum_k src1[m][k] * src0[n][k] with f16 or int8 operands loaded straight into registers
 // no threadgroup memory: the BM x BN tile is split across WM x WN simdgroups, each owning a (BM/WM) x (BN/WN) block
@@ -372,6 +373,7 @@ typedef decltype(kernel_mul_mm_dq_i8<block_q4_K, QK_NL, dequantize_q4_K>) mul_mm
 template [[host_name("kernel_mul_mm_dq_" #name "_i8")]] kernel mul_mm_dq_i8_t kernel_mul_mm_dq_i8<block_q, nl, deq>;
 
 NAX_QTYPES(DQ_I8_INSTANCE)
+DQ_I8_INSTANCE(q5_K, block_q5_K, QK_NL, dequantize_q5_K)
 
 [[kernel, max_total_threads_per_threadgroup(OP_MUL_MM_NAX_WM*OP_MUL_MM_NAX_WN*32)]]
 void kernel_mul_mm_nax_i8(
@@ -1453,3 +1455,200 @@ template [[host_name("kernel_mul_mm_id_iq1_m_f16")]]   kernel mul_mm_id kernel_m
 template [[host_name("kernel_mul_mm_id_iq4_nl_f16")]]  kernel mul_mm_id kernel_mul_mm_id<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq4_nl,  2,     dequantize_iq4_nl,  float,  float4x4,  half, half2x4>;
 template [[host_name("kernel_mul_mm_id_iq4_xs_f16")]]  kernel mul_mm_id kernel_mul_mm_id<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq4_xs,  QK_NL, dequantize_iq4_xs,  float,  float4x4,  half, half2x4>;
 template [[host_name("kernel_mul_mm_id_tq2_0_f16")]]   kernel mul_mm_id kernel_mul_mm_id<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_tq2_0,   QK_NL, dequantize_tq2_0,   float,  float4x4,  half, half2x4>;
+
+#ifdef GGML_METAL_HAS_TENSOR
+// few-row mat-mat on the NAX units (2..32 src1 rows, e.g. MTP verify batches, short prompts): the src1 rows are the M = 16
+// rows of a 16x32x16 matmul2d (MR of them per pass), 32 weight rows are its N columns. each lane dequantizes 16 weights per
+// step straight into a half fragment (no threadgroup memory); the NSG simdgroups split K and are summed at the end. the lane
+// layout is that of nax_coord
+
+// the 16 weights of dequantize_q5_K, with 16-byte loads and bit operations instead of a branch per weight
+template <typename type4x4>
+void dequantize_q5_K_nax(device const block_q5_K * xb, short il, thread type4x4 & reg) {
+    const uint4 qv = *((device const uint4 *) (xb->qs + 32*(il/4) + 16*(il&1)));
+    const uint4 hv = *((device const uint4 *) (xb->qh + 16*(il&1)));
+
+    const short hb = il/2;
+    const short is = (il/4)*2;
+    il = il & 3;
+
+    const uchar2 sc = get_scale_min_k4_just2(is, il/2, xb->scales);
+    const float dl = (float) xb->d    * sc[0];
+    const float ml = (float) xb->dmin * sc[1];
+
+    const short sh = il < 2 ? 0 : 4;
+
+    FOR_UNROLL (short k = 0; k < 4; ++k) {
+        const uint v = ((qv[k] >> sh) & 0x0F0F0F0F) | (((hv[k] >> hb) & 0x01010101) << 4);
+        reg[k][0] = dl*(float) ((v      ) & 0xFF) - ml;
+        reg[k][1] = dl*(float) ((v >>  8) & 0xFF) - ml;
+        reg[k][2] = dl*(float) ((v >> 16) & 0xFF) - ml;
+        reg[k][3] = dl*(float) ((v >> 24)       ) - ml;
+    }
+}
+
+// the weights go through the dequantize function of their type. a lane needs 4 weights at K offsets fn..fn + 3 of each
+// 16-wide K slice s, so K is permuted inside each 64-weight chunk: logical (s, fn + jj) is physical 16*(fn/4) + 4*s + jj,
+// identically for src0 and src1. a lane then dequantizes one whole 16-weight group per weight row and chunk, which is the
+// unit of the dequantize functions
+template<typename block_q, short nl, void (*deq)(device const block_q *, short, thread half4x4 &), short MR, bool ADD>
+kernel void kernel_mul_mv_nax_f32(
+        constant ggml_metal_kargs_mul_mv_ext & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        device const char * src2,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort3 ntg  [[threads_per_threadgroup]]) {
+    const short NSG = ntg.y;
+
+    const short2 lc = nax_coord(tiisg);
+    const short fn = lc.x;
+    const short fm = lc.y;
+
+    const int i01 = tgpig.x*32;
+    const int i11 = tgpig.y*16*MR;
+    const int im  = tgpig.z;
+
+    const int i12 = im%args.ne12;
+    const int i13 = im/args.ne12;
+
+    const uint64_t offset0 = (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
+    const uint64_t offset1 = i12*args.nb12 + i13*args.nb13;
+
+    // weight rows of this lane: half h, row 16*h + fm + 8*i
+    device const block_q * x[2][2];
+    FOR_UNROLL (short h = 0; h < 2; ++h) {
+        FOR_UNROLL (short i = 0; i < 2; ++i) {
+            const int r = min(i01 + 16*h + fm + 8*i, args.ne01 - 1);
+            x[h][i] = (device const block_q *) (src0 + offset0 + (uint64_t) r*args.nb01);
+        }
+    }
+
+    // src1 rows of this lane: i11 + 16*m + fm and i11 + 16*m + fm + 8 for each of the MR 16-row tiles (zero past ne11)
+    device const float * y[MR][2];
+    bool yok[MR][2];
+    FOR_UNROLL (short m = 0; m < MR; ++m) {
+        FOR_UNROLL (short i = 0; i < 2; ++i) {
+            const int r = i11 + 16*m + fm + 8*i;
+            yok[m][i] = r < args.ne11;
+            y[m][i] = (device const float *) (src1 + offset1 + (uint64_t) (yok[m][i] ? r : 0)*args.nb11);
+        }
+    }
+
+    vec<float, 8> c[MR][2];
+    FOR_UNROLL (short m = 0; m < MR; ++m) {
+        c[m][0] = 0.0f;
+        c[m][1] = 0.0f;
+    }
+
+    const int nch = args.ne00/64;
+
+    for (int ch = sgitg; ch < nch; ch += NSG) {
+        // the 16-weight group of this lane: weights p .. p + 15 of the row
+        const int p = 64*ch + 4*fn;
+        const int ib = p/(16*nl);
+        const short il = (p/16)%nl;
+
+        vec<half, 8> b[4][2];
+        FOR_UNROLL (short h = 0; h < 2; ++h) {
+            FOR_UNROLL (short i = 0; i < 2; ++i) {
+                half4x4 w;
+                deq(x[h][i] + ib, il, w);
+                FOR_UNROLL (short s = 0; s < 4; ++s) {
+                    FOR_UNROLL (short jj = 0; jj < 4; ++jj) {
+                        b[s][h][4*i + jj] = w[s][jj];
+                    }
+                }
+            }
+        }
+
+        FOR_UNROLL (short m = 0; m < MR; ++m) {
+            vec<half, 8> a[4];
+            FOR_UNROLL (short s = 0; s < 4; ++s) {
+                FOR_UNROLL (short i = 0; i < 2; ++i) {
+                    const float4 v = yok[m][i] ? *((device const float4 *) (y[m][i] + p + 4*s)) : float4(0.0f);
+                    FOR_UNROLL (short jj = 0; jj < 4; ++jj) {
+                        a[s][4*i + jj] = (half) v[jj];
+                    }
+                }
+            }
+
+            FOR_UNROLL (short s = 0; s < 4; ++s) {
+                nax_mma<float, half, half, true>(c[m][0], c[m][1], a[s], b[s][0], b[s][1]);
+            }
+        }
+    }
+
+    // sum the NSG partial results: lane layout [sg][m][h][8][32]
+    threadgroup float * red = (threadgroup float *) shmem;
+
+    if (NSG > 1) {
+        FOR_UNROLL (short m = 0; m < MR; ++m) {
+            FOR_UNROLL (short h = 0; h < 2; ++h) {
+                FOR_UNROLL (short e = 0; e < 8; ++e) {
+                    red[(((sgitg*MR + m)*2 + h)*8 + e)*32 + tiisg] = c[m][h][e];
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (sgitg != 0) {
+            return;
+        }
+
+        for (short sg = 1; sg < NSG; ++sg) {
+            FOR_UNROLL (short m = 0; m < MR; ++m) {
+                FOR_UNROLL (short h = 0; h < 2; ++h) {
+                    FOR_UNROLL (short e = 0; e < 8; ++e) {
+                        c[m][h][e] += red[(((sg*MR + m)*2 + h)*8 + e)*32 + tiisg];
+                    }
+                }
+            }
+        }
+    }
+
+    device       float * dst_f32 = (device       float *) dst  + (uint64_t) im*args.ne0*args.ne1;
+    device const float * res_f32 = (device const float *) src2 + (uint64_t) im*args.ne0*args.ne1;
+
+    FOR_UNROLL (short m = 0; m < MR; ++m) {
+        FOR_UNROLL (short i = 0; i < 2; ++i) {
+            const int r1 = i11 + 16*m + fm + 8*i;
+            if (r1 >= args.ne11) {
+                continue;
+            }
+
+            FOR_UNROLL (short h = 0; h < 2; ++h) {
+                FOR_UNROLL (short jj = 0; jj < 4; ++jj) {
+                    const int r0 = i01 + 16*h + fn + jj;
+                    if (r0 < args.ne01) {
+                        const uint64_t idx = (uint64_t) r1*args.ne0 + r0;
+                        const float v = c[m][h][4*i + jj];
+                        dst_f32[idx] = ADD ? v + res_f32[idx] : v;
+                    }
+                }
+            }
+        }
+    }
+}
+
+typedef decltype(kernel_mul_mv_nax_f32<block_q4_K, QK_NL, dequantize_q4_K, 1, false>) mul_mv_nax_t;
+
+#define MV_NAX_INSTANCE(name, block_q, nl, deq) \
+template [[host_name("kernel_mul_mv_nax_" #name "_f32_mr1_add0")]] kernel mul_mv_nax_t kernel_mul_mv_nax_f32<block_q, nl, deq, 1, false>; \
+template [[host_name("kernel_mul_mv_nax_" #name "_f32_mr1_add1")]] kernel mul_mv_nax_t kernel_mul_mv_nax_f32<block_q, nl, deq, 1, true>; \
+template [[host_name("kernel_mul_mv_nax_" #name "_f32_mr2_add0")]] kernel mul_mv_nax_t kernel_mul_mv_nax_f32<block_q, nl, deq, 2, false>; \
+template [[host_name("kernel_mul_mv_nax_" #name "_f32_mr2_add1")]] kernel mul_mv_nax_t kernel_mul_mv_nax_f32<block_q, nl, deq, 2, true>;
+
+MV_NAX_INSTANCE(f32,     float4x4,      1,     dequantize_f32)
+MV_NAX_INSTANCE(f16,     half4x4,       1,     dequantize_f16)
+#if defined(GGML_METAL_HAS_BF16)
+MV_NAX_INSTANCE(bf16,    bfloat4x4,     1,     dequantize_bf16)
+#endif
+NAX_QTYPES(MV_NAX_INSTANCE)
+MV_NAX_INSTANCE(q5_K,    block_q5_K,    QK_NL, dequantize_q5_K_nax)
+#endif // GGML_METAL_HAS_TENSOR
