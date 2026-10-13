@@ -58,6 +58,7 @@ bool ggml_metal_op_mul_mat_id_use_mm(const struct ggml_tensor * op, bool has_sim
 bool ggml_metal_op_mul_mat_use_mma    (const struct ggml_tensor * op);
 int  ggml_metal_op_mul_mat_xr_rows    (const struct ggml_tensor * op); // src1 rows per threadgroup of the few-token mat-vec, 0 if not used
 bool ggml_metal_op_mul_mat_may_use_mma(const struct ggml_tensor * op); // graph structure only
+int  ggml_metal_op_mul_mat_mv_nax_mr  (const struct ggml_tensor * op); // 16-row tiles per pass of the NAX few-row kernel (1 or 2), 0 if not used; graph structure only
 
 // the few-row MMA kernel for a src0 type and rt src1 tiles: per 32-weight block (q4_0, q8_0 with one tile), q5_K, or the generic 64-weight chunk kernel
 enum ggml_metal_mma_kind { GGML_METAL_MMA_KIND_BLK, GGML_METAL_MMA_KIND_Q5_K, GGML_METAL_MMA_KIND_GEN };
