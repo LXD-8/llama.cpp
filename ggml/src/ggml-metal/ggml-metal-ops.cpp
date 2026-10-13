@@ -2784,7 +2784,7 @@ static int ggml_metal_op_mul_mat_mma(ggml_metal_op_t ctx, int idx) {
     GGML_TENSOR_LOCALS(uint64_t, nb1, op->src[1], nb);
     GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
 
-    // the MMA store adds the residual when the table fuses the ADD after this mat-mul
+    // the MMA or NAX store adds the residual when the table fuses the ADD after this mat-mul
     const int  n_fuse   = ggml_metal_op_try_fusion(ctx, idx, GGML_METAL_FUSION_MUL_MAT_ADD);
     const bool fuse_add = n_fuse > 1;
 
@@ -2796,8 +2796,6 @@ static int ggml_metal_op_mul_mat_mma(ggml_metal_op_t ctx, int idx) {
         // the residual is the other operand of the ADD, by identity: it can itself be a MUL_MAT output
         res = dst->src[0] == op ? dst->src[1] : dst->src[0];
     }
-
-    auto pipeline = ggml_metal_library_get_pipeline_mul_mv_mma_auto(lib, op, fuse_add);
 
     ggml_metal_kargs_mul_mv_ext args = {
         /*.ne00  =*/ ne00,
@@ -2819,6 +2817,12 @@ static int ggml_metal_op_mul_mat_mma(ggml_metal_op_t ctx, int idx) {
         /*.r2    =*/ (int16_t) (ne12/ne02),
         /*.r3    =*/ (int16_t) (ne13/ne03),
     };
+
+    // a few src1 rows: the weights are dequantized into half fragments and multiplied on the NAX units
+    const int mr = ggml_metal_device_get_props(ctx->dev)->has_nax ? ggml_metal_op_mul_mat_mv_nax_mr(op) : 0;
+
+    auto pipeline = mr > 0 ? ggml_metal_library_get_pipeline_mul_mv_nax(lib, op, mr, fuse_add) :
+                             ggml_metal_library_get_pipeline_mul_mv_mma_auto(lib, op, fuse_add);
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
@@ -3059,7 +3063,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         return ggml_metal_op_fwht(ctx, idx);
     }
 
-    if (props_dev->has_simdgroup_mm && ggml_metal_op_mul_mat_use_mma(op)) {
+    if (props_dev->has_simdgroup_mm && (ggml_metal_op_mul_mat_use_mma(op) || (props_dev->has_nax && ggml_metal_op_mul_mat_mv_nax_mr(op) > 0))) {
         return ggml_metal_op_mul_mat_mma(ctx, idx);
     }
 

@@ -677,7 +677,7 @@ static const struct ggml_tensor * ggml_metal_mul_mat_add_residual(const struct g
 }
 
 // MUL_MAT + ADD of an f32 non-weight: the reorder packs it without reading row counts, so ubatch sizes share one order;
-// the encoder fuses only a same-shape residual in the few-row MMA store, which the sum may overlap only in place
+// the encoder fuses only a same-shape residual in the few-row MMA or NAX store, which the sum may overlap only in place
 static bool ggml_metal_fusion_check_mul_mat_add(
         const ggml_metal_fusion       * fusion,
         const ggml_tensor * const     * nodes,
@@ -704,7 +704,7 @@ static bool ggml_metal_fusion_check_mul_mat_add(
 
     const ggml_tensor * res = ggml_metal_mul_mat_add_residual(mm, add);
 
-    if (res == nullptr || !ggml_metal_op_mul_mat_use_mma(mm)) {
+    if (res == nullptr || !(ggml_metal_op_mul_mat_use_mma(mm) || ggml_metal_op_mul_mat_mv_nax_mr(mm) > 0)) {
         return false;
     }
 
