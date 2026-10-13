@@ -941,6 +941,18 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_mma(ggml_
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_nax(ggml_metal_library_t lib, const ggml_tensor * op, int mr, bool add) {
+    char name[256];
+    snprintf(name, 256, "kernel_mul_mv_nax_%s_f32_mr%d_add%d", ggml_type_name(op->src[0]->type), mr, add ? 1 : 0);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_cvt(ggml_metal_library_t lib) {
     const char * name = "kernel_mul_mm_cvt_f32_f16";
 
