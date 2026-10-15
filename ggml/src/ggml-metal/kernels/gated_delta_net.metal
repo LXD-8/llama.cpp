@@ -151,12 +151,11 @@ template [[host_name("kernel_gated_delta_net_f32_1")]] kernel kernel_gated_delta
 template [[host_name("kernel_gated_delta_net_f32_2")]] kernel kernel_gated_delta_net_t kernel_gated_delta_net_impl<2>;
 template [[host_name("kernel_gated_delta_net_f32_4")]] kernel kernel_gated_delta_net_t kernel_gated_delta_net_impl<4>;
 
-
 // same recurrence with LPR lanes per state row instead of 32: each lane keeps S_v/LPR state elements, so the two
 // per-token dot products need log2(LPR) shuffle steps instead of 5 and the q/k loads are amortized over more state
 // a simdgroup handles 32/LPR rows, the threadgroup NSG simdgroups; only for G == 1 and 16-byte aligned q/k
 template<short SV, short NSG, short LPR>
-kernel void kernel_gated_delta_net_r8_impl(
+kernel void kernel_gated_delta_net_lpr_impl(
         constant ggml_metal_kargs_gated_delta_net & args,
         device const char * q,
         device const char * k,
@@ -269,11 +268,11 @@ kernel void kernel_gated_delta_net_r8_impl(
 #undef K
 }
 
-typedef decltype(kernel_gated_delta_net_r8_impl<128, 4, 8>) kernel_gated_delta_net_r8_t;
+typedef decltype(kernel_gated_delta_net_lpr_impl<128, 4, 8>) kernel_gated_delta_net_lpr_t;
 
-template [[host_name("kernel_gated_delta_net_r8_f32_256")]] kernel kernel_gated_delta_net_r8_t kernel_gated_delta_net_r8_impl<256, 4, 8>;
-template [[host_name("kernel_gated_delta_net_r4_f32_128")]] kernel kernel_gated_delta_net_r8_t kernel_gated_delta_net_r8_impl<128, 4, 4>;
-template [[host_name("kernel_gated_delta_net_r4_f32_64")]] kernel kernel_gated_delta_net_r8_t kernel_gated_delta_net_r8_impl<64, 4, 4>;
+template [[host_name("kernel_gated_delta_net_r8_f32_256")]] kernel kernel_gated_delta_net_lpr_t kernel_gated_delta_net_lpr_impl<256, 4, 8>;
+template [[host_name("kernel_gated_delta_net_r4_f32_128")]] kernel kernel_gated_delta_net_lpr_t kernel_gated_delta_net_lpr_impl<128, 4, 4>;
+template [[host_name("kernel_gated_delta_net_r4_f32_64")]] kernel kernel_gated_delta_net_lpr_t kernel_gated_delta_net_lpr_impl<64, 4, 4>;
 
 #else
 // a simplified version of the above

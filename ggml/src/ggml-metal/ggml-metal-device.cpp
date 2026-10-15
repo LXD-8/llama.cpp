@@ -719,7 +719,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net(
     GGML_ASSERT(op->ne[0] == ne20 * ne21);
     GGML_ASSERT(ne20 % 32 == 0);
 
-    if (ggml_metal_op_gated_delta_net_use_r8(op)) {
+    if (ggml_metal_op_gated_delta_net_use_lpr(op)) {
         snprintf(base, 256, "kernel_gated_delta_net_r%d_%s_%d", ggml_metal_op_gated_delta_net_lpr(op), ggml_type_name(op->src[0]->type), ne20);
     } else {
         snprintf(base, 256, "kernel_gated_delta_net_%s_%d", ggml_type_name(op->src[0]->type), nsg);

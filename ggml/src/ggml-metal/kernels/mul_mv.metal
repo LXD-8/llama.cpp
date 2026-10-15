@@ -2047,7 +2047,6 @@ kernel void kernel_mul_mv_q5_K_f32_xr(
 }
 
 template [[host_name("kernel_mul_mv_q5_K_f32_xr2")]] kernel kernel_mul_mv_xr_t kernel_mul_mv_q5_K_f32_xr<2>;
-template [[host_name("kernel_mul_mv_q5_K_f32_xr3")]] kernel kernel_mul_mv_xr_t kernel_mul_mv_q5_K_f32_xr<3>;
 
 template<int nr0, typename args_t>
 void kernel_mul_mv_q6_K_f32_impl(

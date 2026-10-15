@@ -1992,7 +1992,7 @@ int ggml_metal_op_rwkv(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
-bool ggml_metal_op_gated_delta_net_use_r8(const ggml_tensor * op) {
+bool ggml_metal_op_gated_delta_net_use_lpr(const ggml_tensor * op) {
     static const bool disabled = getenv("GGML_METAL_GDN_R8_DISABLE") != nullptr; // read once per process
     if (disabled) {
         return false;
@@ -2114,7 +2114,7 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
 
     const int nsg = pipeline.nsg;
 
-    if (ggml_metal_op_gated_delta_net_use_r8(op)) {
+    if (ggml_metal_op_gated_delta_net_use_lpr(op)) {
         // 32/LPR rows per simdgroup, 4 simdgroups per threadgroup
         ggml_metal_encoder_dispatch_threadgroups(enc, op->src[2]->ne[0]/(4*(32/ggml_metal_op_gated_delta_net_lpr(op))), op->src[2]->ne[1], op->src[2]->ne[3], 32, 4, 1);
     } else {
