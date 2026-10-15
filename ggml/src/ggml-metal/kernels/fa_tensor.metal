@@ -298,46 +298,6 @@ template [[host_name("kernel_flash_attn_ext_tensor_bf16_dk576_dv512")]] kernel f
 constant bool FC_flash_attn_ext_nax_has_mask  [[function_constant(FC_FLASH_ATTN_EXT_NAX + 0)]];
 constant bool FC_flash_attn_ext_nax_has_sinks [[function_constant(FC_FLASH_ATTN_EXT_NAX + 1)]];
 
-// 16x16 register fragment of a 16x32x16 simdgroup matmul: each lane holds rows fm and fm + 8, columns fn .. fn + 3
-// the layout follows MLX steel/gemm/nax.h (MIT, Apple Inc.)
-static inline short2 fa_nax_coord(ushort lane) {
-    const short qid = lane >> 2;
-    const short fm  = (qid & 4) | ((lane >> 1) & 3);
-    const short fn  = ((qid & 2) | (lane & 1))*4;
-    return short2(fn, fm);
-}
-
-// C[16x32] += A[16x16] * B, with B given as two 16x16 fragments along N (transposed when TB)
-template<typename CT, typename AT, typename BT, bool TB>
-static inline void fa_nax_mma(
-        thread vec<CT, 8> & c0, thread vec<CT, 8> & c1,
-        thread const vec<AT, 8> & a,
-        thread const vec<BT, 8> & b0, thread const vec<BT, 8> & b1) {
-    constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(16, 32, 16, false, TB, true,
-            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
-
-    mpp::tensor_ops::matmul2d<desc, execution_simdgroup> op;
-
-    auto ca = op.template get_left_input_cooperative_tensor <AT, BT, CT>();
-    auto cb = op.template get_right_input_cooperative_tensor<AT, BT, CT>();
-    auto cc = op.template get_destination_cooperative_tensor<remove_addrspace_t<decltype(ca)>, remove_addrspace_t<decltype(cb)>, CT>();
-
-    FOR_UNROLL (short i = 0; i < 8; ++i) {
-        ca[i]     = a[i];
-        cb[i]     = b0[i];
-        cb[8 + i] = b1[i];
-        cc[i]     = c0[i];
-        cc[8 + i] = c1[i];
-    }
-
-    op.run(ca, cb, cc);
-
-    FOR_UNROLL (short i = 0; i < 8; ++i) {
-        c0[i] = cc[i];
-        c1[i] = cc[8 + i];
-    }
-}
-
 // flash attention with the scores, the probabilities and O kept in registers
 // WM simdgroups split the queries (16 each), WN simdgroups split the head dim; the WN partial Q*K^T scores are summed
 // through threadgroup memory in a fixed order, then every simdgroup runs the same softmax on its own copy
@@ -378,7 +338,7 @@ kernel void kernel_flash_attn_ext_nax(
     const short row_group = sgitg/WN;
     const short d_group   = sgitg%WN;
 
-    const short2 sc = fa_nax_coord(tiisg);
+    const short2 sc = nax_coord(tiisg);
     const short fn = sc.x;
     const short fm = sc.y;
 
@@ -499,7 +459,7 @@ kernel void kernel_flash_attn_ext_nax(
                     }
                 }
 
-                fa_nax_mma<float, half, half, true>(sf[ik], sf[ik + 1], qf[id], k0, k1);
+                nax_mma<float, half, half, true>(sf[ik], sf[ik + 1], qf[id], k0, k1);
             }
         }
 
@@ -594,7 +554,7 @@ kernel void kernel_flash_attn_ext_nax(
                     }
                 }
 
-                fa_nax_mma<float, float, half, false>(of[id], of[id + 1], sf[ik], v0, v1);
+                nax_mma<float, float, half, false>(of[id], of[id + 1], sf[ik], v0, v1);
             }
         }
     }
@@ -678,7 +638,7 @@ kernel void kernel_flash_attn_ext_nax_gqa(
     const short row_group = sgitg/WN;
     const short d_group   = sgitg%WN;
 
-    const short2 sc = fa_nax_coord(tiisg);
+    const short2 sc = nax_coord(tiisg);
     const short fn = sc.x;
     const short fm = sc.y;
 
@@ -779,7 +739,7 @@ kernel void kernel_flash_attn_ext_nax_gqa(
                     }
                 }
 
-                fa_nax_mma<float, half, half, true>(sf[ik], sf[ik + 1], qf[id], k0, k1);
+                nax_mma<float, half, half, true>(sf[ik], sf[ik + 1], qf[id], k0, k1);
             }
         }
 
@@ -869,7 +829,7 @@ kernel void kernel_flash_attn_ext_nax_gqa(
                     }
                 }
 
-                fa_nax_mma<float, float, half, false>(of[id], of[id + 1], sf[ik], v0, v1);
+                nax_mma<float, float, half, false>(of[id], of[id + 1], sf[ik], v0, v1);
             }
         }
     }

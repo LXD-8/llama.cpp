@@ -913,6 +913,7 @@ int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
 static bool ggml_metal_op_mul_mat_use_f16_act(const ggml_tensor * op, bool has_tensor);
 static bool ggml_metal_op_mul_mat_use_nax(const ggml_tensor * op, bool has_tensor);
 static bool ggml_metal_op_mul_mat_use_i8(const ggml_tensor * op, bool has_tensor);
+static size_t ggml_metal_op_mul_mat_extra_act(const ggml_tensor * op);
 
 int ggml_metal_op_glu(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
@@ -946,14 +947,13 @@ int ggml_metal_op_glu(ggml_metal_op_t ctx, int idx) {
 
             ggml_tensor * next = ctx->node(idx + 1);
 
-            if (ggml_metal_op_mul_mat_use_f16_act(next, props_dev->has_tensor) &&
-                ggml_metal_op_mul_mat_use_nax    (next, props_dev->has_tensor)) {
-                mm = next;
-                mm_i8 = ggml_metal_op_mul_mat_use_i8(next, props_dev->has_tensor) && op->ne[0] % OP_MUL_MM_I8_G == 0 &&
-                    (op->nb[1] % 16 == 0) && (op->src[0]->nb[1] % 16 == 0) && (!op->src[1] || op->src[1]->nb[1] % 16 == 0);
-                if (ggml_metal_op_mul_mat_use_i8(next, props_dev->has_tensor) && !mm_i8) {
-                    mm = nullptr;
-                } else {
+            if (ggml_metal_op_mul_mat_use_nax(next, props_dev->has_tensor)) {
+                const bool i8 = ggml_metal_op_mul_mat_use_i8(next, props_dev->has_tensor);
+
+                // the int8 variant reads its inputs in 16-byte vectors
+                if (!i8 || (op->src[0]->nb[1] % 16 == 0 && (!op->src[1] || op->src[1]->nb[1] % 16 == 0))) {
+                    mm    = next;
+                    mm_i8 = i8;
                     ctx->count_fusions(fusion);
                 }
             }
@@ -2725,12 +2725,77 @@ static int ggml_metal_op_mul_mat_mv(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
-static bool ggml_metal_op_mul_mat_use_f16_act(const ggml_tensor * op, bool has_tensor);
-static bool ggml_metal_op_mul_mat_use_nax(const ggml_tensor * op, bool has_tensor);
-static size_t ggml_metal_op_mul_mat_extra_act(const ggml_tensor * op);
+// the register-resident NAX mat-mat dst = src1 * src0^T over the whole M x N grid, with src0 (lda/ldb in elements) and
+// src1 already in the operand type of the pipeline. groups of 4 neighbouring src1 tiles run next to each other, so that
+// they share the src0 tile in the cache. long K is split into partitions processed by consecutive dispatches that
+// accumulate into dst, so that the operand slices of a partition stay in the cache while the grid sweeps over them.
+// the int8 pipeline also takes the scales of src0 and src1 (bid_s), and its K steps and partitions are whole scale groups
+static void ggml_metal_op_mul_mat_nax_dispatch(ggml_metal_op_t ctx, const ggml_tensor * op,
+        ggml_metal_pipeline_with_params pipeline,
+        ggml_metal_buffer_id bid_src0, int32_t ldb,
+        ggml_metal_buffer_id bid_src1, int32_t lda,
+        const ggml_metal_buffer_id * bid_s = nullptr) {
+    ggml_metal_encoder_t enc = ctx->enc;
 
-static size_t ggml_metal_op_mul_mat_extra_act(const ggml_tensor * op);
-static bool ggml_metal_op_mul_mat_use_i8(const ggml_tensor * op, bool has_tensor);
+    const int32_t K = op->src[0]->ne[0];
+    const int32_t M = op->src[1]->ne[1];
+    const int32_t N = op->src[0]->ne[1];
+
+    const int32_t bk      = bid_s ? OP_MUL_MM_I8_G : OP_MUL_MM_NAX_BK;
+    const int32_t k_align = bid_s ? OP_MUL_MM_I8_G : 32;
+
+    const int tiles_m = (M + OP_MUL_MM_NAX_BM - 1)/OP_MUL_MM_NAX_BM;
+    const int tiles_n = (N + OP_MUL_MM_NAX_BN - 1)/OP_MUL_MM_NAX_BN;
+    const int swz = tiles_m <= 1 ? 0 : 2;
+
+    int n_part = 1;
+    if (K >= 3*std::max(M, N)) {
+        n_part = (K + OP_MUL_MM_NAX_KSPLIT - 1)/OP_MUL_MM_NAX_KSPLIT;
+    }
+    const int k_chunk = GGML_PAD((K + n_part - 1)/n_part, k_align);
+
+    for (int ip = 0; ip < n_part; ++ip) {
+        const int k_beg = ip*k_chunk;
+        const int k_end = std::min(K, k_beg + k_chunk);
+        if (k_beg >= k_end) {
+            break;
+        }
+
+        ggml_metal_kargs_mul_mm_nax args = {
+            /*.K       =*/ K,
+            /*.M       =*/ M,
+            /*.N       =*/ N,
+            /*.lda     =*/ lda,
+            /*.ldb     =*/ ldb,
+            /*.ldd     =*/ (int32_t) (op->nb[1]/sizeof(float)),
+            /*.tiles_m =*/ tiles_m,
+            /*.tiles_n =*/ tiles_n,
+            /*.swz     =*/ swz,
+            /*.bk      =*/ bk,
+            /*.k_beg   =*/ k_beg,
+            /*.k_end   =*/ k_end,
+            /*.accum   =*/ ip > 0,
+        };
+
+        if (ip > 0) {
+            ggml_metal_op_concurrency_reset(ctx);
+        }
+
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
+        ggml_metal_encoder_set_buffer  (enc, bid_src1, 2);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op), 3);
+        if (bid_s) {
+            ggml_metal_encoder_set_buffer(enc, bid_s[0], 4);
+            ggml_metal_encoder_set_buffer(enc, bid_s[1], 5);
+        }
+
+        ggml_metal_encoder_dispatch_threadgroups(enc,
+                tiles_n << swz, (tiles_m + (1 << swz) - 1) >> swz, 1,
+                32, OP_MUL_MM_NAX_WM*OP_MUL_MM_NAX_WN, 1);
+    }
+}
 
 // int8 NAX mat-mat: quantize the activations and the (dequantized) weights to int8 with per-128 scales, then run the
 // int8 kernel. layout of the extra buffer (within the f16 reservation): [act i8][act scales] | [w i8][w scales]
@@ -2744,12 +2809,10 @@ static int ggml_metal_op_mul_mat_nax_i8(ggml_metal_op_t ctx, int idx) {
     GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
     GGML_TENSOR_LOCALS(uint64_t, nb1, op->src[1], nb);
-    GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
 
     const int K = ne00;
     const int M = ne11;
     const int N = ne01;
-    const int G = OP_MUL_MM_I8_G;
 
     ggml_metal_buffer_id bid_base = ggml_metal_get_buffer_id(op);
     bid_base.offs += ggml_nbytes(op);
@@ -2801,58 +2864,10 @@ static int ggml_metal_op_mul_mat_nax_i8(ggml_metal_op_t ctx, int idx) {
 
     ggml_metal_op_concurrency_reset(ctx);
 
-    const int tiles_m = (M + OP_MUL_MM_NAX_BM - 1)/OP_MUL_MM_NAX_BM;
-    const int tiles_n = (N + OP_MUL_MM_NAX_BN - 1)/OP_MUL_MM_NAX_BN;
-    const int swz = tiles_m <= 1 ? 0 : 2;
+    const ggml_metal_buffer_id bid_s[2] = { bid_sw, bid_sa };
 
-    // long K: split into partitions accumulated into dst (see the f16 path)
-    int n_part = 1;
-    if (K >= 3*std::max(M, N)) {
-        n_part = (K + 4095)/4096;
-    }
-    const int k_chunk = GGML_PAD((K + n_part - 1)/n_part, G);
-
-    auto pipeline = ggml_metal_library_get_pipeline_by_name(lib, "kernel_mul_mm_nax_i8");
-
-    for (int ip = 0; ip < n_part; ++ip) {
-        const int k_beg = ip*k_chunk;
-        const int k_end = std::min(K, k_beg + k_chunk);
-        if (k_beg >= k_end) {
-            break;
-        }
-
-        ggml_metal_kargs_mul_mm_nax args = {
-            /*.K       =*/ K,
-            /*.M       =*/ M,
-            /*.N       =*/ N,
-            /*.lda     =*/ K,
-            /*.ldb     =*/ K,
-            /*.ldd     =*/ (int32_t) (nb1/sizeof(float)),
-            /*.tiles_m =*/ tiles_m,
-            /*.tiles_n =*/ tiles_n,
-            /*.swz     =*/ swz,
-            /*.bk      =*/ G,
-            /*.k_beg   =*/ k_beg,
-            /*.k_end   =*/ k_end,
-            /*.accum   =*/ ip > 0,
-        };
-
-        if (ip > 0) {
-            ggml_metal_op_concurrency_reset(ctx);
-        }
-
-        ggml_metal_encoder_set_pipeline(enc, pipeline);
-        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
-        ggml_metal_encoder_set_buffer  (enc, bid_w,  1);
-        ggml_metal_encoder_set_buffer  (enc, bid_a,  2);
-        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op), 3);
-        ggml_metal_encoder_set_buffer  (enc, bid_sw, 4);
-        ggml_metal_encoder_set_buffer  (enc, bid_sa, 5);
-
-        ggml_metal_encoder_dispatch_threadgroups(enc,
-                tiles_n << swz, (tiles_m + (1 << swz) - 1) >> swz, 1,
-                32, OP_MUL_MM_NAX_WM*OP_MUL_MM_NAX_WN, 1);
-    }
+    ggml_metal_op_mul_mat_nax_dispatch(ctx, op, ggml_metal_library_get_pipeline_by_name(lib, "kernel_mul_mm_nax_i8"),
+            bid_w, K, bid_a, K, bid_s);
 
     return 1;
 }
@@ -3099,59 +3114,8 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
                 ldb = ne00;
             }
 
-            const int tiles_m = (ne11 + OP_MUL_MM_NAX_BM - 1)/OP_MUL_MM_NAX_BM;
-            const int tiles_n = (ne01 + OP_MUL_MM_NAX_BN - 1)/OP_MUL_MM_NAX_BN;
-
-            // groups of 4 neighbouring src1 tiles run next to each other, so that they share the src0 tile in the cache
-            const int swz = tiles_m <= 1 ? 0 : 2;
-
-            // long K: split K into partitions processed by consecutive dispatches that accumulate into dst, so that the
-            // operand slices of a partition stay in the cache while the whole M x N grid sweeps over them
-            int n_part = 1;
-            if (ne00 >= 3*std::max<int>(ne11, ne01)) {
-                n_part = (ne00 + OP_MUL_MM_NAX_KSPLIT - 1)/OP_MUL_MM_NAX_KSPLIT;
-            }
-            const int k_chunk = GGML_PAD((ne00 + n_part - 1)/n_part, 32);
-
-            auto pipeline_nax = ggml_metal_library_get_pipeline_mul_mm_nax(lib);
-
-            for (int ip = 0; ip < n_part; ++ip) {
-                const int k_beg = ip*k_chunk;
-                const int k_end = std::min<int>(ne00, k_beg + k_chunk);
-                if (k_beg >= k_end) {
-                    break;
-                }
-
-                ggml_metal_kargs_mul_mm_nax args_nax = {
-                    /*.K       =*/ ne00,
-                    /*.M       =*/ ne11,
-                    /*.N       =*/ ne01,
-                    /*.lda     =*/ (int32_t) (nb11_mm/sizeof(ggml_fp16_t)),
-                    /*.ldb     =*/ ldb,
-                    /*.ldd     =*/ (int32_t) (nb1/sizeof(float)),
-                    /*.tiles_m =*/ tiles_m,
-                    /*.tiles_n =*/ tiles_n,
-                    /*.swz     =*/ swz,
-                    /*.bk      =*/ OP_MUL_MM_NAX_BK,
-                    /*.k_beg   =*/ k_beg,
-                    /*.k_end   =*/ k_end,
-                    /*.accum   =*/ ip > 0,
-                };
-
-                if (ip > 0) {
-                    ggml_metal_op_concurrency_reset(ctx);
-                }
-
-                ggml_metal_encoder_set_pipeline(enc, pipeline_nax);
-                ggml_metal_encoder_set_bytes   (enc, &args_nax, sizeof(args_nax), 0);
-                ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
-                ggml_metal_encoder_set_buffer  (enc, bid_src1, 2);
-                ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op), 3);
-
-                ggml_metal_encoder_dispatch_threadgroups(enc,
-                        tiles_n << swz, (tiles_m + (1 << swz) - 1) >> swz, 1,
-                        32, OP_MUL_MM_NAX_WM*OP_MUL_MM_NAX_WN, 1);
-            }
+            ggml_metal_op_mul_mat_nax_dispatch(ctx, op, ggml_metal_library_get_pipeline_mul_mm_nax(lib),
+                    bid_src0, ldb, bid_src1, (int32_t) (nb11_mm/sizeof(ggml_fp16_t)));
 
             return 1;
         }
@@ -3307,7 +3271,7 @@ static bool ggml_metal_op_mul_mat_use_i8(const ggml_tensor * op, bool has_tensor
     static const bool disabled = getenv("GGML_METAL_MM_I8_DISABLE") != nullptr; // read once per process
 
     return !disabled && op->src[0]->type != GGML_TYPE_F16 && op->src[0]->ne[0] % OP_MUL_MM_I8_G == 0 &&
-        ggml_metal_op_mul_mat_use_f16_act(op, has_tensor) && ggml_metal_op_mul_mat_use_nax(op, has_tensor);
+        ggml_metal_op_mul_mat_use_nax(op, has_tensor);
 }
 
 static size_t ggml_metal_op_mul_mat_extra_act(const ggml_tensor * op) {
@@ -3691,45 +3655,6 @@ static bool ggml_metal_op_flash_attn_ext_use_kv_f16(const ggml_tensor * op) {
     }
 }
 
-// small batches with grouped KV heads: one NAX tile holds all queries of the heads that share a KV head (<= 32 rows)
-static int ggml_metal_op_flash_attn_ext_gqa_wm(const ggml_tensor * op, bool has_tensor) {
-    static const bool disabled = getenv("GGML_METAL_FA_GQA_DISABLE") != nullptr; // read once per process
-    if (disabled || !has_tensor) {
-        return 0;
-    }
-
-    const int64_t ne01 = op->src[0]->ne[1];
-    const int64_t ne02 = op->src[0]->ne[2];
-    const int64_t ne12 = op->src[1]->ne[2];
-
-    const int64_t dk = op->src[1]->ne[0];
-    const int64_t dv = op->src[2]->ne[0];
-
-    float max_bias;
-    float logit_softcap;
-    memcpy(&max_bias,      ((const int32_t *) op->op_params) + 1, sizeof(max_bias));
-    memcpy(&logit_softcap, ((const int32_t *) op->op_params) + 2, sizeof(logit_softcap));
-
-    if (dk != dv || (dk != 64 && dk != 128 && dk != 256 && dk != 512) ||
-        op->src[1]->type != GGML_TYPE_F16 || op->src[2]->type != GGML_TYPE_F16 ||
-        max_bias != 0.0f || logit_softcap != 0.0f ||
-        ne12 == 0 || ne02 % ne12 != 0 || ne02/ne12 < 2 ||
-        op->src[1]->ne[1] % OP_FLASH_ATTN_EXT_NAX_NCPSG != 0 ||
-        op->src[3] == nullptr || op->src[3]->ne[1] < ne01) {
-        return 0;
-    }
-
-    const int64_t rows = ne01*(ne02/ne12);
-
-    // a tile with only up to 4 used rows (single-token decode with 4 query heads per KV head) loses to the vec kernel
-    // until the KV range is long (Llama-3.1-8B: -1-2% below 16k, +2-5% from 16k)
-    if (rows <= 4 && op->src[1]->ne[1] < 16384) {
-        return 0;
-    }
-
-    return rows <= 16 ? 1 : rows <= 32 ? 2 : 0;
-}
-
 static bool ggml_metal_op_flash_attn_ext_use_tensor(const ggml_tensor * op, bool has_tensor) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
@@ -3801,6 +3726,34 @@ static bool ggml_metal_op_flash_attn_ext_use_nax(const ggml_tensor * op) {
 
     return max_bias == 0.0f && logit_softcap == 0.0f &&
            op->src[1]->ne[1] % OP_FLASH_ATTN_EXT_NAX_NCPSG == 0;
+}
+
+// small batches with grouped KV heads: one NAX tile holds all queries of the heads that share a KV head (<= 32 rows)
+static int ggml_metal_op_flash_attn_ext_gqa_wm(const ggml_tensor * op, bool has_tensor) {
+    static const bool disabled = getenv("GGML_METAL_FA_GQA_DISABLE") != nullptr; // read once per process
+    if (disabled || !has_tensor || !ggml_metal_op_flash_attn_ext_use_nax(op)) {
+        return 0;
+    }
+
+    const int64_t ne01 = op->src[0]->ne[1];
+    const int64_t ne02 = op->src[0]->ne[2];
+    const int64_t ne12 = op->src[1]->ne[2];
+
+    if (op->src[1]->type != GGML_TYPE_F16 || op->src[2]->type != GGML_TYPE_F16 ||
+        ne12 == 0 || ne02 % ne12 != 0 || ne02/ne12 < 2 ||
+        op->src[3] == nullptr || op->src[3]->ne[1] < ne01) {
+        return 0;
+    }
+
+    const int64_t rows = ne01*(ne02/ne12);
+
+    // a tile with only up to 4 used rows (single-token decode with 4 query heads per KV head) loses to the vec kernel
+    // until the KV range is long (Llama-3.1-8B: -1-2% below 16k, +2-5% from 16k)
+    if (rows <= 4 && op->src[1]->ne[1] < 16384) {
+        return 0;
+    }
+
+    return rows <= 16 ? 1 : rows <= 32 ? 2 : 0;
 }
 
 // returns the n_kv_max hint if the sparse path is available for this op, or 0 otherwise

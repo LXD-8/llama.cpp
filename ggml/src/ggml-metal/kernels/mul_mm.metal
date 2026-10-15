@@ -80,56 +80,24 @@ template [[host_name("kernel_mul_mm_dq_iq4_nl_f16")]] kernel mul_mm_dq_t kernel_
 template [[host_name("kernel_mul_mm_dq_iq4_xs_f16")]] kernel mul_mm_dq_t kernel_mul_mm_dq_f16<block_iq4_xs, QK_NL, dequantize_iq4_xs>;
 template [[host_name("kernel_mul_mm_dq_tq2_0_f16")]] kernel mul_mm_dq_t kernel_mul_mm_dq_f16<block_tq2_0, QK_NL, dequantize_tq2_0>;
 
-static inline short2 mm_nax_coord(ushort lane) {
-    const short qid = lane >> 2;
-    const short fm  = (qid & 4) | ((lane >> 1) & 3);
-    const short fn  = ((qid & 2) | (lane & 1))*4;
-    return short2(fn, fm);
-}
-
-// C[16x32] += A[16x16] * B^T, with B given as two 16x16 fragments of rows along N
-static inline void mm_nax_mma(
-        thread vec<float, 8> & c0, thread vec<float, 8> & c1,
-        thread const vec<half, 8> & a,
-        thread const vec<half, 8> & b0, thread const vec<half, 8> & b1) {
-    constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(16, 32, 16, false, true, true,
-            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
-
-    mpp::tensor_ops::matmul2d<desc, execution_simdgroup> op;
-
-    auto ca = op.template get_left_input_cooperative_tensor <half, half, float>();
-    auto cb = op.template get_right_input_cooperative_tensor<half, half, float>();
-    auto cc = op.template get_destination_cooperative_tensor<remove_addrspace_t<decltype(ca)>, remove_addrspace_t<decltype(cb)>, float>();
-
-    FOR_UNROLL (short i = 0; i < 8; ++i) {
-        ca[i]     = a[i];
-        cb[i]     = b0[i];
-        cb[8 + i] = b1[i];
-        cc[i]     = c0[i];
-        cc[8 + i] = c1[i];
-    }
-
-    op.run(ca, cb, cc);
-
-    FOR_UNROLL (short i = 0; i < 8; ++i) {
-        c0[i] = cc[i];
-        c1[i] = cc[8 + i];
-    }
-}
-
-// dst[m][n] = sum_k src1[m][k] * src0[n][k] with f16 operands and the operands loaded straight into registers
+// dst[m][n] = sum_k src1[m][k] * src0[n][k] with f16 or int8 operands loaded straight into registers
 // no threadgroup memory: the BM x BN tile is split across WM x WN simdgroups, each owning a (BM/WM) x (BN/WN) block
 // of 16x16 fragments; the threadgroups are swizzled so that neighbouring ones share src0 rows in the cache
-template<short BM, short BN, short WM, short WN>
-[[kernel, max_total_threads_per_threadgroup(WM*WN*32)]]
-void kernel_mul_mm_nax_f16(
+// int8 (see kernel_mul_mm_q8a_f32): each OP_MUL_MM_I8_G group of K is accumulated in int32 and folded into the f32
+// accumulators with the scales s1 (src1 rows) and s0 (src0 rows); the K ranges are multiples of OP_MUL_MM_I8_G
+template<typename T, short BM, short BN, short WM, short WN>
+static inline void kernel_mul_mm_nax_impl(
         constant ggml_metal_kargs_mul_mm_nax & args,
-        device const half  * src0,
-        device const half  * src1,
+        device const T     * src0,
+        device const T     * src1,
         device       float * dst,
-        uint3  tgpig [[threadgroup_position_in_grid]],
-        ushort tiisg [[thread_index_in_simdgroup]],
-        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+        device const float * s0,
+        device const float * s1,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    constexpr bool I8 = is_same<T, int8_t>::value;
+
     constexpr short SM = BM/WM;
     constexpr short SN = BN/WN;
     constexpr short TM = SM/16;
@@ -149,15 +117,18 @@ void kernel_mul_mm_nax_f16(
     const int m0 = tile_m*BM + SM*(sgitg/WN);
     const int n0 = tile_n*BN + SN*(sgitg%WN);
 
-    const short2 sc = mm_nax_coord(tiisg);
+    const short2 sc = nax_coord(tiisg);
 
     // per-lane row pointers, clamped to the last row - rows past the end are computed but never stored
-    device const half * pa[TM][2];
-    device const half * pb[TN][2];
+    device const T * pa[TM][2];
+    device const T * pb[TN][2];
+    int ra[TM][2]; // the clamped rows and the first of the 4 columns of the lane, for the int8 scales
+    int rb[TN];
 
     FOR_UNROLL (short mm = 0; mm < TM; ++mm) {
         FOR_UNROLL (short i = 0; i < 2; ++i) {
             const int r = min(m0 + mm*16 + sc.y + i*8, args.M - 1);
+            ra[mm][i] = r;
             pa[mm][i] = src1 + (uint64_t) r*args.lda + sc.x;
         }
     }
@@ -166,6 +137,7 @@ void kernel_mul_mm_nax_f16(
             const int r = min(n0 + nn*16 + sc.y + i*8, args.N - 1);
             pb[nn][i] = src0 + (uint64_t) r*args.ldb + sc.x;
         }
+        rb[nn] = n0 + nn*16 + sc.x;
     }
 
     vec<float, 8> c[TM][TN];
@@ -179,51 +151,95 @@ void kernel_mul_mm_nax_f16(
 
     #pragma clang loop unroll(disable)
     for (int k0 = args.k_beg; k0 < args.k_end; k0 += BK) {
-    // keep the simdgroups of the threadgroup close together so that they hit the same cache lines
-    threadgroup_barrier(mem_flags::mem_none);
+        // keep the simdgroups of the threadgroup close together so that they hit the same cache lines
+        threadgroup_barrier(mem_flags::mem_none);
 
-    const int k1 = min(args.k_end, k0 + BK);
+        const int k1 = min(args.k_end, k0 + BK);
 
-    #pragma clang loop unroll(disable)
-    for (int k = k0; k < k1; k += SK) {
-        volatile int compiler_barrier;
-
-        vec<half, 8> a[TM][TK];
-        vec<half, 8> b[TN][TK];
-
-        FOR_UNROLL (short mm = 0; mm < TM; ++mm) {
-            FOR_UNROLL (short kk = 0; kk < TK; ++kk) {
-                FOR_UNROLL (short i = 0; i < 2; ++i) {
-                    const half4 v = *((device const half4 *) (pa[mm][i] + k + kk*16));
-                    a[mm][kk][i*4 + 0] = v[0];
-                    a[mm][kk][i*4 + 1] = v[1];
-                    a[mm][kk][i*4 + 2] = v[2];
-                    a[mm][kk][i*4 + 3] = v[3];
-                }
-            }
-        }
-        FOR_UNROLL (short nn = 0; nn < TN; ++nn) {
-            FOR_UNROLL (short kk = 0; kk < TK; ++kk) {
-                FOR_UNROLL (short i = 0; i < 2; ++i) {
-                    const half4 v = *((device const half4 *) (pb[nn][i] + k + kk*16));
-                    b[nn][kk][i*4 + 0] = v[0];
-                    b[nn][kk][i*4 + 1] = v[1];
-                    b[nn][kk][i*4 + 2] = v[2];
-                    b[nn][kk][i*4 + 3] = v[3];
+        vec<int, 8> ci[TM][TN];
+        if constexpr (I8) {
+            FOR_UNROLL (short mm = 0; mm < TM; ++mm) {
+                FOR_UNROLL (short nn = 0; nn < TN; ++nn) {
+                    ci[mm][nn] = 0;
                 }
             }
         }
 
-        FOR_UNROLL (short mm = 0; mm < TM; ++mm) {
-            FOR_UNROLL (short nn = 0; nn < TN; nn += 2) {
+        #pragma clang loop unroll(disable)
+        for (int k = k0; k < k1; k += SK) {
+            volatile int compiler_barrier;
+
+            vec<T, 8> a[TM][TK];
+            vec<T, 8> b[TN][TK];
+
+            FOR_UNROLL (short mm = 0; mm < TM; ++mm) {
                 FOR_UNROLL (short kk = 0; kk < TK; ++kk) {
-                    mm_nax_mma(c[mm][nn], c[mm][nn + 1], a[mm][kk], b[nn][kk], b[nn + 1][kk]);
+                    FOR_UNROLL (short i = 0; i < 2; ++i) {
+                        const vec<T, 4> v = *((device const vec<T, 4> *) (pa[mm][i] + k + kk*16));
+                        a[mm][kk][i*4 + 0] = v[0];
+                        a[mm][kk][i*4 + 1] = v[1];
+                        a[mm][kk][i*4 + 2] = v[2];
+                        a[mm][kk][i*4 + 3] = v[3];
+                    }
+                }
+            }
+            FOR_UNROLL (short nn = 0; nn < TN; ++nn) {
+                FOR_UNROLL (short kk = 0; kk < TK; ++kk) {
+                    FOR_UNROLL (short i = 0; i < 2; ++i) {
+                        const vec<T, 4> v = *((device const vec<T, 4> *) (pb[nn][i] + k + kk*16));
+                        b[nn][kk][i*4 + 0] = v[0];
+                        b[nn][kk][i*4 + 1] = v[1];
+                        b[nn][kk][i*4 + 2] = v[2];
+                        b[nn][kk][i*4 + 3] = v[3];
+                    }
+                }
+            }
+
+            FOR_UNROLL (short mm = 0; mm < TM; ++mm) {
+                FOR_UNROLL (short nn = 0; nn < TN; nn += 2) {
+                    FOR_UNROLL (short kk = 0; kk < TK; ++kk) {
+                        if constexpr (I8) {
+                            nax_mma<int, T, T, true>(ci[mm][nn], ci[mm][nn + 1], a[mm][kk], b[nn][kk], b[nn + 1][kk]);
+                        } else {
+                            nax_mma<float, T, T, true>(c[mm][nn], c[mm][nn + 1], a[mm][kk], b[nn][kk], b[nn + 1][kk]);
+                        }
+                    }
+                }
+            }
+
+            (void) compiler_barrier;
+        }
+
+        if constexpr (I8) {
+            // fold the group into the f32 accumulators
+            const int g = k0/OP_MUL_MM_I8_G;
+
+            float sa[TM][2];
+            FOR_UNROLL (short mm = 0; mm < TM; ++mm) {
+                FOR_UNROLL (short i = 0; i < 2; ++i) {
+                    sa[mm][i] = s1[g*args.M + ra[mm][i]];
+                }
+            }
+
+            FOR_UNROLL (short nn = 0; nn < TN; ++nn) {
+                float4 sw;
+                if (rb[nn] + 3 < args.N) {
+                    sw = *((device const float4 *) (s0 + g*args.N + rb[nn]));
+                } else {
+                    FOR_UNROLL (short j = 0; j < 4; ++j) {
+                        sw[j] = s0[g*args.N + min(rb[nn] + j, args.N - 1)];
+                    }
+                }
+
+                FOR_UNROLL (short mm = 0; mm < TM; ++mm) {
+                    FOR_UNROLL (short i = 0; i < 2; ++i) {
+                        FOR_UNROLL (short j = 0; j < 4; ++j) {
+                            c[mm][nn][i*4 + j] = fma(sa[mm][i]*sw[j], float(ci[mm][nn][i*4 + j]), c[mm][nn][i*4 + j]);
+                        }
+                    }
                 }
             }
         }
-
-        (void) compiler_barrier;
-    }
     }
 
     FOR_UNROLL (short mm = 0; mm < TM; ++mm) {
@@ -254,9 +270,33 @@ void kernel_mul_mm_nax_f16(
     }
 }
 
-typedef decltype(kernel_mul_mm_nax_f16<OP_MUL_MM_NAX_BM, OP_MUL_MM_NAX_BN, OP_MUL_MM_NAX_WM, OP_MUL_MM_NAX_WN>) mul_mm_nax_t;
+[[kernel, max_total_threads_per_threadgroup(OP_MUL_MM_NAX_WM*OP_MUL_MM_NAX_WN*32)]]
+void kernel_mul_mm_nax_f16(
+        constant ggml_metal_kargs_mul_mm_nax & args,
+        device const half  * src0,
+        device const half  * src1,
+        device       float * dst,
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mm_nax_impl<half, OP_MUL_MM_NAX_BM, OP_MUL_MM_NAX_BN, OP_MUL_MM_NAX_WM, OP_MUL_MM_NAX_WN>(
+            args, src0, src1, dst, nullptr, nullptr, tgpig, tiisg, sgitg);
+}
 
-template [[host_name("kernel_mul_mm_nax_f16")]] kernel mul_mm_nax_t kernel_mul_mm_nax_f16<OP_MUL_MM_NAX_BM, OP_MUL_MM_NAX_BN, OP_MUL_MM_NAX_WM, OP_MUL_MM_NAX_WN>;
+[[kernel, max_total_threads_per_threadgroup(OP_MUL_MM_NAX_WM*OP_MUL_MM_NAX_WN*32)]]
+void kernel_mul_mm_nax_i8(
+        constant ggml_metal_kargs_mul_mm_nax & args,
+        device const int8_t * src0,
+        device const int8_t * src1,
+        device       float  * dst,
+        device const float  * s0,
+        device const float  * s1,
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mm_nax_impl<int8_t, OP_MUL_MM_NAX_BM, OP_MUL_MM_NAX_BN, OP_MUL_MM_NAX_WM, OP_MUL_MM_NAX_WN>(
+            args, src0, src1, dst, s0, s1, tgpig, tiisg, sgitg);
+}
 #endif // GGML_METAL_HAS_TENSOR
 
 #ifdef GGML_METAL_HAS_TENSOR
@@ -361,212 +401,6 @@ template [[host_name("kernel_mul_mm_dq_iq4_nl_i8")]] kernel mul_mm_dq_i8_t kerne
 template [[host_name("kernel_mul_mm_dq_iq4_xs_i8")]] kernel mul_mm_dq_i8_t kernel_mul_mm_dq_i8<block_iq4_xs, QK_NL, dequantize_iq4_xs>;
 template [[host_name("kernel_mul_mm_dq_tq2_0_i8")]] kernel mul_mm_dq_i8_t kernel_mul_mm_dq_i8<block_tq2_0, QK_NL, dequantize_tq2_0>;
 
-static inline void mm_nax_mma_i8(
-        thread vec<int, 8> & c0, thread vec<int, 8> & c1,
-        thread const vec<int8_t, 8> & a,
-        thread const vec<int8_t, 8> & b0, thread const vec<int8_t, 8> & b1) {
-    constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(16, 32, 16, false, true, true,
-            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
-
-    mpp::tensor_ops::matmul2d<desc, execution_simdgroup> op;
-
-    auto ca = op.template get_left_input_cooperative_tensor <int8_t, int8_t, int>();
-    auto cb = op.template get_right_input_cooperative_tensor<int8_t, int8_t, int>();
-    auto cc = op.template get_destination_cooperative_tensor<remove_addrspace_t<decltype(ca)>, remove_addrspace_t<decltype(cb)>, int>();
-
-    FOR_UNROLL (short i = 0; i < 8; ++i) {
-        ca[i]     = a[i];
-        cb[i]     = b0[i];
-        cb[8 + i] = b1[i];
-        cc[i]     = c0[i];
-        cc[8 + i] = c1[i];
-    }
-
-    op.run(ca, cb, cc);
-
-    FOR_UNROLL (short i = 0; i < 8; ++i) {
-        c0[i] = cc[i];
-        c1[i] = cc[8 + i];
-    }
-}
-
-// same tiling as kernel_mul_mm_nax_f16 (BM x BN per threadgroup, WM x WN simdgroups, swizzle, split-K), with int8
-// operands; K ranges are multiples of OP_MUL_MM_I8_G
-template<short BM, short BN, short WM, short WN>
-[[kernel, max_total_threads_per_threadgroup(WM*WN*32)]]
-void kernel_mul_mm_nax_i8(
-        constant ggml_metal_kargs_mul_mm_nax & args,
-        device const int8_t * src0,
-        device const int8_t * src1,
-        device       float  * dst,
-        device const float  * s0,
-        device const float  * s1,
-        uint3  tgpig [[threadgroup_position_in_grid]],
-        ushort tiisg [[thread_index_in_simdgroup]],
-        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    constexpr short SM = BM/WM;
-    constexpr short SN = BN/WN;
-    constexpr short TM = SM/16;
-    constexpr short TN = SN/16;
-    constexpr short TK = 2;
-    constexpr short SK = TK*16;
-    constexpr short G  = OP_MUL_MM_I8_G;
-
-    static_assert(TN % 2 == 0, "src0 fragments are consumed in pairs");
-
-    const int tile_m = (tgpig.y << args.swz) + (tgpig.x & ((1 << args.swz) - 1));
-    const int tile_n = tgpig.x >> args.swz;
-
-    if (tile_m >= args.tiles_m || tile_n >= args.tiles_n) {
-        return;
-    }
-
-    const int m0 = tile_m*BM + SM*(sgitg/WN);
-    const int n0 = tile_n*BN + SN*(sgitg%WN);
-
-    const short2 sc = mm_nax_coord(tiisg);
-
-    device const int8_t * pa[TM][2];
-    device const int8_t * pb[TN][2];
-    int ra[TM][2]; // clamped rows, for the scales
-    int rb[TN];    // first column of the 4 owned by the lane in each fragment
-
-    FOR_UNROLL (short mm = 0; mm < TM; ++mm) {
-        FOR_UNROLL (short i = 0; i < 2; ++i) {
-            const int r = min(m0 + mm*16 + sc.y + i*8, args.M - 1);
-            ra[mm][i] = r;
-            pa[mm][i] = src1 + (uint64_t) r*args.lda + sc.x;
-        }
-    }
-    FOR_UNROLL (short nn = 0; nn < TN; ++nn) {
-        FOR_UNROLL (short i = 0; i < 2; ++i) {
-            const int r = min(n0 + nn*16 + sc.y + i*8, args.N - 1);
-            pb[nn][i] = src0 + (uint64_t) r*args.ldb + sc.x;
-        }
-        rb[nn] = n0 + nn*16 + sc.x;
-    }
-
-    vec<float, 8> c[TM][TN];
-    FOR_UNROLL (short mm = 0; mm < TM; ++mm) {
-        FOR_UNROLL (short nn = 0; nn < TN; ++nn) {
-            c[mm][nn] = 0.0f;
-        }
-    }
-
-    #pragma clang loop unroll(disable)
-    for (int k0 = args.k_beg; k0 < args.k_end; k0 += G) {
-        // keep the simdgroups of the threadgroup close together so that they hit the same cache lines
-        threadgroup_barrier(mem_flags::mem_none);
-
-        vec<int, 8> ci[TM][TN];
-        FOR_UNROLL (short mm = 0; mm < TM; ++mm) {
-            FOR_UNROLL (short nn = 0; nn < TN; ++nn) {
-                ci[mm][nn] = 0;
-            }
-        }
-
-        #pragma clang loop unroll(disable)
-        for (int k = k0; k < k0 + G; k += SK) {
-            volatile int compiler_barrier;
-
-            vec<int8_t, 8> a[TM][TK];
-            vec<int8_t, 8> b[TN][TK];
-
-            FOR_UNROLL (short mm = 0; mm < TM; ++mm) {
-                FOR_UNROLL (short kk = 0; kk < TK; ++kk) {
-                    FOR_UNROLL (short i = 0; i < 2; ++i) {
-                        const char4 v = *((device const char4 *) (pa[mm][i] + k + kk*16));
-                        a[mm][kk][i*4 + 0] = v[0];
-                        a[mm][kk][i*4 + 1] = v[1];
-                        a[mm][kk][i*4 + 2] = v[2];
-                        a[mm][kk][i*4 + 3] = v[3];
-                    }
-                }
-            }
-            FOR_UNROLL (short nn = 0; nn < TN; ++nn) {
-                FOR_UNROLL (short kk = 0; kk < TK; ++kk) {
-                    FOR_UNROLL (short i = 0; i < 2; ++i) {
-                        const char4 v = *((device const char4 *) (pb[nn][i] + k + kk*16));
-                        b[nn][kk][i*4 + 0] = v[0];
-                        b[nn][kk][i*4 + 1] = v[1];
-                        b[nn][kk][i*4 + 2] = v[2];
-                        b[nn][kk][i*4 + 3] = v[3];
-                    }
-                }
-            }
-
-            FOR_UNROLL (short mm = 0; mm < TM; ++mm) {
-                FOR_UNROLL (short nn = 0; nn < TN; nn += 2) {
-                    FOR_UNROLL (short kk = 0; kk < TK; ++kk) {
-                        mm_nax_mma_i8(ci[mm][nn], ci[mm][nn + 1], a[mm][kk], b[nn][kk], b[nn + 1][kk]);
-                    }
-                }
-            }
-
-            (void) compiler_barrier;
-        }
-
-        // fold the group into the f32 accumulators
-        const int g = k0/G;
-
-        float sa[TM][2];
-        FOR_UNROLL (short mm = 0; mm < TM; ++mm) {
-            FOR_UNROLL (short i = 0; i < 2; ++i) {
-                sa[mm][i] = s1[g*args.M + ra[mm][i]];
-            }
-        }
-
-        FOR_UNROLL (short nn = 0; nn < TN; ++nn) {
-            float4 sw;
-            if (rb[nn] + 3 < args.N) {
-                sw = *((device const float4 *) (s0 + g*args.N + rb[nn]));
-            } else {
-                FOR_UNROLL (short j = 0; j < 4; ++j) {
-                    sw[j] = s0[g*args.N + min(rb[nn] + j, args.N - 1)];
-                }
-            }
-
-            FOR_UNROLL (short mm = 0; mm < TM; ++mm) {
-                FOR_UNROLL (short i = 0; i < 2; ++i) {
-                    FOR_UNROLL (short j = 0; j < 4; ++j) {
-                        c[mm][nn][i*4 + j] = fma(sa[mm][i]*sw[j], float(ci[mm][nn][i*4 + j]), c[mm][nn][i*4 + j]);
-                    }
-                }
-            }
-        }
-    }
-
-    FOR_UNROLL (short mm = 0; mm < TM; ++mm) {
-        FOR_UNROLL (short i = 0; i < 2; ++i) {
-            const int r = m0 + mm*16 + sc.y + i*8;
-            if (r >= args.M) {
-                continue;
-            }
-            device float * d = dst + (uint64_t) r*args.ldd;
-            FOR_UNROLL (short nn = 0; nn < TN; ++nn) {
-                const int col = n0 + nn*16 + sc.x;
-                const float4 v = float4(c[mm][nn][i*4 + 0], c[mm][nn][i*4 + 1], c[mm][nn][i*4 + 2], c[mm][nn][i*4 + 3]);
-                if (col + 3 < args.N) {
-                    if (args.accum) {
-                        *((device float4 *) (d + col)) += v;
-                    } else {
-                        *((device float4 *) (d + col)) = v;
-                    }
-                } else {
-                    for (short j = 0; j < 4; ++j) {
-                        if (col + j < args.N) {
-                            d[col + j] = args.accum ? d[col + j] + v[j] : v[j];
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-typedef decltype(kernel_mul_mm_nax_i8<OP_MUL_MM_NAX_BM, OP_MUL_MM_NAX_BN, OP_MUL_MM_NAX_WM, OP_MUL_MM_NAX_WN>) mul_mm_nax_i8_t;
-
-template [[host_name("kernel_mul_mm_nax_i8")]] kernel mul_mm_nax_i8_t kernel_mul_mm_nax_i8<OP_MUL_MM_NAX_BM, OP_MUL_MM_NAX_BN, OP_MUL_MM_NAX_WM, OP_MUL_MM_NAX_WN>;
 #endif // GGML_METAL_HAS_TENSOR
 
 // each block_q contains 16*nl weights
@@ -1686,42 +1520,7 @@ template [[host_name("kernel_mul_mm_id_tq2_0_f16")]]   kernel mul_mm_id kernel_m
 // few-row mat-mat on the NAX units (2..32 src1 rows, e.g. MTP verify batches, short prompts): the src1 rows are the M = 16
 // rows of a 16x32x16 matmul2d (MR of them per pass), 32 weight rows are its N columns. each lane dequantizes 16 weights per
 // step straight into a half fragment (no threadgroup memory); the NSG simdgroups split K and are summed at the end. the lane
-// layout is that of fa_nax_coord (MLX steel/gemm/nax.h)
-static inline short2 mv_nax_coord(ushort lane) {
-    const short qid = lane >> 2;
-    const short fm  = (qid & 4) | ((lane >> 1) & 3);
-    const short fn  = ((qid & 2) | (lane & 1))*4;
-    return short2(fn, fm);
-}
-
-static inline void mv_nax_mma(
-        thread vec<float, 8> & c0, thread vec<float, 8> & c1,
-        thread const vec<half, 8> & a,
-        thread const vec<half, 8> & b0, thread const vec<half, 8> & b1) {
-    constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(16, 32, 16, false, true, true,
-            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
-
-    mpp::tensor_ops::matmul2d<desc, execution_simdgroup> op;
-
-    auto ca = op.template get_left_input_cooperative_tensor <half, half, float>();
-    auto cb = op.template get_right_input_cooperative_tensor<half, half, float>();
-    auto cc = op.template get_destination_cooperative_tensor<remove_addrspace_t<decltype(ca)>, remove_addrspace_t<decltype(cb)>, float>();
-
-    FOR_UNROLL (short i = 0; i < 8; ++i) {
-        ca[i]     = a[i];
-        cb[i]     = b0[i];
-        cb[8 + i] = b1[i];
-        cc[i]     = c0[i];
-        cc[8 + i] = c1[i];
-    }
-
-    op.run(ca, cb, cc);
-
-    FOR_UNROLL (short i = 0; i < 8; ++i) {
-        c0[i] = cc[i];
-        c1[i] = cc[8 + i];
-    }
-}
+// layout is that of nax_coord
 
 // the 16 weights of dequantize_q5_K, with 16-byte loads and bit operations instead of a branch per weight
 template <typename type4x4>
@@ -1766,7 +1565,7 @@ kernel void kernel_mul_mv_nax_f32(
         ushort3 ntg  [[threads_per_threadgroup]]) {
     const short NSG = ntg.y;
 
-    const short2 lc = mv_nax_coord(tiisg);
+    const short2 lc = nax_coord(tiisg);
     const short fn = lc.x;
     const short fm = lc.y;
 
@@ -1839,7 +1638,7 @@ kernel void kernel_mul_mv_nax_f32(
             }
 
             FOR_UNROLL (short s = 0; s < 4; ++s) {
-                mv_nax_mma(c[m][0], c[m][1], a[s], b[s][0], b[s][1]);
+                nax_mma<float, half, half, true>(c[m][0], c[m][1], a[s], b[s][0], b[s][1]);
             }
         }
     }
