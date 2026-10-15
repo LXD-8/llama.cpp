@@ -54,31 +54,39 @@ kernel void kernel_mul_mm_dq_f16(
     }
 }
 
+// the quantized weight types of the NAX mat-mat paths (name, block, nl, dequantize); q5_K is listed per path, because
+// the few-row kernel dequantizes it with dequantize_q5_K_nax
+#define NAX_QTYPES(X) \
+    X(q4_0,    block_q4_0,    2,     dequantize_q4_0) \
+    X(q4_1,    block_q4_1,    2,     dequantize_q4_1) \
+    X(q5_0,    block_q5_0,    2,     dequantize_q5_0) \
+    X(q5_1,    block_q5_1,    2,     dequantize_q5_1) \
+    X(q8_0,    block_q8_0,    2,     dequantize_q8_0) \
+    X(q4_K,    block_q4_K,    QK_NL, dequantize_q4_K) \
+    X(q6_K,    block_q6_K,    QK_NL, dequantize_q6_K) \
+    X(q1_0,    block_q1_0,    8,     dequantize_q1_0) \
+    X(q2_0,    block_q2_0,    4,     dequantize_q2_0) \
+    X(mxfp4,   block_mxfp4,   2,     dequantize_mxfp4) \
+    X(q2_K,    block_q2_K,    QK_NL, dequantize_q2_K) \
+    X(q3_K,    block_q3_K,    QK_NL, dequantize_q3_K) \
+    X(iq2_xxs, block_iq2_xxs, QK_NL, dequantize_iq2_xxs) \
+    X(iq2_xs,  block_iq2_xs,  QK_NL, dequantize_iq2_xs) \
+    X(iq2_s,   block_iq2_s,   QK_NL, dequantize_iq2_s) \
+    X(iq3_xxs, block_iq3_xxs, QK_NL, dequantize_iq3_xxs) \
+    X(iq3_s,   block_iq3_s,   QK_NL, dequantize_iq3_s) \
+    X(iq1_s,   block_iq1_s,   QK_NL, dequantize_iq1_s) \
+    X(iq1_m,   block_iq1_m,   QK_NL, dequantize_iq1_m) \
+    X(iq4_nl,  block_iq4_nl,  2,     dequantize_iq4_nl) \
+    X(iq4_xs,  block_iq4_xs,  QK_NL, dequantize_iq4_xs) \
+    X(tq2_0,   block_tq2_0,   QK_NL, dequantize_tq2_0)
+
 typedef decltype(kernel_mul_mm_dq_f16<block_q4_K, QK_NL, dequantize_q4_K>) mul_mm_dq_t;
 
-template [[host_name("kernel_mul_mm_dq_q4_0_f16")]] kernel mul_mm_dq_t kernel_mul_mm_dq_f16<block_q4_0, 2,     dequantize_q4_0>;
-template [[host_name("kernel_mul_mm_dq_q4_1_f16")]] kernel mul_mm_dq_t kernel_mul_mm_dq_f16<block_q4_1, 2,     dequantize_q4_1>;
-template [[host_name("kernel_mul_mm_dq_q5_0_f16")]] kernel mul_mm_dq_t kernel_mul_mm_dq_f16<block_q5_0, 2,     dequantize_q5_0>;
-template [[host_name("kernel_mul_mm_dq_q5_1_f16")]] kernel mul_mm_dq_t kernel_mul_mm_dq_f16<block_q5_1, 2,     dequantize_q5_1>;
-template [[host_name("kernel_mul_mm_dq_q8_0_f16")]] kernel mul_mm_dq_t kernel_mul_mm_dq_f16<block_q8_0, 2,     dequantize_q8_0>;
-template [[host_name("kernel_mul_mm_dq_q4_K_f16")]] kernel mul_mm_dq_t kernel_mul_mm_dq_f16<block_q4_K, QK_NL, dequantize_q4_K>;
-template [[host_name("kernel_mul_mm_dq_q5_K_f16")]] kernel mul_mm_dq_t kernel_mul_mm_dq_f16<block_q5_K, QK_NL, dequantize_q5_K>;
-template [[host_name("kernel_mul_mm_dq_q6_K_f16")]] kernel mul_mm_dq_t kernel_mul_mm_dq_f16<block_q6_K, QK_NL, dequantize_q6_K>;
-template [[host_name("kernel_mul_mm_dq_q1_0_f16")]] kernel mul_mm_dq_t kernel_mul_mm_dq_f16<block_q1_0, 8, dequantize_q1_0>;
-template [[host_name("kernel_mul_mm_dq_q2_0_f16")]] kernel mul_mm_dq_t kernel_mul_mm_dq_f16<block_q2_0, 4, dequantize_q2_0>;
-template [[host_name("kernel_mul_mm_dq_mxfp4_f16")]] kernel mul_mm_dq_t kernel_mul_mm_dq_f16<block_mxfp4, 2, dequantize_mxfp4>;
-template [[host_name("kernel_mul_mm_dq_q2_K_f16")]] kernel mul_mm_dq_t kernel_mul_mm_dq_f16<block_q2_K, QK_NL, dequantize_q2_K>;
-template [[host_name("kernel_mul_mm_dq_q3_K_f16")]] kernel mul_mm_dq_t kernel_mul_mm_dq_f16<block_q3_K, QK_NL, dequantize_q3_K>;
-template [[host_name("kernel_mul_mm_dq_iq2_xxs_f16")]] kernel mul_mm_dq_t kernel_mul_mm_dq_f16<block_iq2_xxs, QK_NL, dequantize_iq2_xxs>;
-template [[host_name("kernel_mul_mm_dq_iq2_xs_f16")]] kernel mul_mm_dq_t kernel_mul_mm_dq_f16<block_iq2_xs, QK_NL, dequantize_iq2_xs>;
-template [[host_name("kernel_mul_mm_dq_iq2_s_f16")]] kernel mul_mm_dq_t kernel_mul_mm_dq_f16<block_iq2_s, QK_NL, dequantize_iq2_s>;
-template [[host_name("kernel_mul_mm_dq_iq3_xxs_f16")]] kernel mul_mm_dq_t kernel_mul_mm_dq_f16<block_iq3_xxs, QK_NL, dequantize_iq3_xxs>;
-template [[host_name("kernel_mul_mm_dq_iq3_s_f16")]] kernel mul_mm_dq_t kernel_mul_mm_dq_f16<block_iq3_s, QK_NL, dequantize_iq3_s>;
-template [[host_name("kernel_mul_mm_dq_iq1_s_f16")]] kernel mul_mm_dq_t kernel_mul_mm_dq_f16<block_iq1_s, QK_NL, dequantize_iq1_s>;
-template [[host_name("kernel_mul_mm_dq_iq1_m_f16")]] kernel mul_mm_dq_t kernel_mul_mm_dq_f16<block_iq1_m, QK_NL, dequantize_iq1_m>;
-template [[host_name("kernel_mul_mm_dq_iq4_nl_f16")]] kernel mul_mm_dq_t kernel_mul_mm_dq_f16<block_iq4_nl, 2, dequantize_iq4_nl>;
-template [[host_name("kernel_mul_mm_dq_iq4_xs_f16")]] kernel mul_mm_dq_t kernel_mul_mm_dq_f16<block_iq4_xs, QK_NL, dequantize_iq4_xs>;
-template [[host_name("kernel_mul_mm_dq_tq2_0_f16")]] kernel mul_mm_dq_t kernel_mul_mm_dq_f16<block_tq2_0, QK_NL, dequantize_tq2_0>;
+#define DQ_F16_INSTANCE(name, block_q, nl, deq) \
+template [[host_name("kernel_mul_mm_dq_" #name "_f16")]] kernel mul_mm_dq_t kernel_mul_mm_dq_f16<block_q, nl, deq>;
+
+NAX_QTYPES(DQ_F16_INSTANCE)
+DQ_F16_INSTANCE(q5_K, block_q5_K, QK_NL, dequantize_q5_K)
 
 // dst[m][n] = sum_k src1[m][k] * src0[n][k] with f16 or int8 operands loaded straight into registers
 // no threadgroup memory: the BM x BN tile is split across WM x WN simdgroups, each owning a (BM/WM) x (BN/WN) block
@@ -377,29 +385,11 @@ kernel void kernel_mul_mm_dq_i8(
 
 typedef decltype(kernel_mul_mm_dq_i8<block_q4_K, QK_NL, dequantize_q4_K>) mul_mm_dq_i8_t;
 
-template [[host_name("kernel_mul_mm_dq_q4_0_i8")]] kernel mul_mm_dq_i8_t kernel_mul_mm_dq_i8<block_q4_0, 2,     dequantize_q4_0>;
-template [[host_name("kernel_mul_mm_dq_q4_1_i8")]] kernel mul_mm_dq_i8_t kernel_mul_mm_dq_i8<block_q4_1, 2,     dequantize_q4_1>;
-template [[host_name("kernel_mul_mm_dq_q5_0_i8")]] kernel mul_mm_dq_i8_t kernel_mul_mm_dq_i8<block_q5_0, 2,     dequantize_q5_0>;
-template [[host_name("kernel_mul_mm_dq_q5_1_i8")]] kernel mul_mm_dq_i8_t kernel_mul_mm_dq_i8<block_q5_1, 2,     dequantize_q5_1>;
-template [[host_name("kernel_mul_mm_dq_q8_0_i8")]] kernel mul_mm_dq_i8_t kernel_mul_mm_dq_i8<block_q8_0, 2,     dequantize_q8_0>;
-template [[host_name("kernel_mul_mm_dq_q4_K_i8")]] kernel mul_mm_dq_i8_t kernel_mul_mm_dq_i8<block_q4_K, QK_NL, dequantize_q4_K>;
-template [[host_name("kernel_mul_mm_dq_q5_K_i8")]] kernel mul_mm_dq_i8_t kernel_mul_mm_dq_i8<block_q5_K, QK_NL, dequantize_q5_K>;
-template [[host_name("kernel_mul_mm_dq_q6_K_i8")]] kernel mul_mm_dq_i8_t kernel_mul_mm_dq_i8<block_q6_K, QK_NL, dequantize_q6_K>;
-template [[host_name("kernel_mul_mm_dq_q1_0_i8")]] kernel mul_mm_dq_i8_t kernel_mul_mm_dq_i8<block_q1_0, 8, dequantize_q1_0>;
-template [[host_name("kernel_mul_mm_dq_q2_0_i8")]] kernel mul_mm_dq_i8_t kernel_mul_mm_dq_i8<block_q2_0, 4, dequantize_q2_0>;
-template [[host_name("kernel_mul_mm_dq_mxfp4_i8")]] kernel mul_mm_dq_i8_t kernel_mul_mm_dq_i8<block_mxfp4, 2, dequantize_mxfp4>;
-template [[host_name("kernel_mul_mm_dq_q2_K_i8")]] kernel mul_mm_dq_i8_t kernel_mul_mm_dq_i8<block_q2_K, QK_NL, dequantize_q2_K>;
-template [[host_name("kernel_mul_mm_dq_q3_K_i8")]] kernel mul_mm_dq_i8_t kernel_mul_mm_dq_i8<block_q3_K, QK_NL, dequantize_q3_K>;
-template [[host_name("kernel_mul_mm_dq_iq2_xxs_i8")]] kernel mul_mm_dq_i8_t kernel_mul_mm_dq_i8<block_iq2_xxs, QK_NL, dequantize_iq2_xxs>;
-template [[host_name("kernel_mul_mm_dq_iq2_xs_i8")]] kernel mul_mm_dq_i8_t kernel_mul_mm_dq_i8<block_iq2_xs, QK_NL, dequantize_iq2_xs>;
-template [[host_name("kernel_mul_mm_dq_iq2_s_i8")]] kernel mul_mm_dq_i8_t kernel_mul_mm_dq_i8<block_iq2_s, QK_NL, dequantize_iq2_s>;
-template [[host_name("kernel_mul_mm_dq_iq3_xxs_i8")]] kernel mul_mm_dq_i8_t kernel_mul_mm_dq_i8<block_iq3_xxs, QK_NL, dequantize_iq3_xxs>;
-template [[host_name("kernel_mul_mm_dq_iq3_s_i8")]] kernel mul_mm_dq_i8_t kernel_mul_mm_dq_i8<block_iq3_s, QK_NL, dequantize_iq3_s>;
-template [[host_name("kernel_mul_mm_dq_iq1_s_i8")]] kernel mul_mm_dq_i8_t kernel_mul_mm_dq_i8<block_iq1_s, QK_NL, dequantize_iq1_s>;
-template [[host_name("kernel_mul_mm_dq_iq1_m_i8")]] kernel mul_mm_dq_i8_t kernel_mul_mm_dq_i8<block_iq1_m, QK_NL, dequantize_iq1_m>;
-template [[host_name("kernel_mul_mm_dq_iq4_nl_i8")]] kernel mul_mm_dq_i8_t kernel_mul_mm_dq_i8<block_iq4_nl, 2, dequantize_iq4_nl>;
-template [[host_name("kernel_mul_mm_dq_iq4_xs_i8")]] kernel mul_mm_dq_i8_t kernel_mul_mm_dq_i8<block_iq4_xs, QK_NL, dequantize_iq4_xs>;
-template [[host_name("kernel_mul_mm_dq_tq2_0_i8")]] kernel mul_mm_dq_i8_t kernel_mul_mm_dq_i8<block_tq2_0, QK_NL, dequantize_tq2_0>;
+#define DQ_I8_INSTANCE(name, block_q, nl, deq) \
+template [[host_name("kernel_mul_mm_dq_" #name "_i8")]] kernel mul_mm_dq_i8_t kernel_mul_mm_dq_i8<block_q, nl, deq>;
+
+NAX_QTYPES(DQ_I8_INSTANCE)
+DQ_I8_INSTANCE(q5_K, block_q5_K, QK_NL, dequantize_q5_K)
 
 #endif // GGML_METAL_HAS_TENSOR
 
@@ -1709,27 +1699,6 @@ MV_NAX_INSTANCE(f16,     half4x4,       1,     dequantize_f16)
 #if defined(GGML_METAL_HAS_BF16)
 MV_NAX_INSTANCE(bf16,    bfloat4x4,     1,     dequantize_bf16)
 #endif
-MV_NAX_INSTANCE(q1_0,    block_q1_0,    8,     dequantize_q1_0)
-MV_NAX_INSTANCE(q2_0,    block_q2_0,    4,     dequantize_q2_0)
-MV_NAX_INSTANCE(q4_0,    block_q4_0,    2,     dequantize_q4_0)
-MV_NAX_INSTANCE(q4_1,    block_q4_1,    2,     dequantize_q4_1)
-MV_NAX_INSTANCE(q5_0,    block_q5_0,    2,     dequantize_q5_0)
-MV_NAX_INSTANCE(q5_1,    block_q5_1,    2,     dequantize_q5_1)
-MV_NAX_INSTANCE(q8_0,    block_q8_0,    2,     dequantize_q8_0)
-MV_NAX_INSTANCE(mxfp4,   block_mxfp4,   2,     dequantize_mxfp4)
-MV_NAX_INSTANCE(q2_K,    block_q2_K,    QK_NL, dequantize_q2_K)
-MV_NAX_INSTANCE(q3_K,    block_q3_K,    QK_NL, dequantize_q3_K)
-MV_NAX_INSTANCE(q4_K,    block_q4_K,    QK_NL, dequantize_q4_K)
+NAX_QTYPES(MV_NAX_INSTANCE)
 MV_NAX_INSTANCE(q5_K,    block_q5_K,    QK_NL, dequantize_q5_K_nax)
-MV_NAX_INSTANCE(q6_K,    block_q6_K,    QK_NL, dequantize_q6_K)
-MV_NAX_INSTANCE(iq2_xxs, block_iq2_xxs, QK_NL, dequantize_iq2_xxs)
-MV_NAX_INSTANCE(iq2_xs,  block_iq2_xs,  QK_NL, dequantize_iq2_xs)
-MV_NAX_INSTANCE(iq2_s,   block_iq2_s,   QK_NL, dequantize_iq2_s)
-MV_NAX_INSTANCE(iq3_xxs, block_iq3_xxs, QK_NL, dequantize_iq3_xxs)
-MV_NAX_INSTANCE(iq3_s,   block_iq3_s,   QK_NL, dequantize_iq3_s)
-MV_NAX_INSTANCE(iq1_s,   block_iq1_s,   QK_NL, dequantize_iq1_s)
-MV_NAX_INSTANCE(iq1_m,   block_iq1_m,   QK_NL, dequantize_iq1_m)
-MV_NAX_INSTANCE(iq4_nl,  block_iq4_nl,  2,     dequantize_iq4_nl)
-MV_NAX_INSTANCE(iq4_xs,  block_iq4_xs,  QK_NL, dequantize_iq4_xs)
-MV_NAX_INSTANCE(tq2_0,   block_tq2_0,   QK_NL, dequantize_tq2_0)
 #endif // GGML_METAL_HAS_TENSOR

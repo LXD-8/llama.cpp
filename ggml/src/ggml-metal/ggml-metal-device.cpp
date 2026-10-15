@@ -744,21 +744,6 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net(
     return res;
 }
 
-// f32 GLU writing f16 (only SWIGLU, used when fused with the NAX mat-mat that consumes it)
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_glu_f16(ggml_metal_library_t lib, const ggml_tensor * op) {
-    GGML_ASSERT(ggml_get_glu_op(op) == GGML_GLU_OP_SWIGLU);
-    GGML_UNUSED(op);
-
-    const char * name = "kernel_swiglu_f32_f16";
-
-    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
-    if (!res.pipeline) {
-        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
-    }
-
-    return res;
-}
-
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_solve_tri(ggml_metal_library_t lib, const ggml_tensor * op) {
     char base[256];
     char name[256];
@@ -941,54 +926,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_mma(ggml_
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_nax(ggml_metal_library_t lib, const ggml_tensor * op, int mr, bool add) {
-    char name[256];
-    snprintf(name, 256, "kernel_mul_mv_nax_%s_f32_mr%d_add%d", ggml_type_name(op->src[0]->type), mr, add ? 1 : 0);
-
-    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
-    if (!res.pipeline) {
-        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
-    }
-
-    return res;
-}
-
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_cvt(ggml_metal_library_t lib) {
-    const char * name = "kernel_mul_mm_cvt_f32_f16";
-
-    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
-    if (!res.pipeline) {
-        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
-    }
-
-    return res;
-}
-
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_dq(ggml_metal_library_t lib, ggml_type tsrc0) {
-    char name[256];
-    snprintf(name, 256, "kernel_mul_mm_dq_%s_f16", ggml_type_name(tsrc0));
-
-    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
-    if (!res.pipeline) {
-        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
-    }
-
-    return res;
-}
-
 // pipelines without function constants, by kernel name
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_by_name(ggml_metal_library_t lib, const char * name) {
-    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
-    if (!res.pipeline) {
-        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
-    }
-
-    return res;
-}
-
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_nax(ggml_metal_library_t lib) {
-    const char * name = "kernel_mul_mm_nax_f16";
-
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
         res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
@@ -1982,37 +1921,6 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_n
         ggml_metal_library_t lib,
         const ggml_tensor * op,
         bool has_mask,
-        bool has_sinks) {
-    assert(op->op == GGML_OP_FLASH_ATTN_EXT);
-
-    char base[256];
-    char name[256];
-
-    const int32_t dk = (int32_t) op->src[1]->ne[0];
-    const int32_t dv = (int32_t) op->src[2]->ne[0];
-
-    snprintf(base, 256, "kernel_flash_attn_ext_nax_f16_dk%d_dv%d", dk, dv);
-    snprintf(name, 256, "%s_mask=%d_sinks=%d", base, has_mask, has_sinks);
-
-    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
-    if (!res.pipeline) {
-        ggml_metal_cv_t cv = ggml_metal_cv_init();
-
-        ggml_metal_cv_set_bool(cv, has_mask,  FC_FLASH_ATTN_EXT_NAX + 0);
-        ggml_metal_cv_set_bool(cv, has_sinks, FC_FLASH_ATTN_EXT_NAX + 1);
-
-        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
-
-        ggml_metal_cv_free(cv);
-    }
-
-    return res;
-}
-
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_nax_gqa(
-        ggml_metal_library_t lib,
-        const ggml_tensor * op,
-        bool has_mask,
         bool has_sinks,
         int  wm) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
@@ -2023,7 +1931,12 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_n
     const int32_t dk = (int32_t) op->src[1]->ne[0];
     const int32_t dv = (int32_t) op->src[2]->ne[0];
 
-    snprintf(base, 256, "kernel_flash_attn_ext_nax_gqa_f16_dk%d_dv%d_wm%d", dk, dv, wm);
+    // wm > 0: the GQA variant with wm tiles of 16 query rows
+    if (wm > 0) {
+        snprintf(base, 256, "kernel_flash_attn_ext_nax_gqa_f16_dk%d_dv%d_wm%d", dk, dv, wm);
+    } else {
+        snprintf(base, 256, "kernel_flash_attn_ext_nax_f16_dk%d_dv%d", dk, dv);
+    }
     snprintf(name, 256, "%s_mask=%d_sinks=%d", base, has_mask, has_sinks);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);

@@ -139,12 +139,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_mm
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_mma_auto   (ggml_metal_library_t lib, const struct ggml_tensor * op, bool add);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm            (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_t1         (ggml_metal_library_t lib, const struct ggml_tensor * op, enum ggml_type tsrc1);
-struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_nax(ggml_metal_library_t lib, const struct ggml_tensor * op, int mr, bool add);
-struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_cvt        (ggml_metal_library_t lib);
-struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_dq         (ggml_metal_library_t lib, enum ggml_type tsrc0);
-struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_nax        (ggml_metal_library_t lib);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_by_name           (ggml_metal_library_t lib, const char * name);
-struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_glu_f16           (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv            (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map0    (ggml_metal_library_t lib, int ne02, int ne20, bool wide);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_amax(ggml_metal_library_t lib);
@@ -212,11 +207,6 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_att
         bool has_scap);
 
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_nax(
-        ggml_metal_library_t lib,
-        const struct ggml_tensor * op,
-        bool has_mask,
-        bool has_sinks);
-struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_nax_gqa(
         ggml_metal_library_t lib,
         const struct ggml_tensor * op,
         bool has_mask,

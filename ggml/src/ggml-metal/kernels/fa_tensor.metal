@@ -298,6 +298,151 @@ template [[host_name("kernel_flash_attn_ext_tensor_bf16_dk576_dv512")]] kernel f
 constant bool FC_flash_attn_ext_nax_has_mask  [[function_constant(FC_FLASH_ATTN_EXT_NAX + 0)]];
 constant bool FC_flash_attn_ext_nax_has_sinks [[function_constant(FC_FLASH_ATTN_EXT_NAX + 1)]];
 
+// one KV block of the NAX attention kernels: the partial S = Q*K^T over this simdgroup's slice of the head dim, summed
+// over the WN simdgroups through threadgroup memory in a fixed order, the mask (rows with use_mask), the online softmax
+// (base 2) and O += P*V. qf, of, M, S are the per-lane registers of the calling kernel
+template<short TK, short TDh, short WN>
+static inline void fa_nax_block(
+        thread const vec<half, 8>  * qf,
+        thread       vec<float, 8> * of,
+        thread       float         * M,
+        thread       float         * S,
+        device const half * pk, int sk,
+        device const half * pv, int sv,
+        device const half * pm0,
+        device const half * pm1,
+        bool use_mask0,
+        bool use_mask1,
+        int ic,
+        threadgroup float * sx_own,
+        threadgroup float * sx_row) {
+    constexpr short kU = 16;
+
+    device const half * pm[2] = { pm0, pm1 };
+    const bool use_mask[2] = { use_mask0, use_mask1 };
+
+    vec<float, 8> sf[TK];
+    FOR_UNROLL (short ik = 0; ik < TK; ++ik) {
+        sf[ik] = 0.0f;
+    }
+
+    // partial S = Q*K^T over this simdgroup's slice of the head dim
+    FOR_UNROLL (short ik = 0; ik < TK; ik += 2) {
+        FOR_UNROLL (short id = 0; id < TDh; ++id) {
+            vec<half, 8> k0;
+            vec<half, 8> k1;
+
+            device const half * pk0 = pk + (ic + ik*kU)*sk + id*kU;
+            device const half * pk1 = pk0 + kU*sk;
+
+            FOR_UNROLL (short i = 0; i < 2; ++i) {
+                const half4 a = *((device const half4 *) (pk0 + 8*i*sk));
+                const half4 b = *((device const half4 *) (pk1 + 8*i*sk));
+
+                FOR_UNROLL (short j = 0; j < 4; ++j) {
+                    k0[4*i + j] = a[j];
+                    k1[4*i + j] = b[j];
+                }
+            }
+
+            nax_mma<float, half, half, true>(sf[ik], sf[ik + 1], qf[id], k0, k1);
+        }
+    }
+
+    if (WN > 1) {
+        // sum the WN partial scores in a fixed order
+        FOR_UNROLL (short ik = 0; ik < TK; ++ik) {
+            FOR_UNROLL (short i = 0; i < 8; ++i) {
+                sx_own[ik*8 + i] = sf[ik][i];
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        FOR_UNROLL (short ik = 0; ik < TK; ++ik) {
+            FOR_UNROLL (short i = 0; i < 8; ++i) {
+                float s = sx_row[ik*8 + i];
+                FOR_UNROLL (short g = 1; g < WN; ++g) {
+                    s += sx_row[g*(TK*8*32) + ik*8 + i];
+                }
+                sf[ik][i] = s;
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    FOR_UNROLL (short i = 0; i < 2; ++i) {
+        if (use_mask[i]) {
+            FOR_UNROLL (short ik = 0; ik < TK; ++ik) {
+                device const half * pmi = pm[i] + ic + ik*kU;
+
+                FOR_UNROLL (short j = 0; j < 4; ++j) {
+                    sf[ik][4*i + j] += M_LOG2E_F*(float) pmi[j];
+                }
+            }
+        }
+    }
+
+    // online softmax, base 2 - the lanes that share a row differ in bits 0 and 3
+    FOR_UNROLL (short i = 0; i < 2; ++i) {
+        float m = M[i];
+
+        FOR_UNROLL (short ik = 0; ik < TK; ++ik) {
+            m = max(m, max(max(sf[ik][4*i + 0], sf[ik][4*i + 1]), max(sf[ik][4*i + 2], sf[ik][4*i + 3])));
+        }
+
+        m = max(m, simd_shuffle_xor(m, 1));
+        m = max(m, simd_shuffle_xor(m, 8));
+
+        const float ms = fast::exp2(M[i] - m);
+        M[i] = m;
+
+        float sum = 0.0f;
+
+        FOR_UNROLL (short ik = 0; ik < TK; ++ik) {
+            FOR_UNROLL (short j = 0; j < 4; ++j) {
+                const float p = fast::exp2(sf[ik][4*i + j] - m);
+                sf[ik][4*i + j] = p;
+                sum += p;
+            }
+        }
+
+        sum += simd_shuffle_xor(sum, 1);
+        sum += simd_shuffle_xor(sum, 8);
+
+        S[i] = S[i]*ms + sum;
+
+        FOR_UNROLL (short id = 0; id < TDh; ++id) {
+            FOR_UNROLL (short j = 0; j < 4; ++j) {
+                of[id][4*i + j] *= ms;
+            }
+        }
+    }
+
+    // O += P*V over this simdgroup's slice of the head dim
+    FOR_UNROLL (short id = 0; id < TDh; id += 2) {
+        FOR_UNROLL (short ik = 0; ik < TK; ++ik) {
+            vec<half, 8> v0;
+            vec<half, 8> v1;
+
+            device const half * pv0 = pv + (ic + ik*kU)*sv + id*kU;
+
+            FOR_UNROLL (short i = 0; i < 2; ++i) {
+                const half4 a = *((device const half4 *) (pv0 + 8*i*sv));
+                const half4 b = *((device const half4 *) (pv0 + 8*i*sv + kU));
+
+                FOR_UNROLL (short j = 0; j < 4; ++j) {
+                    v0[4*i + j] = a[j];
+                    v1[4*i + j] = b[j];
+                }
+            }
+
+            nax_mma<float, float, half, false>(of[id], of[id + 1], sf[ik], v0, v1);
+        }
+    }
+}
+
 // flash attention with the scores, the probabilities and O kept in registers
 // WM simdgroups split the queries (16 each), WN simdgroups split the head dim; the WN partial Q*K^T scores are summed
 // through threadgroup memory in a fixed order, then every simdgroup runs the same softmax on its own copy
@@ -435,128 +580,9 @@ kernel void kernel_flash_attn_ext_nax(
             }
         }
 
-        vec<float, 8> sf[TK];
-        FOR_UNROLL (short ik = 0; ik < TK; ++ik) {
-            sf[ik] = 0.0f;
-        }
-
-        // partial S = Q*K^T over this simdgroup's slice of the head dim
-        FOR_UNROLL (short ik = 0; ik < TK; ik += 2) {
-            FOR_UNROLL (short id = 0; id < TDh; ++id) {
-                vec<half, 8> k0;
-                vec<half, 8> k1;
-
-                device const half * pk0 = pk + (ic + ik*kU)*sk + id*kU;
-                device const half * pk1 = pk0 + kU*sk;
-
-                FOR_UNROLL (short i = 0; i < 2; ++i) {
-                    const half4 a = *((device const half4 *) (pk0 + 8*i*sk));
-                    const half4 b = *((device const half4 *) (pk1 + 8*i*sk));
-
-                    FOR_UNROLL (short j = 0; j < 4; ++j) {
-                        k0[4*i + j] = a[j];
-                        k1[4*i + j] = b[j];
-                    }
-                }
-
-                nax_mma<float, half, half, true>(sf[ik], sf[ik + 1], qf[id], k0, k1);
-            }
-        }
-
-        if (WN > 1) {
-            // sum the WN partial scores in a fixed order
-            FOR_UNROLL (short ik = 0; ik < TK; ++ik) {
-                FOR_UNROLL (short i = 0; i < 8; ++i) {
-                    sx_own[ik*8 + i] = sf[ik][i];
-                }
-            }
-
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            FOR_UNROLL (short ik = 0; ik < TK; ++ik) {
-                FOR_UNROLL (short i = 0; i < 8; ++i) {
-                    float s = sx_row[ik*8 + i];
-                    FOR_UNROLL (short g = 1; g < WN; ++g) {
-                        s += sx_row[g*(TK*8*32) + ik*8 + i];
-                    }
-                    sf[ik][i] = s;
-                }
-            }
-
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-
-        if (FC_flash_attn_ext_nax_has_mask && blk_cur != 2) {
-            FOR_UNROLL (short i = 0; i < 2; ++i) {
-                if (row_ok[i]) {
-                    FOR_UNROLL (short ik = 0; ik < TK; ++ik) {
-                        device const half * pmi = pm[i] + ic + ik*kU;
-
-                        FOR_UNROLL (short j = 0; j < 4; ++j) {
-                            sf[ik][4*i + j] += M_LOG2E_F*(float) pmi[j];
-                        }
-                    }
-                }
-            }
-        }
-
-        // online softmax, base 2 - the lanes that share a row differ in bits 0 and 3
-        FOR_UNROLL (short i = 0; i < 2; ++i) {
-            float m = M[i];
-
-            FOR_UNROLL (short ik = 0; ik < TK; ++ik) {
-                m = max(m, max(max(sf[ik][4*i + 0], sf[ik][4*i + 1]), max(sf[ik][4*i + 2], sf[ik][4*i + 3])));
-            }
-
-            m = max(m, simd_shuffle_xor(m, 1));
-            m = max(m, simd_shuffle_xor(m, 8));
-
-            const float ms = fast::exp2(M[i] - m);
-            M[i] = m;
-
-            float sum = 0.0f;
-
-            FOR_UNROLL (short ik = 0; ik < TK; ++ik) {
-                FOR_UNROLL (short j = 0; j < 4; ++j) {
-                    const float p = fast::exp2(sf[ik][4*i + j] - m);
-                    sf[ik][4*i + j] = p;
-                    sum += p;
-                }
-            }
-
-            sum += simd_shuffle_xor(sum, 1);
-            sum += simd_shuffle_xor(sum, 8);
-
-            S[i] = S[i]*ms + sum;
-
-            FOR_UNROLL (short id = 0; id < TDh; ++id) {
-                FOR_UNROLL (short j = 0; j < 4; ++j) {
-                    of[id][4*i + j] *= ms;
-                }
-            }
-        }
-
-        // O += P*V over this simdgroup's slice of the head dim
-        FOR_UNROLL (short id = 0; id < TDh; id += 2) {
-            FOR_UNROLL (short ik = 0; ik < TK; ++ik) {
-                vec<half, 8> v0;
-                vec<half, 8> v1;
-
-                device const half * pv0 = pv + (ic + ik*kU)*sv + id*kU;
-
-                FOR_UNROLL (short i = 0; i < 2; ++i) {
-                    const half4 a = *((device const half4 *) (pv0 + 8*i*sv));
-                    const half4 b = *((device const half4 *) (pv0 + 8*i*sv + kU));
-
-                    FOR_UNROLL (short j = 0; j < 4; ++j) {
-                        v0[4*i + j] = a[j];
-                        v1[4*i + j] = b[j];
-                    }
-                }
-
-                nax_mma<float, float, half, false>(of[id], of[id + 1], sf[ik], v0, v1);
-            }
-        }
+        fa_nax_block<TK, TDh, WN>(qf, of, M, S, pk, sk, pv, sv, pm[0], pm[1],
+                FC_flash_attn_ext_nax_has_mask && blk_cur != 2 && row_ok[0],
+                FC_flash_attn_ext_nax_has_mask && blk_cur != 2 && row_ok[1], ic, sx_own, sx_row);
     }
 
     // normalize and store - rows past ne01 are not written
@@ -716,122 +742,8 @@ kernel void kernel_flash_attn_ext_nax_gqa(
     for (int ib = ib0; ib < ib1; ++ib) {
         const int ic = ib*BK;
 
-        vec<float, 8> sf[TK];
-        FOR_UNROLL (short ik = 0; ik < TK; ++ik) {
-            sf[ik] = 0.0f;
-        }
-
-        FOR_UNROLL (short ik = 0; ik < TK; ik += 2) {
-            FOR_UNROLL (short id = 0; id < TDh; ++id) {
-                vec<half, 8> k0;
-                vec<half, 8> k1;
-
-                device const half * pk0 = pk + (ic + ik*kU)*sk + id*kU;
-                device const half * pk1 = pk0 + kU*sk;
-
-                FOR_UNROLL (short i = 0; i < 2; ++i) {
-                    const half4 a = *((device const half4 *) (pk0 + 8*i*sk));
-                    const half4 b = *((device const half4 *) (pk1 + 8*i*sk));
-
-                    FOR_UNROLL (short j = 0; j < 4; ++j) {
-                        k0[4*i + j] = a[j];
-                        k1[4*i + j] = b[j];
-                    }
-                }
-
-                nax_mma<float, half, half, true>(sf[ik], sf[ik + 1], qf[id], k0, k1);
-            }
-        }
-
-        if (WN > 1) {
-            FOR_UNROLL (short ik = 0; ik < TK; ++ik) {
-                FOR_UNROLL (short i = 0; i < 8; ++i) {
-                    sx_own[ik*8 + i] = sf[ik][i];
-                }
-            }
-
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            FOR_UNROLL (short ik = 0; ik < TK; ++ik) {
-                FOR_UNROLL (short i = 0; i < 8; ++i) {
-                    float s = sx_row[ik*8 + i];
-                    FOR_UNROLL (short g = 1; g < WN; ++g) {
-                        s += sx_row[g*(TK*8*32) + ik*8 + i];
-                    }
-                    sf[ik][i] = s;
-                }
-            }
-
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-
-        if (FC_flash_attn_ext_nax_has_mask) {
-            FOR_UNROLL (short i = 0; i < 2; ++i) {
-                FOR_UNROLL (short ik = 0; ik < TK; ++ik) {
-                    device const half * pmi = pm[i] + ic + ik*kU;
-
-                    FOR_UNROLL (short j = 0; j < 4; ++j) {
-                        sf[ik][4*i + j] += M_LOG2E_F*(float) pmi[j];
-                    }
-                }
-            }
-        }
-
-        FOR_UNROLL (short i = 0; i < 2; ++i) {
-            float m = M[i];
-
-            FOR_UNROLL (short ik = 0; ik < TK; ++ik) {
-                m = max(m, max(max(sf[ik][4*i + 0], sf[ik][4*i + 1]), max(sf[ik][4*i + 2], sf[ik][4*i + 3])));
-            }
-
-            m = max(m, simd_shuffle_xor(m, 1));
-            m = max(m, simd_shuffle_xor(m, 8));
-
-            const float ms = fast::exp2(M[i] - m);
-            M[i] = m;
-
-            float sum = 0.0f;
-
-            FOR_UNROLL (short ik = 0; ik < TK; ++ik) {
-                FOR_UNROLL (short j = 0; j < 4; ++j) {
-                    const float p = fast::exp2(sf[ik][4*i + j] - m);
-                    sf[ik][4*i + j] = p;
-                    sum += p;
-                }
-            }
-
-            sum += simd_shuffle_xor(sum, 1);
-            sum += simd_shuffle_xor(sum, 8);
-
-            S[i] = S[i]*ms + sum;
-
-            FOR_UNROLL (short id = 0; id < TDh; ++id) {
-                FOR_UNROLL (short j = 0; j < 4; ++j) {
-                    of[id][4*i + j] *= ms;
-                }
-            }
-        }
-
-        FOR_UNROLL (short id = 0; id < TDh; id += 2) {
-            FOR_UNROLL (short ik = 0; ik < TK; ++ik) {
-                vec<half, 8> v0;
-                vec<half, 8> v1;
-
-                device const half * pv0 = pv + (ic + ik*kU)*sv + id*kU;
-
-                FOR_UNROLL (short i = 0; i < 2; ++i) {
-                    const half4 a = *((device const half4 *) (pv0 + 8*i*sv));
-                    const half4 b = *((device const half4 *) (pv0 + 8*i*sv + kU));
-
-                    FOR_UNROLL (short j = 0; j < 4; ++j) {
-                        v0[4*i + j] = a[j];
-                        v1[4*i + j] = b[j];
-                    }
-                }
-
-                nax_mma<float, float, half, false>(of[id], of[id + 1], sf[ik], v0, v1);
-            }
-        }
+        fa_nax_block<TK, TDh, WN>(qf, of, M, S, pk, sk, pv, sv, pm[0], pm[1],
+                FC_flash_attn_ext_nax_has_mask, FC_flash_attn_ext_nax_has_mask, ic, sx_own, sx_row);
     }
 
     // partial results in the layout of kernel_flash_attn_ext_vec_reduce: O as float4 chunks interleaved over the NWG

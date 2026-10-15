@@ -961,7 +961,7 @@ int ggml_metal_op_glu(ggml_metal_op_t ctx, int idx) {
     }
 
     auto pipeline = mm_i8 ? ggml_metal_library_get_pipeline_by_name(lib, "kernel_swiglu_q8a") :
-                    mm    ? ggml_metal_library_get_pipeline_glu_f16(lib, op) : ggml_metal_library_get_pipeline_glu(lib, op);
+                    mm    ? ggml_metal_library_get_pipeline_by_name(lib, "kernel_swiglu_f32_f16") : ggml_metal_library_get_pipeline_glu(lib, op);
 
     const int32_t swp = ggml_get_op_params_i32(op, 1);
     const float alpha = ggml_get_op_params_f32(op, 2);
@@ -2582,7 +2582,10 @@ static int ggml_metal_op_mul_mat_mma(ggml_metal_op_t ctx, int idx) {
     if (mr > 0) {
         const int nsg = 4;
 
-        auto pipeline_nax = ggml_metal_library_get_pipeline_mul_mv_nax(lib, op, mr, fuse_add);
+        char name[64];
+        snprintf(name, sizeof(name), "kernel_mul_mv_nax_%s_f32_mr%d_add%d", ggml_type_name(op->src[0]->type), mr, fuse_add ? 1 : 0);
+
+        auto pipeline_nax = ggml_metal_library_get_pipeline_by_name(lib, name);
 
         ggml_metal_kargs_mul_mv_ext args = {
             /*.ne00  =*/ ne00,
@@ -3059,7 +3062,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
                 /*.nb13 =*/ nb13,
             };
 
-            auto pipeline_cvt = ggml_metal_library_get_pipeline_mul_mm_cvt(lib);
+            auto pipeline_cvt = ggml_metal_library_get_pipeline_by_name(lib, "kernel_mul_mm_cvt_f32_f16");
 
             // the extra buffer is not covered by the concurrency tracking
             ggml_metal_op_concurrency_reset(ctx);
@@ -3097,7 +3100,10 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
                     /*.nb01 =*/ nb01,
                 };
 
-                auto pipeline_dq = ggml_metal_library_get_pipeline_mul_mm_dq(lib, op->src[0]->type);
+                char name[64];
+                snprintf(name, sizeof(name), "kernel_mul_mm_dq_%s_f16", ggml_type_name(op->src[0]->type));
+
+                auto pipeline_dq = ggml_metal_library_get_pipeline_by_name(lib, name);
 
                 ggml_metal_encoder_set_pipeline(enc, pipeline_dq);
                 ggml_metal_encoder_set_bytes   (enc, &args_dq, sizeof(args_dq), 0);
@@ -3114,7 +3120,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
                 ldb = ne00;
             }
 
-            ggml_metal_op_mul_mat_nax_dispatch(ctx, op, ggml_metal_library_get_pipeline_mul_mm_nax(lib),
+            ggml_metal_op_mul_mat_nax_dispatch(ctx, op, ggml_metal_library_get_pipeline_by_name(lib, "kernel_mul_mm_nax_f16"),
                     bid_src0, ldb, bid_src1, (int32_t) (nb11_mm/sizeof(ggml_fp16_t)));
 
             return 1;
@@ -4246,7 +4252,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
 
         const size_t smem = (size_t) nsg*(OP_FLASH_ATTN_EXT_NAX_NCPSG/16)*8*32*sizeof(float);
 
-        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_nax_gqa(lib, op, has_mask, has_sinks, gqa_wm);
+        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_nax(lib, op, has_mask, has_sinks, gqa_wm);
 
         GGML_ASSERT(nsg*32 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
         GGML_ASSERT(smem <= props_dev->max_theadgroup_memory_size);
@@ -4374,7 +4380,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
                      nqptg*sizeof(float) + sizeof(int32_t), 16);
 
         auto pipeline = use_nax ?
-            ggml_metal_library_get_pipeline_flash_attn_ext_nax(lib, op, has_mask, has_sinks) :
+            ggml_metal_library_get_pipeline_flash_attn_ext_nax(lib, op, has_mask, has_sinks, 0) :
             ggml_metal_library_get_pipeline_flash_attn_ext_tensor(lib, op, has_mask, has_sinks, has_bias, has_scap);
 
         GGML_ASSERT(nsg*32 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
