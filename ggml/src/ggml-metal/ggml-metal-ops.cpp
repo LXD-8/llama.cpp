@@ -3775,7 +3775,28 @@ static int ggml_metal_op_flash_attn_ext_gqa_wm(const ggml_tensor * op, bool has_
     const int64_t ne02 = op->src[0]->ne[2];
     const int64_t ne12 = op->src[1]->ne[2];
 
-    if ((op->src[1]->type != GGML_TYPE_F16 && op->src[1]->type != GGML_TYPE_BF16) || op->src[2]->type != op->src[1]->type ||
+    // a quantized cache (32-value blocks) is dequantized in registers; GGML_METAL_FA_GQA_Q_DISABLE leaves it to the
+    // vec kernels
+    static const bool q_disabled = getenv("GGML_METAL_FA_GQA_Q_DISABLE") != nullptr; // read once per process
+
+    bool kv_q = false;
+    switch (op->src[1]->type) {
+        case GGML_TYPE_F16:
+        case GGML_TYPE_BF16:
+            break;
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_IQ4_NL:
+            kv_q = true;
+            break;
+        default:
+            return 0;
+    }
+
+    if ((kv_q && q_disabled) || op->src[2]->type != op->src[1]->type ||
         ne12 == 0 || ne02 % ne12 != 0 || ne02/ne12 < 2 ||
         op->src[3] == nullptr || op->src[3]->ne[1] < ne01) {
         return 0;
@@ -3783,9 +3804,10 @@ static int ggml_metal_op_flash_attn_ext_gqa_wm(const ggml_tensor * op, bool has_
 
     const int64_t rows = ne01*(ne02/ne12);
 
-    // a tile with only up to 4 used rows (single-token decode with 4 query heads per KV head) loses to the vec kernel
-    // until the KV range is long (Llama-3.1-8B: -1-2% below 16k, +2-5% from 16k)
-    if (rows <= 4 && op->src[1]->ne[1] < 16384) {
+    // a tile with only up to 4 used rows (single-token decode with 4 query heads per KV head) loses to the vec kernel:
+    // on an F16 cache until the KV range is long (Llama-3.1-8B: -1-2% below 16k, +2-5% from 16k), on a quantized
+    // cache at any length (q8_0: -8% at 8k, -18% at 32k)
+    if (rows <= 4 && (kv_q || op->src[1]->ne[1] < 16384)) {
         return 0;
     }
 
