@@ -3726,14 +3726,17 @@ static bool ggml_metal_op_flash_attn_ext_use_tensor(const ggml_tensor * op, bool
     return op->src[1]->ne[1] % OP_FLASH_ATTN_EXT_TENSOR_NCPSG == 0;
 }
 
-// the register-resident NAX kernel covers the tensor kernel for equal K/V head sizes 64, 128, 256 and 512, without ALiBi or softcap
+// the register-resident NAX kernel covers the tensor kernel for K/V head sizes 64, 128, 256, 512 and the MLA shapes, without ALiBi or softcap
 static bool ggml_metal_op_flash_attn_ext_use_nax(const ggml_tensor * op) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
     const int64_t dk = op->src[1]->ne[0];
     const int64_t dv = op->src[2]->ne[0];
 
-    if (dk != dv || (dk != 64 && dk != 128 && dk != 256 && dk != 512)) {
+    // MLA: 192/128, and 576/512 with V a view of K
+    const bool dk_dv_ok = (dk == dv && (dk == 64 || dk == 128 || dk == 256 || dk == 512)) ||
+                          (dk == 192 && dv == 128) || (dk == 576 && dv == 512);
+    if (!dk_dv_ok) {
         return false;
     }
 
@@ -3753,8 +3756,9 @@ static bool ggml_metal_op_flash_attn_ext_use_nax(const ggml_tensor * op) {
 }
 
 // small batches with grouped KV heads: one NAX tile holds all queries of the heads that share a KV head (<= 32 rows)
-static int ggml_metal_op_flash_attn_ext_gqa_wm(const ggml_tensor * op, bool has_nax) {
-    if (!has_nax || !ggml_metal_op_flash_attn_ext_use_nax(op)) {
+static int ggml_metal_op_flash_attn_ext_gqa_wm(const ggml_tensor * op, bool has_tensor) {
+    // equal K/V head sizes only
+    if (!has_tensor || !ggml_metal_op_flash_attn_ext_use_nax(op) || op->src[1]->ne[0] != op->src[2]->ne[0]) {
         return 0;
     }
 
