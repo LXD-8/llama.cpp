@@ -1975,8 +1975,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_n
     const int32_t dk = (int32_t) op->src[1]->ne[0];
     const int32_t dv = (int32_t) op->src[2]->ne[0];
 
-    // the K/V element type as stored (a quantized cache has been converted to f16 beforehand)
-    const char * kv = op->src[1]->type == GGML_TYPE_BF16 ? "bf16" : "f16";
+    // the K/V element type: the GQA kernel reads a quantized cache as stored, the others get an F16 copy of it
+    const char * kv = op->src[1]->type == GGML_TYPE_BF16 ? "bf16" : wm > 0 ? ggml_type_name(op->src[1]->type) : "f16";
 
     // wm > 0: the GQA variant with wm tiles of 16 query rows
     if (wm > 0) {
