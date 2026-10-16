@@ -292,7 +292,9 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
             {
                 const ggml_metal_device_t ctx_dev = (ggml_metal_device_t) buft->device->context;
 
-                res += ggml_metal_op_mul_mat_extra_f16_act(tensor, ggml_metal_device_get_props(ctx_dev)->has_tensor);
+                const struct ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx_dev);
+
+                res += ggml_metal_op_mul_mat_extra_f16_act(tensor, props_dev->has_tensor, props_dev->has_nax);
             } break;
         case GGML_OP_MUL_MAT_ID:
             {
