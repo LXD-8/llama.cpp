@@ -311,7 +311,7 @@ static inline half4 fa_nax_kv4(device const bfloat * p) {
 // one KV block of the NAX attention kernels: the partial S = Q*K^T over this simdgroup's slice of the head dim, summed
 // over the WN simdgroups through threadgroup memory in a fixed order, the mask (rows with use_mask), the online softmax
 // (base 2) and O += P*V. qf, of, M, S are the per-lane registers of the calling kernel
-template<typename KV, short TK, short TDh, short WN>
+template<typename KV, short TK, short TDk, short TDv, short WN>
 static inline void fa_nax_block(
         thread const vec<half, 8>  * qf,
         thread       vec<float, 8> * of,
@@ -338,7 +338,7 @@ static inline void fa_nax_block(
 
     // partial S = Q*K^T over this simdgroup's slice of the head dim
     FOR_UNROLL (short ik = 0; ik < TK; ik += 2) {
-        FOR_UNROLL (short id = 0; id < TDh; ++id) {
+        FOR_UNROLL (short id = 0; id < TDk; ++id) {
             vec<half, 8> k0;
             vec<half, 8> k1;
 
@@ -423,7 +423,7 @@ static inline void fa_nax_block(
 
         S[i] = S[i]*ms + sum;
 
-        FOR_UNROLL (short id = 0; id < TDh; ++id) {
+        FOR_UNROLL (short id = 0; id < TDv; ++id) {
             FOR_UNROLL (short j = 0; j < 4; ++j) {
                 of[id][4*i + j] *= ms;
             }
@@ -431,7 +431,7 @@ static inline void fa_nax_block(
     }
 
     // O += P*V over this simdgroup's slice of the head dim
-    FOR_UNROLL (short id = 0; id < TDh; id += 2) {
+    FOR_UNROLL (short id = 0; id < TDv; id += 2) {
         FOR_UNROLL (short ik = 0; ik < TK; ++ik) {
             vec<half, 8> v0;
             vec<half, 8> v1;
@@ -480,12 +480,14 @@ kernel void kernel_flash_attn_ext_nax(
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
     constexpr short kU  = 16;
     constexpr short TK  = BK/kU;      // KV fragments per block
-    constexpr short TDh = DK/kU/WN;   // head-dim fragments per simdgroup
-    constexpr short BDh = DK/WN;      // head-dim columns per simdgroup
+    constexpr short TDk = DK/kU/WN;   // K head-dim fragments per simdgroup
+    constexpr short BDk = DK/WN;      // K head-dim columns per simdgroup
+    constexpr short TDv = DV/kU/WN;   // V head-dim fragments per simdgroup
+    constexpr short BDv = DV/WN;      // V head-dim columns per simdgroup
 
-    static_assert(DK == DV,     "DK must equal DV");
+    static_assert(DK % (kU*WN) == 0 && DV % (kU*WN) == 0, "the head dims must split into WN fragment columns");
     static_assert(TK % 2 == 0,  "scores are computed in pairs of fragments");
-    static_assert(TDh % 2 == 0, "O is accumulated in pairs of fragments");
+    static_assert(TDv % 2 == 0, "O is accumulated in pairs of fragments");
 
     const int iq3 = tgpig[2];
     const int iq2 = tgpig[1];
@@ -502,7 +504,7 @@ kernel void kernel_flash_attn_ext_nax(
     const int r0 = iq1 + row_group*kU + fm;
 
     // queries, with the softmax scale and log2(e) folded in
-    vec<half, 8> qf[TDh];
+    vec<half, 8> qf[TDk];
     {
         const float qs = args.scale*M_LOG2E_F;
 
@@ -511,10 +513,10 @@ kernel void kernel_flash_attn_ext_nax(
         FOR_UNROLL (short i = 0; i < 2; ++i) {
             const int r = r0 + 8*i;
 
-            FOR_UNROLL (short id = 0; id < TDh; ++id) {
+            FOR_UNROLL (short id = 0; id < TDk; ++id) {
                 float4 x = 0.0f;
                 if (r < args.ne01) {
-                    x = *((device const float4 *) (q0 + r*args.nb01) + (d_group*BDh + id*kU + fn)/4);
+                    x = *((device const float4 *) (q0 + r*args.nb01) + (d_group*BDk + id*kU + fn)/4);
                 }
 
                 const half4 h = (half4) (x*qs);
@@ -537,8 +539,8 @@ kernel void kernel_flash_attn_ext_nax(
     const int sk = args.ns10;
     const int sv = args.ns20;
 
-    device const KV * pk = (device const KV *) k + fm*sk + d_group*BDh + fn;
-    device const KV * pv = (device const KV *) v + fm*sv + d_group*BDh + fn;
+    device const KV * pk = (device const KV *) k + fm*sk + d_group*BDk + fn;
+    device const KV * pv = (device const KV *) v + fm*sv + d_group*BDv + fn;
 
     device const half * pm[2];
     bool row_ok[2];
@@ -558,8 +560,8 @@ kernel void kernel_flash_attn_ext_nax(
         blk += (((iq3%args.ne33)*args.ne32 + (iq2%args.ne32))*nblk1 + iq1/BQ)*nblk0;
     }
 
-    vec<float, 8> of[TDh];
-    FOR_UNROLL (short id = 0; id < TDh; ++id) {
+    vec<float, 8> of[TDv];
+    FOR_UNROLL (short id = 0; id < TDv; ++id) {
         of[id] = 0.0f;
     }
 
@@ -591,13 +593,13 @@ kernel void kernel_flash_attn_ext_nax(
             }
         }
 
-        fa_nax_block<KV, TK, TDh, WN>(qf, of, M, S, pk, sk, pv, sv, pm[0], pm[1],
+        fa_nax_block<KV, TK, TDk, TDv, WN>(qf, of, M, S, pk, sk, pv, sv, pm[0], pm[1],
                 FC_flash_attn_ext_nax_has_mask && blk_cur != 2 && row_ok[0],
                 FC_flash_attn_ext_nax_has_mask && blk_cur != 2 && row_ok[1], ic, sx_own, sx_row);
     }
 
     // normalize and store - rows past ne01 are not written
-    device float * pdst = (device float *) dst + ((uint64_t) iq3*args.ne2*args.ne1 + iq2)*DV + d_group*BDh + fn;
+    device float * pdst = (device float *) dst + ((uint64_t) iq3*args.ne2*args.ne1 + iq2)*DV + d_group*BDv + fn;
 
     FOR_UNROLL (short i = 0; i < 2; ++i) {
         const int r = r0 + 8*i;
@@ -619,7 +621,7 @@ kernel void kernel_flash_attn_ext_nax(
 
             device float * pd = pdst + (uint64_t) r*args.ne1*DV;
 
-            FOR_UNROLL (short id = 0; id < TDh; ++id) {
+            FOR_UNROLL (short id = 0; id < TDv; ++id) {
                 *((device float4 *) (pd + id*kU)) = float4(of[id][4*i + 0], of[id][4*i + 1], of[id][4*i + 2], of[id][4*i + 3])*rs;
             }
         }
@@ -636,6 +638,10 @@ template [[host_name("kernel_flash_attn_ext_nax_f16_dk256_dv256")]]  kernel flas
 template [[host_name("kernel_flash_attn_ext_nax_bf16_dk256_dv256")]] kernel flash_attn_ext_nax_t kernel_flash_attn_ext_nax<bfloat, 256, 256, 2>;
 template [[host_name("kernel_flash_attn_ext_nax_f16_dk512_dv512")]]  kernel flash_attn_ext_nax_t kernel_flash_attn_ext_nax<half,   512, 512, 4>;
 template [[host_name("kernel_flash_attn_ext_nax_bf16_dk512_dv512")]] kernel flash_attn_ext_nax_t kernel_flash_attn_ext_nax<bfloat, 512, 512, 4>;
+template [[host_name("kernel_flash_attn_ext_nax_f16_dk192_dv128")]]  kernel flash_attn_ext_nax_t kernel_flash_attn_ext_nax<half,   192, 128, 1>;
+template [[host_name("kernel_flash_attn_ext_nax_bf16_dk192_dv128")]] kernel flash_attn_ext_nax_t kernel_flash_attn_ext_nax<bfloat, 192, 128, 1>;
+template [[host_name("kernel_flash_attn_ext_nax_f16_dk576_dv512")]]  kernel flash_attn_ext_nax_t kernel_flash_attn_ext_nax<half,   576, 512, 4>;
+template [[host_name("kernel_flash_attn_ext_nax_bf16_dk576_dv512")]] kernel flash_attn_ext_nax_t kernel_flash_attn_ext_nax<bfloat, 576, 512, 4>;
 
 // small batches (decode, MTP verify): the G query heads that share a KV head and the ne01 queries are packed into the
 // rows of one tile (packed row p = g*ne01 + i), so every K/V block is loaded once for all of them. the KV range is
@@ -758,7 +764,7 @@ kernel void kernel_flash_attn_ext_nax_gqa(
     for (int ib = ib0; ib < ib1; ++ib) {
         const int ic = ib*BK;
 
-        fa_nax_block<KV, TK, TDh, WN>(qf, of, M, S, pk, sk, pv, sv, pm[0], pm[1],
+        fa_nax_block<KV, TK, TDh, TDh, WN>(qf, of, M, S, pk, sk, pv, sv, pm[0], pm[1],
                 FC_flash_attn_ext_nax_has_mask, FC_flash_attn_ext_nax_has_mask, ic, sx_own, sx_row);
     }
 
