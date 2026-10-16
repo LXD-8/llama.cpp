@@ -378,6 +378,74 @@ void dequantize_mxfp4_t4(device const block_mxfp4 * xb, short il, thread type4 &
     reg[3] = d * kvalues_mxfp4_f[(q2[4*il4 + 3] >> shr) & 0x0F];
 }
 
+// NVFP4: 4 sub-blocks of 16 E2M1 values with one UE4M3 scale each; in a sub-block, byte j holds value j in its low and
+// value j + 8 in its high nibble. il selects the sub-block
+template <typename type4x4>
+void dequantize_nvfp4(device const block_nvfp4 * xb, short il, thread type4x4 & reg) {
+    device const uint8_t * q = xb->qs + 8*il;
+
+    const float d = ue4m3_to_fp32(xb->d[il]);
+
+    float4x4 reg_f;
+
+    for (int i = 0; i < 2; ++i) {
+        reg_f[i    ][0] = d * kvalues_mxfp4_f[q[4*i + 0] & 0x0F];
+        reg_f[i    ][1] = d * kvalues_mxfp4_f[q[4*i + 1] & 0x0F];
+        reg_f[i    ][2] = d * kvalues_mxfp4_f[q[4*i + 2] & 0x0F];
+        reg_f[i    ][3] = d * kvalues_mxfp4_f[q[4*i + 3] & 0x0F];
+        reg_f[i + 2][0] = d * kvalues_mxfp4_f[q[4*i + 0] >> 4];
+        reg_f[i + 2][1] = d * kvalues_mxfp4_f[q[4*i + 1] >> 4];
+        reg_f[i + 2][2] = d * kvalues_mxfp4_f[q[4*i + 2] >> 4];
+        reg_f[i + 2][3] = d * kvalues_mxfp4_f[q[4*i + 3] >> 4];
+    }
+
+    reg = (type4x4) reg_f;
+}
+
+// 4 values of an NVFP4 block: il = 4*sub-block + quarter
+template <typename type4>
+void dequantize_nvfp4_t4(device const block_nvfp4 * xb, short il, thread type4 & reg) {
+    const short is = il/4;
+    const short iq = il%4;
+
+    device const uint8_t * q = xb->qs + 8*is + 4*(iq%2);
+
+    const float d = ue4m3_to_fp32(xb->d[is]);
+    const uint8_t shr = iq >= 2 ? 4 : 0;
+
+    reg[0] = d * kvalues_mxfp4_f[(q[0] >> shr) & 0x0F];
+    reg[1] = d * kvalues_mxfp4_f[(q[1] >> shr) & 0x0F];
+    reg[2] = d * kvalues_mxfp4_f[(q[2] >> shr) & 0x0F];
+    reg[3] = d * kvalues_mxfp4_f[(q[3] >> shr) & 0x0F];
+}
+
+// TQ1_0: base-3 digits as in the CPU reference, digit n of a byte b is ((uint8_t) (b*3^n)*3) >> 8; il selects 16 values
+template <typename type4x4>
+void dequantize_tq1_0(device const block_tq1_0 * xb, short il, thread type4x4 & reg) {
+    const float d = xb->d;
+
+    constexpr uchar pow3[5] = {1, 3, 9, 27, 81};
+
+    float4x4 reg_f;
+
+    if (il < 15) {
+        device const uchar * q = il < 10 ? xb->qs + 16*(il%2) : xb->qs + 32;
+        const uchar p = pow3[il < 10 ? il/2 : il - 10];
+
+        for (int i = 0; i < 16; ++i) {
+            const uchar t = q[i]*p;
+            reg_f[i/4][i%4] = (float) ((((ushort) t*3) >> 8) - 1)*d;
+        }
+    } else {
+        for (int i = 0; i < 16; ++i) {
+            const uchar t = xb->qh[i%4]*pow3[i/4];
+            reg_f[i/4][i%4] = (float) ((((ushort) t*3) >> 8) - 1)*d;
+        }
+    }
+
+    reg = (type4x4) reg_f;
+}
+
 template <typename type4x4>
 void dequantize_q2_K(device const block_q2_K *xb, short il, thread type4x4 & reg) {
     const float d = xb->d;

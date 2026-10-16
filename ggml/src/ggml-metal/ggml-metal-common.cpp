@@ -86,6 +86,7 @@ static bool ggml_metal_mul_mv_mma_type_supported(enum ggml_type type) {
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
         case GGML_TYPE_MXFP4:
+        case GGML_TYPE_NVFP4:
         case GGML_TYPE_Q2_K:
         case GGML_TYPE_Q3_K:
         case GGML_TYPE_IQ2_XXS:
@@ -98,6 +99,7 @@ static bool ggml_metal_mul_mv_mma_type_supported(enum ggml_type type) {
         case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_TQ2_0:
+        case GGML_TYPE_TQ1_0:
             return true;
         default:
             return false;
@@ -124,6 +126,7 @@ static int64_t ggml_metal_mul_mv_mma_rows_min(enum ggml_type type) {
         case GGML_TYPE_F32:
             return 6;
         case GGML_TYPE_TQ2_0:
+        case GGML_TYPE_TQ1_0:
             return 5;
         case GGML_TYPE_BF16:
             return 4;
@@ -135,6 +138,7 @@ static int64_t ggml_metal_mul_mv_mma_rows_min(enum ggml_type type) {
         case GGML_TYPE_Q2_K:
         case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_MXFP4:
+        case GGML_TYPE_NVFP4:
             return 3;
         default:
             return 2;
@@ -188,6 +192,7 @@ static int64_t ggml_metal_mul_mv_nax_rows_max(enum ggml_type type) {
         case GGML_TYPE_IQ1_S:
             return 48;
         case GGML_TYPE_MXFP4:
+        case GGML_TYPE_NVFP4:
         case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ2_XXS:
@@ -229,6 +234,7 @@ static bool ggml_metal_mul_mv_nax_rows_ok(enum ggml_type type, int64_t ne11) {
             return true;
         case GGML_TYPE_Q2_K:
         case GGML_TYPE_TQ2_0:
+        case GGML_TYPE_TQ1_0:
         case GGML_TYPE_Q5_K:
             return ne11 >= 3;
         case GGML_TYPE_Q6_K:
