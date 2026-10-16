@@ -917,18 +917,27 @@ int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
 }
 
 // the tensor mul_mm kernels are faster with half activations, so f32 activations are first converted to f16 into the extra buffer
-static bool ggml_metal_op_mul_mat_f16_act_shape(const ggml_tensor * op) {
+static bool ggml_metal_op_mul_mat_f16_act_shape_any(const ggml_tensor * op) {
     const ggml_tensor * src1 = op->src[1];
 
     return src1->type == GGML_TYPE_F32 &&
-           op->src[0]->type != GGML_TYPE_F32 && op->src[0]->type != GGML_TYPE_BF16 &&
+           op->src[0]->type != GGML_TYPE_F32 &&
            src1->ne[0] % 4 == 0 && src1->nb[0] == sizeof(float) &&
            src1->nb[1] % 16 == 0 && src1->nb[2] % 16 == 0 && src1->nb[3] % 16 == 0 &&
            ggml_metal_op_mul_mat_use_mm(op, true);
 }
 
-// whether the mul_mm is large enough to pay for the conversion of its activations
-static bool ggml_metal_op_mul_mat_f16_act_rows(const ggml_tensor * op) {
+// whether a MUL_MAT converts its activations to f16 (and reserves the extra buffer for them)
+static bool ggml_metal_op_mul_mat_f16_act_shape(const ggml_tensor * op) {
+    if (!ggml_metal_op_mul_mat_f16_act_shape_any(op)) {
+        return false;
+    }
+
+    // the NAX mat-mat takes f16 activations only
+    if (ggml_metal_op_mul_mat_nax_shape(op)) {
+        return true;
+    }
+
     // the conversion is an extra dispatch with a barrier on each side, which costs more than it saves for small products
     const double flop = 2.0*op->src[0]->ne[0]*op->src[0]->ne[1]*ggml_nrows(op->src[1]);
 
@@ -946,6 +955,7 @@ bool ggml_metal_op_mul_mat_nax_shape(const ggml_tensor * op) {
 
     switch (src0->type) {
         case GGML_TYPE_F16:
+        case GGML_TYPE_BF16:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
@@ -977,7 +987,7 @@ bool ggml_metal_op_mul_mat_nax_shape(const ggml_tensor * op) {
     // the copy of the weights pays off from about 1000 src1 rows
     const int64_t min_rows = 1024;
 
-    return ggml_metal_op_mul_mat_f16_act_shape(op) &&
+    return ggml_metal_op_mul_mat_f16_act_shape_any(op) &&
            src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
            src0->ne[0] % 32 == 0 && src1->ne[1] >= min_rows &&
            (src0->type != GGML_TYPE_F16 || (src0->nb[0] == sizeof(ggml_fp16_t) && src0->nb[1] % 16 == 0)) &&
@@ -994,7 +1004,8 @@ static bool ggml_metal_op_mul_mat_use_nax(const ggml_tensor * op, bool has_nax) 
 static bool ggml_metal_op_mul_mat_use_i8(const ggml_tensor * op, bool has_tensor) {
     static const bool disabled = getenv("GGML_METAL_MM_I8_DISABLE") != nullptr; // read once per process
 
-    return !disabled && op->src[0]->type != GGML_TYPE_F16 && op->src[0]->ne[0] % OP_MUL_MM_I8_G == 0 &&
+    return !disabled && op->src[0]->type != GGML_TYPE_F16 && op->src[0]->type != GGML_TYPE_BF16 &&
+        op->src[0]->ne[0] % OP_MUL_MM_I8_G == 0 &&
         ggml_metal_op_mul_mat_use_nax(op, has_tensor);
 }
 
