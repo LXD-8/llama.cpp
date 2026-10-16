@@ -3771,7 +3771,8 @@ static bool ggml_metal_op_flash_attn_ext_use_tensor(const ggml_tensor * op, bool
 
 // the register-resident NAX kernel covers the tensor kernel for equal K/V head sizes 64, 128, 256 and 512, without ALiBi or softcap
 static bool ggml_metal_op_flash_attn_ext_use_nax(const ggml_tensor * op) {
-    static const bool disabled = getenv("GGML_METAL_FA_NAX_DISABLE") != nullptr;
+    static const bool disabled      = getenv("GGML_METAL_FA_NAX_DISABLE") != nullptr;
+    static const bool bf16_disabled = getenv("GGML_METAL_FA_NAX_BF16_DISABLE") != nullptr;
 
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
@@ -3791,9 +3792,11 @@ static bool ggml_metal_op_flash_attn_ext_use_nax(const ggml_tensor * op) {
         return false;
     }
 
-    // f16 K/V only (or converted to f16): the BF16 cache takes the tensor kernel
+    // a BF16 cache is converted to f16 in registers
     if (op->src[1]->type == GGML_TYPE_BF16) {
-        return false;
+        if (bf16_disabled || op->src[2]->type != GGML_TYPE_BF16) {
+            return false;
+        }
     }
 
     float max_bias;
