@@ -298,17 +298,27 @@ template [[host_name("kernel_flash_attn_ext_tensor_bf16_dk576_dv512")]] kernel f
 constant bool FC_flash_attn_ext_nax_has_mask  [[function_constant(FC_FLASH_ATTN_EXT_NAX + 0)]];
 constant bool FC_flash_attn_ext_nax_has_sinks [[function_constant(FC_FLASH_ATTN_EXT_NAX + 1)]];
 
+// K/V elements of the NAX attention kernels: f16 as is, bf16 converted to f16 in registers (exact within the f16 range,
+// larger values are clamped), so that Q, K, V and P stay f16 in the MMA
+static inline half4 fa_nax_kv4(device const half * p) {
+    return *((device const half4 *) p);
+}
+
+static inline half4 fa_nax_kv4(device const bfloat * p) {
+    return (half4) clamp(float4(*((device const bfloat4 *) p)), -65504.0f, 65504.0f);
+}
+
 // one KV block of the NAX attention kernels: the partial S = Q*K^T over this simdgroup's slice of the head dim, summed
 // over the WN simdgroups through threadgroup memory in a fixed order, the mask (rows with use_mask), the online softmax
 // (base 2) and O += P*V. qf, of, M, S are the per-lane registers of the calling kernel
-template<short TK, short TDh, short WN>
+template<typename KV, short TK, short TDh, short WN>
 static inline void fa_nax_block(
         thread const vec<half, 8>  * qf,
         thread       vec<float, 8> * of,
         thread       float         * M,
         thread       float         * S,
-        device const half * pk, int sk,
-        device const half * pv, int sv,
+        device const KV * pk, int sk,
+        device const KV * pv, int sv,
         device const half * pm0,
         device const half * pm1,
         bool use_mask0,
@@ -332,12 +342,12 @@ static inline void fa_nax_block(
             vec<half, 8> k0;
             vec<half, 8> k1;
 
-            device const half * pk0 = pk + (ic + ik*kU)*sk + id*kU;
-            device const half * pk1 = pk0 + kU*sk;
+            device const KV * pk0 = pk + (ic + ik*kU)*sk + id*kU;
+            device const KV * pk1 = pk0 + kU*sk;
 
             FOR_UNROLL (short i = 0; i < 2; ++i) {
-                const half4 a = *((device const half4 *) (pk0 + 8*i*sk));
-                const half4 b = *((device const half4 *) (pk1 + 8*i*sk));
+                const half4 a = fa_nax_kv4(pk0 + 8*i*sk);
+                const half4 b = fa_nax_kv4(pk1 + 8*i*sk);
 
                 FOR_UNROLL (short j = 0; j < 4; ++j) {
                     k0[4*i + j] = a[j];
@@ -426,11 +436,11 @@ static inline void fa_nax_block(
             vec<half, 8> v0;
             vec<half, 8> v1;
 
-            device const half * pv0 = pv + (ic + ik*kU)*sv + id*kU;
+            device const KV * pv0 = pv + (ic + ik*kU)*sv + id*kU;
 
             FOR_UNROLL (short i = 0; i < 2; ++i) {
-                const half4 a = *((device const half4 *) (pv0 + 8*i*sv));
-                const half4 b = *((device const half4 *) (pv0 + 8*i*sv + kU));
+                const half4 a = fa_nax_kv4(pv0 + 8*i*sv);
+                const half4 b = fa_nax_kv4(pv0 + 8*i*sv + kU);
 
                 FOR_UNROLL (short j = 0; j < 4; ++j) {
                     v0[4*i + j] = a[j];
@@ -449,6 +459,7 @@ static inline void fa_nax_block(
 // the structure follows MLX steel attention_nax_dsplit (MIT, Apple Inc.)
 // no ALiBi or softcap - the host uses kernel_flash_attn_ext_tensor for those
 template<
+    typename KV, // K/V element type: half or bfloat
     short DK,
     short DV,
     short WN,
@@ -526,8 +537,8 @@ kernel void kernel_flash_attn_ext_nax(
     const int sk = args.ns10;
     const int sv = args.ns20;
 
-    device const half * pk = (device const half *) k + fm*sk + d_group*BDh + fn;
-    device const half * pv = (device const half *) v + fm*sv + d_group*BDh + fn;
+    device const KV * pk = (device const KV *) k + fm*sk + d_group*BDh + fn;
+    device const KV * pv = (device const KV *) v + fm*sv + d_group*BDh + fn;
 
     device const half * pm[2];
     bool row_ok[2];
@@ -580,7 +591,7 @@ kernel void kernel_flash_attn_ext_nax(
             }
         }
 
-        fa_nax_block<TK, TDh, WN>(qf, of, M, S, pk, sk, pv, sv, pm[0], pm[1],
+        fa_nax_block<KV, TK, TDh, WN>(qf, of, M, S, pk, sk, pv, sv, pm[0], pm[1],
                 FC_flash_attn_ext_nax_has_mask && blk_cur != 2 && row_ok[0],
                 FC_flash_attn_ext_nax_has_mask && blk_cur != 2 && row_ok[1], ic, sx_own, sx_row);
     }
@@ -615,18 +626,23 @@ kernel void kernel_flash_attn_ext_nax(
     }
 }
 
-typedef decltype(kernel_flash_attn_ext_nax<256, 256, 2>) flash_attn_ext_nax_t;
+typedef decltype(kernel_flash_attn_ext_nax<half, 256, 256, 2>) flash_attn_ext_nax_t;
 
-template [[host_name("kernel_flash_attn_ext_nax_f16_dk64_dv64")]]   kernel flash_attn_ext_nax_t kernel_flash_attn_ext_nax<64,  64,  1>;
-template [[host_name("kernel_flash_attn_ext_nax_f16_dk128_dv128")]] kernel flash_attn_ext_nax_t kernel_flash_attn_ext_nax<128, 128, 1>;
-template [[host_name("kernel_flash_attn_ext_nax_f16_dk256_dv256")]] kernel flash_attn_ext_nax_t kernel_flash_attn_ext_nax<256, 256, 2>;
-template [[host_name("kernel_flash_attn_ext_nax_f16_dk512_dv512")]] kernel flash_attn_ext_nax_t kernel_flash_attn_ext_nax<512, 512, 4>;
+template [[host_name("kernel_flash_attn_ext_nax_f16_dk64_dv64")]]    kernel flash_attn_ext_nax_t kernel_flash_attn_ext_nax<half,   64, 64, 1>;
+template [[host_name("kernel_flash_attn_ext_nax_bf16_dk64_dv64")]]   kernel flash_attn_ext_nax_t kernel_flash_attn_ext_nax<bfloat, 64, 64, 1>;
+template [[host_name("kernel_flash_attn_ext_nax_f16_dk128_dv128")]]  kernel flash_attn_ext_nax_t kernel_flash_attn_ext_nax<half,   128, 128, 1>;
+template [[host_name("kernel_flash_attn_ext_nax_bf16_dk128_dv128")]] kernel flash_attn_ext_nax_t kernel_flash_attn_ext_nax<bfloat, 128, 128, 1>;
+template [[host_name("kernel_flash_attn_ext_nax_f16_dk256_dv256")]]  kernel flash_attn_ext_nax_t kernel_flash_attn_ext_nax<half,   256, 256, 2>;
+template [[host_name("kernel_flash_attn_ext_nax_bf16_dk256_dv256")]] kernel flash_attn_ext_nax_t kernel_flash_attn_ext_nax<bfloat, 256, 256, 2>;
+template [[host_name("kernel_flash_attn_ext_nax_f16_dk512_dv512")]]  kernel flash_attn_ext_nax_t kernel_flash_attn_ext_nax<half,   512, 512, 4>;
+template [[host_name("kernel_flash_attn_ext_nax_bf16_dk512_dv512")]] kernel flash_attn_ext_nax_t kernel_flash_attn_ext_nax<bfloat, 512, 512, 4>;
 
 // small batches (decode, MTP verify): the G query heads that share a KV head and the ne01 queries are packed into the
 // rows of one tile (packed row p = g*ne01 + i), so every K/V block is loaded once for all of them. the KV range is
 // split over NWG threadgroups; each writes its unnormalized O and its S, M into the temp buffer of the vec kernels,
 // and kernel_flash_attn_ext_vec_reduce combines them; the first one also folds in the sink. no ALiBi or softcap
 template<
+    typename KV, // K/V element type: half or bfloat
     short DK,
     short DV,
     short WN,
@@ -713,8 +729,8 @@ kernel void kernel_flash_attn_ext_nax_gqa(
     const int sk = args.ns10;
     const int sv = args.ns20;
 
-    device const half * pk = (device const half *) k + fm*sk + d_group*BDh + fn;
-    device const half * pv = (device const half *) v + fm*sv + d_group*BDh + fn;
+    device const KV * pk = (device const KV *) k + fm*sk + d_group*BDh + fn;
+    device const KV * pv = (device const KV *) v + fm*sv + d_group*BDh + fn;
 
     device const half * pm[2];
     FOR_UNROLL (short i = 0; i < 2; ++i) {
@@ -742,7 +758,7 @@ kernel void kernel_flash_attn_ext_nax_gqa(
     for (int ib = ib0; ib < ib1; ++ib) {
         const int ic = ib*BK;
 
-        fa_nax_block<TK, TDh, WN>(qf, of, M, S, pk, sk, pv, sv, pm[0], pm[1],
+        fa_nax_block<KV, TK, TDh, WN>(qf, of, M, S, pk, sk, pv, sv, pm[0], pm[1],
                 FC_flash_attn_ext_nax_has_mask, FC_flash_attn_ext_nax_has_mask, ic, sx_own, sx_row);
     }
 
@@ -787,15 +803,23 @@ kernel void kernel_flash_attn_ext_nax_gqa(
     }
 }
 
-typedef decltype(kernel_flash_attn_ext_nax_gqa<256, 256, 2, 1>) flash_attn_ext_nax_gqa_t;
+typedef decltype(kernel_flash_attn_ext_nax_gqa<half, 256, 256, 2, 1>) flash_attn_ext_nax_gqa_t;
 
-template [[host_name("kernel_flash_attn_ext_nax_gqa_f16_dk64_dv64_wm1")]]   kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<64,  64,  1, 1>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_f16_dk64_dv64_wm2")]]   kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<64,  64,  1, 2>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_f16_dk128_dv128_wm1")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<128, 128, 1, 1>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_f16_dk128_dv128_wm2")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<128, 128, 1, 2>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_f16_dk256_dv256_wm1")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<256, 256, 2, 1>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_f16_dk256_dv256_wm2")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<256, 256, 2, 2>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_f16_dk512_dv512_wm1")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<512, 512, 4, 1>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_f16_dk512_dv512_wm2")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<512, 512, 4, 2>;
+template [[host_name("kernel_flash_attn_ext_nax_gqa_f16_dk64_dv64_wm1")]]    kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<half,   64, 64, 1, 1>;
+template [[host_name("kernel_flash_attn_ext_nax_gqa_bf16_dk64_dv64_wm1")]]   kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<bfloat, 64, 64, 1, 1>;
+template [[host_name("kernel_flash_attn_ext_nax_gqa_f16_dk64_dv64_wm2")]]    kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<half,   64, 64, 1, 2>;
+template [[host_name("kernel_flash_attn_ext_nax_gqa_bf16_dk64_dv64_wm2")]]   kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<bfloat, 64, 64, 1, 2>;
+template [[host_name("kernel_flash_attn_ext_nax_gqa_f16_dk128_dv128_wm1")]]  kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<half,   128, 128, 1, 1>;
+template [[host_name("kernel_flash_attn_ext_nax_gqa_bf16_dk128_dv128_wm1")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<bfloat, 128, 128, 1, 1>;
+template [[host_name("kernel_flash_attn_ext_nax_gqa_f16_dk128_dv128_wm2")]]  kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<half,   128, 128, 1, 2>;
+template [[host_name("kernel_flash_attn_ext_nax_gqa_bf16_dk128_dv128_wm2")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<bfloat, 128, 128, 1, 2>;
+template [[host_name("kernel_flash_attn_ext_nax_gqa_f16_dk256_dv256_wm1")]]  kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<half,   256, 256, 2, 1>;
+template [[host_name("kernel_flash_attn_ext_nax_gqa_bf16_dk256_dv256_wm1")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<bfloat, 256, 256, 2, 1>;
+template [[host_name("kernel_flash_attn_ext_nax_gqa_f16_dk256_dv256_wm2")]]  kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<half,   256, 256, 2, 2>;
+template [[host_name("kernel_flash_attn_ext_nax_gqa_bf16_dk256_dv256_wm2")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<bfloat, 256, 256, 2, 2>;
+template [[host_name("kernel_flash_attn_ext_nax_gqa_f16_dk512_dv512_wm1")]]  kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<half,   512, 512, 4, 1>;
+template [[host_name("kernel_flash_attn_ext_nax_gqa_bf16_dk512_dv512_wm1")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<bfloat, 512, 512, 4, 1>;
+template [[host_name("kernel_flash_attn_ext_nax_gqa_f16_dk512_dv512_wm2")]]  kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<half,   512, 512, 4, 2>;
+template [[host_name("kernel_flash_attn_ext_nax_gqa_bf16_dk512_dv512_wm2")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<bfloat, 512, 512, 4, 2>;
 
 #endif // GGML_METAL_HAS_TENSOR
