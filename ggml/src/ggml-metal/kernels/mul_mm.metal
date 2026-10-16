@@ -87,6 +87,9 @@ template [[host_name("kernel_mul_mm_dq_" #name "_f16")]] kernel mul_mm_dq_t kern
 
 NAX_QTYPES(DQ_F16_INSTANCE)
 DQ_F16_INSTANCE(q5_K, block_q5_K, QK_NL, dequantize_q5_K)
+#if defined(GGML_METAL_HAS_BF16)
+DQ_F16_INSTANCE(bf16, bfloat4x4,  1,     dequantize_bf16)
+#endif
 
 // dst[m][n] = sum_k src1[m][k] * src0[n][k] with f16 or int8 operands loaded straight into registers
 // no threadgroup memory: the BM x BN tile is split across WM x WN simdgroups, each owning a (BM/WM) x (BN/WN) block
