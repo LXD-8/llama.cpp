@@ -3726,8 +3726,8 @@ static bool ggml_metal_op_flash_attn_ext_use_nax(const ggml_tensor * op) {
         return false;
     }
 
-    // f16 K/V only (or converted to f16): the BF16 cache takes the tensor kernel
-    if (op->src[1]->type == GGML_TYPE_BF16) {
+    // a BF16 cache is converted to f16 in registers
+    if (op->src[1]->type == GGML_TYPE_BF16 && op->src[2]->type != GGML_TYPE_BF16) {
         return false;
     }
 
@@ -3751,7 +3751,7 @@ static int ggml_metal_op_flash_attn_ext_gqa_wm(const ggml_tensor * op, bool has_
     const int64_t ne02 = op->src[0]->ne[2];
     const int64_t ne12 = op->src[1]->ne[2];
 
-    if (op->src[1]->type != GGML_TYPE_F16 || op->src[2]->type != GGML_TYPE_F16 ||
+    if ((op->src[1]->type != GGML_TYPE_F16 && op->src[1]->type != GGML_TYPE_BF16) || op->src[2]->type != op->src[1]->type ||
         ne12 == 0 || ne02 % ne12 != 0 || ne02/ne12 < 2 ||
         op->src[3] == nullptr || op->src[3]->ne[1] < ne01) {
         return 0;
