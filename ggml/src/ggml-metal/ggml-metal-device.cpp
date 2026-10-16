@@ -1931,11 +1931,14 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_n
     const int32_t dk = (int32_t) op->src[1]->ne[0];
     const int32_t dv = (int32_t) op->src[2]->ne[0];
 
+    // the K/V element type as stored (a quantized cache has been converted to f16 beforehand)
+    const char * kv = op->src[1]->type == GGML_TYPE_BF16 ? "bf16" : "f16";
+
     // wm > 0: the GQA variant with wm tiles of 16 query rows
     if (wm > 0) {
-        snprintf(base, 256, "kernel_flash_attn_ext_nax_gqa_f16_dk%d_dv%d_wm%d", dk, dv, wm);
+        snprintf(base, 256, "kernel_flash_attn_ext_nax_gqa_%s_dk%d_dv%d_wm%d", kv, dk, dv, wm);
     } else {
-        snprintf(base, 256, "kernel_flash_attn_ext_nax_f16_dk%d_dv%d", dk, dv);
+        snprintf(base, 256, "kernel_flash_attn_ext_nax_%s_dk%d_dv%d", kv, dk, dv);
     }
     snprintf(name, 256, "%s_mask=%d_sinks=%d", base, has_mask, has_sinks);
 
