@@ -89,6 +89,9 @@ template [[host_name("kernel_mul_mm_dq_" #name "_f16")]] kernel mul_mm_dq_t kern
 
 NAX_QTYPES(DQ_F16_INSTANCE)
 DQ_F16_INSTANCE(q5_K, block_q5_K, QK_NL, dequantize_q5_K)
+#if defined(GGML_METAL_HAS_BF16)
+DQ_F16_INSTANCE(bf16, bfloat4x4,  1,     dequantize_bf16)
+#endif
 
 // dst[m][n] = sum_k src1[m][k] * src0[n][k] with f16 or int8 operands loaded straight into registers, no threadgroup memory
 // int8: each OP_MUL_MM_I8_G group of K is accumulated in int32, then folded into the f32 accumulators with the scales s1 and s0
