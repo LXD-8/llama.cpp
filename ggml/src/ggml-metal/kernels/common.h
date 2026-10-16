@@ -98,6 +98,16 @@ static inline int best_index_int8(int n, constant float * val, float x) {
     return x - val[mu-1] < val[mu] - x ? mu-1 : mu;
 }
 
+// NVFP4 sub-block scale: unsigned E4M3 (bias 7, no infinities, 0x7F is NaN and decodes to 0 as on the CPU)
+static inline float ue4m3_to_fp32(uint8_t x) {
+    const uint e = (x >> 3) & 0xF;
+    const uint m = x & 0x7;
+
+    const float v = e == 0 ? (float) m * 0x1p-9f : as_type<float>(((e + 120) << 23) | (m << 20));
+
+    return x == 0x7F ? 0.0f : v;
+}
+
 static inline float e8m0_to_fp32(uint8_t x) {
     uint32_t bits;
 
