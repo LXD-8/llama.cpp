@@ -3769,7 +3769,24 @@ static int ggml_metal_op_flash_attn_ext_gqa_wm(const ggml_tensor * op, bool has_
     const int64_t ne02 = op->src[0]->ne[2];
     const int64_t ne12 = op->src[1]->ne[2];
 
-    if ((op->src[1]->type != GGML_TYPE_F16 && op->src[1]->type != GGML_TYPE_BF16) || op->src[2]->type != op->src[1]->type ||
+    // a quantized cache (32-value blocks) is dequantized in registers
+    bool kv_q = false;
+    switch (op->src[1]->type) {
+        case GGML_TYPE_F16:
+        case GGML_TYPE_BF16:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_IQ4_NL:
+            kv_q = true;
+            break;
+        default:
+            return 0;
+    }
+
+    if (op->src[2]->type != op->src[1]->type ||
         ne12 == 0 || ne02 % ne12 != 0 || ne02/ne12 < 2 ||
         op->src[3] == nullptr || op->src[3]->ne[1] < ne01) {
         return 0;
@@ -3777,8 +3794,8 @@ static int ggml_metal_op_flash_attn_ext_gqa_wm(const ggml_tensor * op, bool has_
 
     const int64_t rows = ne01*(ne02/ne12);
 
-    // up to 4 used rows (one token, 4 query heads per KV head) lose to the vec kernel below 16k of KV
-    if (rows <= 4 && op->src[1]->ne[1] < 16384) {
+    // up to 4 used rows (one token, 4 query heads per KV head) lose to the vec kernel, on an F16 cache only below 16k of KV
+    if (rows <= 4 && (kv_q || op->src[1]->ne[1] < 16384)) {
         return 0;
     }
 
