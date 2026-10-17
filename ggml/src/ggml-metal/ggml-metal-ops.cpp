@@ -3806,8 +3806,9 @@ static int ggml_metal_op_flash_attn_ext_gqa_wm(const ggml_tensor * op, bool has_
         return 0;
     }
 
-    static const bool wm4_disabled = getenv("GGML_METAL_FA_GQA_WM4_DISABLE") != nullptr; // scratch A/B
-    return rows <= 16 ? 1 : rows <= 32 ? 2 : (rows <= 64 && !wm4_disabled) ? 4 : 0;
+    static const int max_wm = getenv("GGML_METAL_FA_GQA_MAX_WM") ? atoi(getenv("GGML_METAL_FA_GQA_MAX_WM")) : 8; // scratch A/B
+    const int wm = rows <= 16 ? 1 : rows <= 32 ? 2 : rows <= 64 ? 4 : (rows <= 128 && op->src[1]->ne[0] <= 256) ? 8 : 0;
+    return wm <= max_wm ? wm : 0;
 }
 
 // returns the n_kv_max hint if the sparse path is available for this op, or 0 otherwise

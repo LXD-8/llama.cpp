@@ -948,7 +948,10 @@ kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<T, dk, dk, wn, wm>
     FA_NAX_GQA_DK(name, T, 64,  1) \
     FA_NAX_GQA_DK(name, T, 128, 1) \
     FA_NAX_GQA_DK(name, T, 256, 2) \
-    FA_NAX_GQA_DK(name, T, 512, 4)
+    FA_NAX_GQA_DK(name, T, 512, 4) \
+    FA_NAX_GQA_WM(name, T, 64,  1, 8) \
+    FA_NAX_GQA_WM(name, T, 128, 1, 8) \
+    FA_NAX_GQA_WM(name, T, 256, 2, 8)
 
 FA_NAX_GQA(f16,  half)
 FA_NAX_GQA(bf16, bfloat)
