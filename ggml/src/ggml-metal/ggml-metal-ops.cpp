@@ -2917,7 +2917,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         GGML_TENSOR_LOCALS(uint64_t, nb1, op->src[1], nb);
         GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
 
-        static const int WM[4] = {2, 2, 4, 2}, WN[4] = {2, 2, 2, 4}, TM[4] = {2, 4, 2, 4}, TP[4] = {2, 1, 2, 1};
+        static const int WM[7] = {2, 2, 4, 2, 2, 2, 2}, WN[7] = {2, 2, 2, 4, 2, 2, 2}, TM[7] = {2, 4, 2, 4, 2, 2, 2}, TP[7] = {2, 1, 2, 1, 4, 2, 4};
         const int bm = WM[cfg]*TM[cfg]*16, bn = WN[cfg]*TP[cfg]*32;
 
         char name[64];
@@ -3571,7 +3571,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
         }
 
         if (naxq >= 0) {
-            static const int WM[3] = {2, 4, 2}, WN[3] = {2, 1, 4}, TP[3] = {2, 2, 1};
+            static const int WM[5] = {2, 4, 2, 2, 2}, WN[5] = {2, 1, 4, 2, 2}, TP[5] = {2, 2, 1, 4, 2};
             const int bn = WN[naxq]*TP[naxq]*32;
 
             char name[64];

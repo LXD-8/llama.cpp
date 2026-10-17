@@ -1717,7 +1717,7 @@ MV_NAX_INSTANCE(q5_K,    block_q5_K,    QK_NL, dequantize_q5_K_nax)
 
 // SCRATCH prototype: tiled NAX mat-mat, weights dequantized straight into fragments (no f16 copy of the weights).
 // threadgroup tile: WM*TM*16 src1 rows x WN*TP*32 weight rows; K permuted inside 64-weight chunks as in kernel_mul_mv_nax_f32
-template<typename block_q, short nl, void (*deq)(device const block_q *, short, thread half4x4 &), short WM, short WN, short TM, short TP>
+template<typename block_q, short nl, void (*deq)(device const block_q *, short, thread half4x4 &), short WM, short WN, short TM, short TP, bool AH = false>
 kernel void kernel_mul_mm_naxq_f32(
         constant ggml_metal_kargs_mul_mv_ext & args,
         device const char * src0,
@@ -1787,9 +1787,16 @@ kernel void kernel_mul_mm_naxq_f32(
         FOR_UNROLL (short m = 0; m < TM; ++m) {
             FOR_UNROLL (short s = 0; s < 4; ++s) {
                 FOR_UNROLL (short i = 0; i < 2; ++i) {
-                    const float4 v = *((device const float4 *) (y[m][i] + p + 4*s));
-                    FOR_UNROLL (short jj = 0; jj < 4; ++jj) {
-                        a[m][s][4*i + jj] = (half) v[jj];
+                    if (AH) {
+                        const half4 v = *((device const half4 *) ((device const half *) y[m][i] + p + 4*s));
+                        FOR_UNROLL (short jj = 0; jj < 4; ++jj) {
+                            a[m][s][4*i + jj] = v[jj];
+                        }
+                    } else {
+                        const float4 v = *((device const float4 *) (y[m][i] + p + 4*s));
+                        FOR_UNROLL (short jj = 0; jj < 4; ++jj) {
+                            a[m][s][4*i + jj] = (half) v[jj];
+                        }
                     }
                 }
             }
@@ -1853,7 +1860,10 @@ typedef decltype(kernel_mul_mm_naxq_f32<block_q4_K, QK_NL, dequantize_q4_K, 2, 2
 template [[host_name("kernel_mul_mm_naxq_" #name "_f32_c0")]] kernel mul_mm_naxq_t kernel_mul_mm_naxq_f32<block_q, nl, deq, 2, 2, 2, 2>; \
 template [[host_name("kernel_mul_mm_naxq_" #name "_f32_c1")]] kernel mul_mm_naxq_t kernel_mul_mm_naxq_f32<block_q, nl, deq, 2, 2, 4, 1>; \
 template [[host_name("kernel_mul_mm_naxq_" #name "_f32_c2")]] kernel mul_mm_naxq_t kernel_mul_mm_naxq_f32<block_q, nl, deq, 4, 2, 2, 2>; \
-template [[host_name("kernel_mul_mm_naxq_" #name "_f32_c3")]] kernel mul_mm_naxq_t kernel_mul_mm_naxq_f32<block_q, nl, deq, 2, 4, 4, 1>;
+template [[host_name("kernel_mul_mm_naxq_" #name "_f32_c3")]] kernel mul_mm_naxq_t kernel_mul_mm_naxq_f32<block_q, nl, deq, 2, 4, 4, 1>; \
+template [[host_name("kernel_mul_mm_naxq_" #name "_f32_c4")]] kernel mul_mm_naxq_t kernel_mul_mm_naxq_f32<block_q, nl, deq, 2, 2, 2, 4>; \
+template [[host_name("kernel_mul_mm_naxq_" #name "_f32_c5")]] kernel mul_mm_naxq_t kernel_mul_mm_naxq_f32<block_q, nl, deq, 2, 2, 2, 2, true>; \
+template [[host_name("kernel_mul_mm_naxq_" #name "_f32_c6")]] kernel mul_mm_naxq_t kernel_mul_mm_naxq_f32<block_q, nl, deq, 2, 2, 2, 4, true>;
 
 MM_NAXQ_INSTANCE(f16,    half4x4,       1,     dequantize_f16)
 MM_NAXQ_INSTANCE(q4_0,   block_q4_0,    2,     dequantize_q4_0)
@@ -1866,7 +1876,7 @@ MM_NAXQ_INSTANCE(q5_K,   block_q5_K,    QK_NL, dequantize_q5_K_nax)
 
 // SCRATCH prototype: MoE version - one threadgroup per entry tile of kernel_mul_mm_id_map0 (wide: up to 64 entries) and
 // WN*TP*32 weight rows of its expert; the entries are the src1 rows (gathered through hids), dst rows are scattered
-template<typename block_q, short nl, void (*deq)(device const block_q *, short, thread half4x4 &), short WM, short WN, short TM, short TP>
+template<typename block_q, short nl, void (*deq)(device const block_q *, short, thread half4x4 &), short WM, short WN, short TM, short TP, bool AH = false>
 kernel void kernel_mul_mm_id_naxq_f32(
         constant ggml_metal_kargs_mul_mm_id & args,
         device const char * src0,
@@ -1953,9 +1963,16 @@ kernel void kernel_mul_mm_id_naxq_f32(
         FOR_UNROLL (short m = 0; m < TM; ++m) {
             FOR_UNROLL (short s = 0; s < 4; ++s) {
                 FOR_UNROLL (short i = 0; i < 2; ++i) {
-                    const float4 v = *((device const float4 *) (y[m][i] + p + 4*s))*s1_inv;
-                    FOR_UNROLL (short jj = 0; jj < 4; ++jj) {
-                        a[m][s][4*i + jj] = (half) v[jj];
+                    if (AH) {
+                        const half4 v = *((device const half4 *) ((device const half *) y[m][i] + p + 4*s));
+                        FOR_UNROLL (short jj = 0; jj < 4; ++jj) {
+                            a[m][s][4*i + jj] = v[jj];
+                        }
+                    } else {
+                        const float4 v = *((device const float4 *) (y[m][i] + p + 4*s))*s1_inv;
+                        FOR_UNROLL (short jj = 0; jj < 4; ++jj) {
+                            a[m][s][4*i + jj] = (half) v[jj];
+                        }
                     }
                 }
             }
@@ -2019,7 +2036,9 @@ typedef decltype(kernel_mul_mm_id_naxq_f32<block_q4_K, QK_NL, dequantize_q4_K, 2
 #define MM_ID_NAXQ_INSTANCE(name, block_q, nl, deq) \
 template [[host_name("kernel_mul_mm_id_naxq_" #name "_f32_c0")]] kernel mul_mm_id_naxq_t kernel_mul_mm_id_naxq_f32<block_q, nl, deq, 2, 2, 2, 2>; \
 template [[host_name("kernel_mul_mm_id_naxq_" #name "_f32_c1")]] kernel mul_mm_id_naxq_t kernel_mul_mm_id_naxq_f32<block_q, nl, deq, 4, 1, 1, 2>; \
-template [[host_name("kernel_mul_mm_id_naxq_" #name "_f32_c2")]] kernel mul_mm_id_naxq_t kernel_mul_mm_id_naxq_f32<block_q, nl, deq, 2, 4, 2, 1>;
+template [[host_name("kernel_mul_mm_id_naxq_" #name "_f32_c2")]] kernel mul_mm_id_naxq_t kernel_mul_mm_id_naxq_f32<block_q, nl, deq, 2, 4, 2, 1>; \
+template [[host_name("kernel_mul_mm_id_naxq_" #name "_f32_c3")]] kernel mul_mm_id_naxq_t kernel_mul_mm_id_naxq_f32<block_q, nl, deq, 2, 2, 2, 4>; \
+template [[host_name("kernel_mul_mm_id_naxq_" #name "_f32_c4")]] kernel mul_mm_id_naxq_t kernel_mul_mm_id_naxq_f32<block_q, nl, deq, 2, 2, 2, 2, true>;
 
 MM_ID_NAXQ_INSTANCE(f16,    half4x4,       1,     dequantize_f16)
 MM_ID_NAXQ_INSTANCE(q4_0,   block_q4_0,    2,     dequantize_q4_0)
