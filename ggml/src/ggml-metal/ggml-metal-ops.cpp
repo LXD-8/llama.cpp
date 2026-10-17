@@ -3807,7 +3807,8 @@ static int ggml_metal_op_flash_attn_ext_gqa_wm(const ggml_tensor * op, bool has_
     }
 
     static const int max_rows = getenv("GGML_METAL_FA_GQA_MAX_ROWS") ? atoi(getenv("GGML_METAL_FA_GQA_MAX_ROWS")) : 128; // scratch sweep
-    if (rows > max_rows) {
+    // the partial results go to the temp buffer of the vec kernels, sized for up to 32 queries per head
+    if (rows > max_rows || ne01 > 32) {
         return 0;
     }
     const int wm_max = op->src[1]->ne[0] <= 256 ? 8 : 4;
