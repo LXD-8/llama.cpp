@@ -3415,6 +3415,29 @@ static bool ggml_metal_op_mul_mat_id_wide(const ggml_tensor * op) {
     return !disabled && ne20*ne21 >= 128*ne02;
 }
 
+
+// SCRATCH: route the MUL_MAT_ID mat-mat through kernel_mul_mm_id_naxq_*: GGML_METAL_MM_ID_NAXQ="min_tokens,max_tokens,cfg"
+static int ggml_metal_op_mul_mat_id_naxq_cfg(const ggml_tensor * op, bool has_tensor) {
+    static int lo = -1, hi = -1, cfg = 0;
+    if (lo < 0) {
+        const char * e = getenv("GGML_METAL_MM_ID_NAXQ");
+        lo = 0; hi = -1;
+        if (e) { sscanf(e, "%d,%d,%d", &lo, &hi, &cfg); }
+    }
+    const int64_t nt = op->src[2]->ne[1];
+    if (!has_tensor || op->src[1]->type != GGML_TYPE_F32 || nt < lo || nt > hi || op->src[0]->ne[0] % 64 != 0 ||
+        op->src[1]->nb[0] != sizeof(float)) {
+        return -1;
+    }
+    switch (op->src[0]->type) {
+        case GGML_TYPE_F16: case GGML_TYPE_Q4_0: case GGML_TYPE_Q8_0: case GGML_TYPE_Q4_K: case GGML_TYPE_Q6_K:
+        case GGML_TYPE_MXFP4: case GGML_TYPE_IQ4_XS: case GGML_TYPE_Q5_K:
+            return cfg;
+        default:
+            return -1;
+    }
+}
+
 int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -3472,7 +3495,9 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
         // src1 prec [TAG_GGML_PREC]
         const bool use_amax = ggml_get_op_params_i32(op, 3) == GGML_PREC_F32;
 
-        const bool wide = props_dev->has_tensor && ggml_metal_op_mul_mat_id_wide(op);
+        const int naxq = ggml_metal_op_mul_mat_id_naxq_cfg(op, props_dev->has_tensor);
+
+        const bool wide = props_dev->has_tensor && (naxq >= 0 || ggml_metal_op_mul_mat_id_wide(op));
 
         // src1 rescale factors, computed before the matmul
         // ref: https://github.com/ggml-org/llama.cpp/pull/26223
@@ -3545,7 +3570,31 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
             ggml_metal_op_concurrency_reset(ctx);
         }
 
-        {
+        if (naxq >= 0) {
+            static const int WM[3] = {2, 4, 2}, WN[3] = {2, 1, 4}, TP[3] = {2, 2, 1};
+            const int bn = WN[naxq]*TP[naxq]*32;
+
+            char name[64];
+            snprintf(name, sizeof(name), "kernel_mul_mm_id_naxq_%s_f32_c%d", ggml_type_name(op->src[0]->type), naxq);
+            auto pipeline = ggml_metal_library_get_pipeline_by_name(lib, name);
+
+            ggml_metal_kargs_mul_mm_id args = {
+                ne00, ne02, nb01, nb02, nb03, ne11, nb10, nb11, nb12, nb13, ne20, ne0, ne1, (int16_t) r2, (int16_t) r3,
+            };
+            int32_t ua = use_amax ? 1 : 0;
+
+            ggml_metal_encoder_set_pipeline(enc, pipeline);
+            ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+            ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
+            ggml_metal_encoder_set_buffer  (enc, bid_src1, 2);
+            ggml_metal_encoder_set_buffer  (enc, bid_tpe,  3);
+            ggml_metal_encoder_set_buffer  (enc, bid_ids,  4);
+            ggml_metal_encoder_set_buffer  (enc, bid_dst,  5);
+            ggml_metal_encoder_set_buffer  (enc, bid_amax, 6);
+            ggml_metal_encoder_set_bytes   (enc, &ua, sizeof(ua), 7);
+
+            ggml_metal_encoder_dispatch_threadgroups(enc, (int) ggml_metal_op_mul_mat_id_max_tiles(op), (ne01 + bn - 1)/bn, 1, 32, WM[naxq]*WN[naxq], 1);
+        } else {
             auto pipeline = ggml_metal_library_get_pipeline_mul_mm_id(lib, op, wide);
 
             ggml_metal_kargs_mul_mm_id args = {
