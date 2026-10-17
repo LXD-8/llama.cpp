@@ -12046,6 +12046,61 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 #endif
 
 // Test cases for performance evaluation: should be representative of real-world use cases
+
+// roofline grid (scratch, not for upstream): ROOFLINE=1 test-backend-ops perf ...
+static std::vector<std::unique_ptr<test_case>> make_test_cases_roofline() {
+    std::vector<std::unique_ptr<test_case>> test_cases;
+    const ggml_type types[] = {
+        GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
+        GGML_TYPE_Q8_0, GGML_TYPE_MXFP4, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
+        GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ1_S,
+        GGML_TYPE_IQ1_M, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_TQ2_0, GGML_TYPE_Q1_0, GGML_TYPE_Q2_0,
+        GGML_TYPE_NVFP4, GGML_TYPE_TQ1_0,
+    };
+    const char * only = getenv("ROOFLINE_OP");
+    auto want = [&](const char * op) { return !only || strcmp(only, op) == 0; };
+    if (want("MUL_MAT")) {
+        for (ggml_type t : types) {
+            // ROOFLINE_N="n1,n2,..." and ROOFLINE_MK="m,k" override the grid (scratch sweeps)
+            std::vector<int64_t> ns = {1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 256, 512, 1024, 2048};
+            if (const char * e = getenv("ROOFLINE_N")) { ns.clear(); for (const char * q = e; *q; ) { ns.push_back(strtoll(q, (char **) &q, 10)); if (*q == ',') ++q; } }
+            int64_t mm_m = 28672, mm_k = 8192;
+            if (const char * e = getenv("ROOFLINE_MK")) { sscanf(e, "%lld,%lld", (long long *) &mm_m, (long long *) &mm_k); }
+            for (int64_t n : ns) {
+                // 28672 x 8192: >= 120 MB for every format, larger than the SLC
+                test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, mm_m, n, mm_k, {1, 1}, {1, 1}));
+            }
+        }
+    }
+    if (want("MUL_MAT_ID")) {
+        for (ggml_type t : types) {
+            for (int64_t n : {1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048}) {
+                test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 32, 4, false, 2880, n, 2880));
+                test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 128, 8, false, 704, n, 2816));
+            }
+        }
+    }
+    if (want("FLASH_ATTN_EXT")) {
+        struct fa_shape { int64_t hsk, hsv, nh, gqa; bool v_view; };
+        const fa_shape shapes[] = { {64, 64, 8, 8, false}, {128, 128, 8, 4, false}, {256, 256, 4, 6, false}, {512, 512, 2, 8, false},
+                                    {192, 128, 32, 1, false}, {576, 512, 1, 16, true} };
+        for (const auto & sh : shapes) {
+            for (ggml_type kvt : {GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
+                if (sh.hsk != sh.hsv && kvt != GGML_TYPE_F16 && kvt != GGML_TYPE_BF16) {
+                    continue;
+                }
+                for (int64_t kv : {32768, 131072}) {
+                    for (int64_t nb : {1, 2, 4, 8, 16, 32, 64, 128, 512, 2048}) {
+                        test_cases.emplace_back(new test_flash_attn_ext(sh.hsk, sh.hsv, sh.nh, {sh.gqa, 1}, kv, nb, true, false, 0, 0,
+                            GGML_PREC_F32, kvt, kvt, {0, 1, 2, 3}, true, sh.v_view));
+                    }
+                }
+            }
+        }
+    }
+    return test_cases;
+}
+
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
@@ -12738,7 +12793,7 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
             test_cases = make_test_cases_eval();
             break;
         case MODE_PERF:
-            test_cases = make_test_cases_perf();
+            test_cases = getenv("ROOFLINE") ? make_test_cases_roofline() : make_test_cases_perf();
             break;
         }
     } else {
