@@ -3263,7 +3263,9 @@ static bool ggml_metal_op_mul_mat_f16_act_rows(const ggml_tensor * op) {
 
     const double flop = 2.0*op->src[0]->ne[0]*op->src[0]->ne[1]*ggml_nrows(op->src[1]);
 
-    return disabled || (op->src[1]->ne[1] >= 128 && flop >= 4e9) || ggml_metal_op_mul_mat_nax_shape(op);
+    static int min_rows = -1; static double min_flop = 4e9; // scratch sweep: GGML_METAL_MM_F16_ACT_MIN="rows,mflop"
+    if (min_rows < 0) { min_rows = 128; if (const char * e = getenv("GGML_METAL_MM_F16_ACT_MIN")) { int r = 128, mf = 4000; sscanf(e, "%d,%d", &r, &mf); min_rows = r; min_flop = mf*1e6; } }
+    return disabled || (op->src[1]->ne[1] >= min_rows && flop >= min_flop) || ggml_metal_op_mul_mat_nax_shape(op);
 }
 
 static bool ggml_metal_op_mul_mat_use_f16_act(const ggml_tensor * op, bool has_tensor) {
@@ -3412,7 +3414,8 @@ static bool ggml_metal_op_mul_mat_id_wide(const ggml_tensor * op) {
     const int64_t ne20 = op->src[2]->ne[0]; // n_expert_used
     const int64_t ne21 = op->src[2]->ne[1]; // n_token
 
-    return !disabled && ne20*ne21 >= 128*ne02;
+    static const int wide_min = getenv("GGML_METAL_MM_ID_WIDE_MIN") ? atoi(getenv("GGML_METAL_MM_ID_WIDE_MIN")) : 128; // scratch sweep
+    return !disabled && ne20*ne21 >= wide_min*ne02;
 }
 
 
@@ -3907,7 +3910,8 @@ static int ggml_metal_op_flash_attn_ext_gqa_wm(const ggml_tensor * op, bool has_
     // a tile with only up to 4 used rows (single-token decode with 4 query heads per KV head) loses to the vec kernel:
     // on an F16 cache until the KV range is long (Llama-3.1-8B: -1-2% below 16k, +2-5% from 16k), on a BF16 or
     // quantized cache at any length (BF16: -14% at 32k; q8_0: -8% at 8k, -18% at 32k)
-    if (rows <= 4 && (op->src[1]->type != GGML_TYPE_F16 || op->src[1]->ne[1] < 16384)) {
+    static const int r4_kv = getenv("GGML_METAL_FA_GQA_R4_KV") ? atoi(getenv("GGML_METAL_FA_GQA_R4_KV")) : 16384; // scratch sweep
+    if (rows <= 4 && (op->src[1]->type != GGML_TYPE_F16 || op->src[1]->ne[1] < r4_kv)) {
         return 0;
     }
 

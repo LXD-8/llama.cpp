@@ -50,7 +50,8 @@ bool ggml_metal_op_mul_mat_id_use_mm(const struct ggml_tensor * op, bool has_sim
     const int64_t ne02 = op->src[0]->ne[2];
     const int64_t ne21 = op->src[2]->ne[1];
 
-    return has_simdgroup_mm && ne00 >= 64 && ne02 <= 1024 && ne21 >= (has_tensor && !min16_off ? 16 : 32);
+    static const int min_tok = getenv("GGML_METAL_MM_ID_MIN_TOK") ? atoi(getenv("GGML_METAL_MM_ID_MIN_TOK")) : 16; // scratch sweep
+    return has_simdgroup_mm && ne00 >= 64 && ne02 <= 1024 && ne21 >= (has_tensor && !min16_off ? min_tok : 32);
 }
 
 // the most src1 rows of the few-row MMA kernels
@@ -216,6 +217,10 @@ static int64_t ggml_metal_mul_mv_nax_rows_max(enum ggml_type type) {
 // weights): from 17 rows the mat-mat kernels for every type, from 9 rows the few-row MMA kernels for every quantized
 // type, and below that only for the types whose dequantization costs the MMA kernels the most
 static bool ggml_metal_mul_mv_nax_rows_ok(enum ggml_type type, int64_t ne11) {
+    static const bool force = getenv("GGML_METAL_MV_NAX_FORCE") != nullptr; // scratch sweep: every format, 2..64 rows
+    if (force) {
+        return ne11 >= 2 && ne11 <= 64;
+    }
     if (ne11 < 2 || ne11 > ggml_metal_mul_mv_nax_rows_max(type)) {
         return false;
     }

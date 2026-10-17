@@ -12074,7 +12074,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_roofline() {
     }
     if (want("MUL_MAT_ID")) {
         for (ggml_type t : types) {
-            for (int64_t n : {1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048}) {
+            std::vector<int64_t> nsi = {1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048};
+            if (const char * e = getenv("ROOFLINE_N")) { nsi.clear(); for (const char * q = e; *q; ) { nsi.push_back(strtoll(q, (char **) &q, 10)); if (*q == ',') ++q; } }
+            for (int64_t n : nsi) {
                 test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 32, 4, false, 2880, n, 2880));
                 test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 128, 8, false, 704, n, 2816));
             }
@@ -12089,8 +12091,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_roofline() {
                 if (sh.hsk != sh.hsv && kvt != GGML_TYPE_F16 && kvt != GGML_TYPE_BF16) {
                     continue;
                 }
-                for (int64_t kv : {32768, 131072}) {
-                    for (int64_t nb : {1, 2, 4, 8, 16, 32, 64, 128, 512, 2048}) {
+                std::vector<int64_t> kvs = {32768, 131072}, nbs = {1, 2, 4, 8, 16, 32, 64, 128, 512, 2048};
+                auto parse = [](const char * e, std::vector<int64_t> & v) { if (!e) return; v.clear(); for (const char * q = e; *q; ) { v.push_back(strtoll(q, (char **) &q, 10)); if (*q == ',') ++q; } };
+                parse(getenv("ROOFLINE_KV"), kvs); parse(getenv("ROOFLINE_NB"), nbs);
+                for (int64_t kv : kvs) {
+                    for (int64_t nb : nbs) {
                         test_cases.emplace_back(new test_flash_attn_ext(sh.hsk, sh.hsv, sh.nh, {sh.gqa, 1}, kv, nb, true, false, 0, 0,
                             GGML_PREC_F32, kvt, kvt, {0, 1, 2, 3}, true, sh.v_view));
                     }
