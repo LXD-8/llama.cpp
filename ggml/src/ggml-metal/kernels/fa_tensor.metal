@@ -935,71 +935,29 @@ kernel void kernel_flash_attn_ext_nax_gqa(
 
 typedef decltype(kernel_flash_attn_ext_nax_gqa<half, 256, 256, 2, 1>) flash_attn_ext_nax_gqa_t;
 
-template [[host_name("kernel_flash_attn_ext_nax_gqa_f16_dk64_dv64_wm1")]]   kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<half, 64,  64,  1, 1>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_bf16_dk64_dv64_wm1")]]   kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<bfloat, 64,  64,  1, 1>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_f16_dk64_dv64_wm2")]]   kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<half, 64,  64,  1, 2>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_bf16_dk64_dv64_wm2")]]   kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<bfloat, 64,  64,  1, 2>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_f16_dk128_dv128_wm1")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<half, 128, 128, 1, 1>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_bf16_dk128_dv128_wm1")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<bfloat, 128, 128, 1, 1>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_f16_dk128_dv128_wm2")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<half, 128, 128, 1, 2>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_bf16_dk128_dv128_wm2")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<bfloat, 128, 128, 1, 2>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_f16_dk256_dv256_wm1")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<half, 256, 256, 2, 1>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_bf16_dk256_dv256_wm1")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<bfloat, 256, 256, 2, 1>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_f16_dk256_dv256_wm2")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<half, 256, 256, 2, 2>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_bf16_dk256_dv256_wm2")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<bfloat, 256, 256, 2, 2>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_f16_dk512_dv512_wm1")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<half, 512, 512, 4, 1>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_bf16_dk512_dv512_wm1")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<bfloat, 512, 512, 4, 1>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_f16_dk512_dv512_wm2")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<half, 512, 512, 4, 2>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_bf16_dk512_dv512_wm2")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<bfloat, 512, 512, 4, 2>;
+#define FA_NAX_GQA_WM(name, T, dk, wn, wm) \
+template [[host_name("kernel_flash_attn_ext_nax_gqa_" #name "_dk" #dk "_dv" #dk "_wm" #wm)]] \
+kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<T, dk, dk, wn, wm>;
 
+#define FA_NAX_GQA_DK(name, T, dk, wn) \
+    FA_NAX_GQA_WM(name, T, dk, wn, 1) \
+    FA_NAX_GQA_WM(name, T, dk, wn, 2) \
+    FA_NAX_GQA_WM(name, T, dk, wn, 4)
+
+#define FA_NAX_GQA(name, T) \
+    FA_NAX_GQA_DK(name, T, 64,  1) \
+    FA_NAX_GQA_DK(name, T, 128, 1) \
+    FA_NAX_GQA_DK(name, T, 256, 2) \
+    FA_NAX_GQA_DK(name, T, 512, 4)
+
+FA_NAX_GQA(f16,  half)
+FA_NAX_GQA(bf16, bfloat)
 
 // quantized caches (decode and small batches; larger batches convert the cache to f16 first)
-template [[host_name("kernel_flash_attn_ext_nax_gqa_q4_0_dk64_dv64_wm1")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<block_q4_0, 64, 64, 1, 1>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_q4_0_dk64_dv64_wm2")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<block_q4_0, 64, 64, 1, 2>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_q4_0_dk128_dv128_wm1")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<block_q4_0, 128, 128, 1, 1>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_q4_0_dk128_dv128_wm2")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<block_q4_0, 128, 128, 1, 2>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_q4_0_dk256_dv256_wm1")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<block_q4_0, 256, 256, 2, 1>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_q4_0_dk256_dv256_wm2")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<block_q4_0, 256, 256, 2, 2>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_q4_0_dk512_dv512_wm1")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<block_q4_0, 512, 512, 4, 1>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_q4_0_dk512_dv512_wm2")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<block_q4_0, 512, 512, 4, 2>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_q4_1_dk64_dv64_wm1")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<block_q4_1, 64, 64, 1, 1>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_q4_1_dk64_dv64_wm2")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<block_q4_1, 64, 64, 1, 2>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_q4_1_dk128_dv128_wm1")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<block_q4_1, 128, 128, 1, 1>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_q4_1_dk128_dv128_wm2")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<block_q4_1, 128, 128, 1, 2>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_q4_1_dk256_dv256_wm1")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<block_q4_1, 256, 256, 2, 1>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_q4_1_dk256_dv256_wm2")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<block_q4_1, 256, 256, 2, 2>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_q4_1_dk512_dv512_wm1")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<block_q4_1, 512, 512, 4, 1>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_q4_1_dk512_dv512_wm2")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<block_q4_1, 512, 512, 4, 2>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_q5_0_dk64_dv64_wm1")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<block_q5_0, 64, 64, 1, 1>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_q5_0_dk64_dv64_wm2")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<block_q5_0, 64, 64, 1, 2>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_q5_0_dk128_dv128_wm1")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<block_q5_0, 128, 128, 1, 1>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_q5_0_dk128_dv128_wm2")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<block_q5_0, 128, 128, 1, 2>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_q5_0_dk256_dv256_wm1")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<block_q5_0, 256, 256, 2, 1>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_q5_0_dk256_dv256_wm2")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<block_q5_0, 256, 256, 2, 2>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_q5_0_dk512_dv512_wm1")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<block_q5_0, 512, 512, 4, 1>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_q5_0_dk512_dv512_wm2")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<block_q5_0, 512, 512, 4, 2>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_q5_1_dk64_dv64_wm1")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<block_q5_1, 64, 64, 1, 1>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_q5_1_dk64_dv64_wm2")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<block_q5_1, 64, 64, 1, 2>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_q5_1_dk128_dv128_wm1")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<block_q5_1, 128, 128, 1, 1>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_q5_1_dk128_dv128_wm2")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<block_q5_1, 128, 128, 1, 2>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_q5_1_dk256_dv256_wm1")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<block_q5_1, 256, 256, 2, 1>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_q5_1_dk256_dv256_wm2")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<block_q5_1, 256, 256, 2, 2>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_q5_1_dk512_dv512_wm1")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<block_q5_1, 512, 512, 4, 1>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_q5_1_dk512_dv512_wm2")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<block_q5_1, 512, 512, 4, 2>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_q8_0_dk64_dv64_wm1")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<block_q8_0, 64, 64, 1, 1>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_q8_0_dk64_dv64_wm2")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<block_q8_0, 64, 64, 1, 2>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_q8_0_dk128_dv128_wm1")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<block_q8_0, 128, 128, 1, 1>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_q8_0_dk128_dv128_wm2")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<block_q8_0, 128, 128, 1, 2>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_q8_0_dk256_dv256_wm1")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<block_q8_0, 256, 256, 2, 1>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_q8_0_dk256_dv256_wm2")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<block_q8_0, 256, 256, 2, 2>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_q8_0_dk512_dv512_wm1")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<block_q8_0, 512, 512, 4, 1>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_q8_0_dk512_dv512_wm2")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<block_q8_0, 512, 512, 4, 2>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_iq4_nl_dk64_dv64_wm1")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<block_iq4_nl, 64, 64, 1, 1>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_iq4_nl_dk64_dv64_wm2")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<block_iq4_nl, 64, 64, 1, 2>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_iq4_nl_dk128_dv128_wm1")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<block_iq4_nl, 128, 128, 1, 1>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_iq4_nl_dk128_dv128_wm2")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<block_iq4_nl, 128, 128, 1, 2>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_iq4_nl_dk256_dv256_wm1")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<block_iq4_nl, 256, 256, 2, 1>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_iq4_nl_dk256_dv256_wm2")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<block_iq4_nl, 256, 256, 2, 2>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_iq4_nl_dk512_dv512_wm1")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<block_iq4_nl, 512, 512, 4, 1>;
-template [[host_name("kernel_flash_attn_ext_nax_gqa_iq4_nl_dk512_dv512_wm2")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<block_iq4_nl, 512, 512, 4, 2>;
+FA_NAX_GQA(q4_0,   block_q4_0)
+FA_NAX_GQA(q4_1,   block_q4_1)
+FA_NAX_GQA(q5_0,   block_q5_0)
+FA_NAX_GQA(q5_1,   block_q5_1)
+FA_NAX_GQA(q8_0,   block_q8_0)
+FA_NAX_GQA(iq4_nl, block_iq4_nl)
 #endif // GGML_METAL_HAS_TENSOR
