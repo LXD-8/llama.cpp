@@ -668,7 +668,8 @@ kernel void kernel_flash_attn_ext_nax_gqa(
     static_assert(TK % 2 == 0,  "scores are computed in pairs of fragments");
     static_assert(TDh % 2 == 0, "O is accumulated in pairs of fragments");
 
-    const int iwg = tgpig[0];
+    const int iwg = tgpig[0]%NWG;
+    const int irb = tgpig[0]/NWG; // block of WM*16 packed rows
     const int hk  = tgpig[1];
     const int iq3 = tgpig[2];
 
@@ -688,7 +689,7 @@ kernel void kernel_flash_attn_ext_nax_gqa(
     bool rok[2];
 
     FOR_UNROLL (short i = 0; i < 2; ++i) {
-        const int p = row_group*kU + fm + 8*i;
+        const int p = (irb*WM + row_group)*kU + fm + 8*i;
         rok[i] = p < R;
         const int pp = rok[i] ? p : 0;
         ri[i] = pp % args.ne01;

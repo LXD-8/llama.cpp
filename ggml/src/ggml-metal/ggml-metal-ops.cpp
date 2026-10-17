@@ -3806,9 +3806,13 @@ static int ggml_metal_op_flash_attn_ext_gqa_wm(const ggml_tensor * op, bool has_
         return 0;
     }
 
-    static const int max_wm = getenv("GGML_METAL_FA_GQA_MAX_WM") ? atoi(getenv("GGML_METAL_FA_GQA_MAX_WM")) : 8; // scratch A/B
-    const int wm = rows <= 16 ? 1 : rows <= 32 ? 2 : rows <= 64 ? 4 : (rows <= 128 && op->src[1]->ne[0] <= 256) ? 8 : 0;
-    return wm <= max_wm ? wm : 0;
+    static const int max_rows = getenv("GGML_METAL_FA_GQA_MAX_ROWS") ? atoi(getenv("GGML_METAL_FA_GQA_MAX_ROWS")) : 128; // scratch sweep
+    if (rows > max_rows) {
+        return 0;
+    }
+    const int wm_max = op->src[1]->ne[0] <= 256 ? 8 : 4;
+    const int wm = rows <= 16 ? 1 : rows <= 32 ? 2 : rows <= 64 ? 4 : 8;
+    return std::min(wm, wm_max);
 }
 
 // returns the n_kv_max hint if the sparse path is available for this op, or 0 otherwise
@@ -4317,7 +4321,9 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
 
         ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
-        ggml_metal_encoder_dispatch_threadgroups(enc, nwg, ne12, ne03, 32, nsg, 1);
+        const int64_t nrb = (ne01*(ne02/ne12) + 16*gqa_wm - 1)/(16*gqa_wm); // blocks of packed rows
+
+        ggml_metal_encoder_dispatch_threadgroups(enc, nwg*nrb, ne12, ne03, 32, nsg, 1);
 
         ggml_metal_op_concurrency_reset(ctx);
 
