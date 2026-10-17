@@ -4153,7 +4153,9 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     const int n_kv_max_padded = use_sparse ? GGML_PAD(n_kv_max_sparse, OP_FLASH_ATTN_EXT_VEC_NCPSG) : 0;
 
     // the vec kernels dequantize the KV inline; no need for the F16 dequant pass in the sparse path
-    const bool use_kv_f16 = !use_sparse && ggml_metal_op_flash_attn_ext_use_kv_f16(op);
+    static const bool qbig = getenv("GGML_METAL_FA_GQA_QBIG") != nullptr; // scratch A/B
+    const int gqa_wm_pre = !use_sparse && qbig ? ggml_metal_op_flash_attn_ext_gqa_wm(op, props_dev->has_tensor) : 0;
+    const bool use_kv_f16 = !use_sparse && gqa_wm_pre == 0 && ggml_metal_op_flash_attn_ext_use_kv_f16(op);
 
     ggml_metal_buffer_id bid_idx = bid_kv_f16;
     bid_idx.offs += ggml_metal_op_flash_attn_ext_extra_kv_f16(op);
@@ -4258,7 +4260,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         }
     }
 
-    const int gqa_wm = use_sparse || use_kv_f16 ? 0 : ggml_metal_op_flash_attn_ext_gqa_wm(op, props_dev->has_tensor);
+    const int gqa_wm = gqa_wm_pre > 0 ? gqa_wm_pre : use_sparse || use_kv_f16 ? 0 : ggml_metal_op_flash_attn_ext_gqa_wm(op, props_dev->has_tensor);
 
     if (gqa_wm > 0) {
         const int nwg = 32;
