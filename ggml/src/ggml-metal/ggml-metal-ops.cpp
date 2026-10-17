@@ -3763,7 +3763,11 @@ static bool ggml_metal_op_flash_attn_ext_use_nax(const ggml_tensor * op) {
            op->src[1]->ne[1] % OP_FLASH_ATTN_EXT_NAX_NCPSG == 0;
 }
 
-// small batches with grouped KV heads: one NAX tile holds all queries of the heads that share a KV head (<= 32 rows)
+// queries per head up to which the GQA kernel beats the main NAX kernel
+static constexpr int64_t GQA_MAX_Q = 32;
+
+// small batches with grouped KV heads: the queries of the heads that share a KV head are packed into tiles of
+// wm*16 rows; returns wm, or 0 for the other kernels
 static int ggml_metal_op_flash_attn_ext_gqa_wm(const ggml_tensor * op, bool has_tensor) {
     static const bool disabled = getenv("GGML_METAL_FA_GQA_DISABLE") != nullptr; // read once per process
     // equal K/V head sizes only
@@ -3805,13 +3809,21 @@ static int ggml_metal_op_flash_attn_ext_gqa_wm(const ggml_tensor * op, bool has_
     const int64_t rows = ne01*(ne02/ne12);
 
     // a tile with only up to 4 used rows (single-token decode with 4 query heads per KV head) loses to the vec kernel:
-    // on an F16 cache until the KV range is long (Llama-3.1-8B: -1-2% below 16k, +2-5% from 16k), on a quantized
-    // cache at any length (q8_0: -8% at 8k, -18% at 32k)
-    if (rows <= 4 && (kv_q || op->src[1]->ne[1] < 16384)) {
+    // on an F16 cache until the KV range is long (Llama-3.1-8B: -1-2% below 16k, +2-5% from 16k), on a BF16 or
+    // quantized cache at any length (BF16: -14% at 32k; q8_0: -8% at 8k, -18% at 32k)
+    if (rows <= 4 && (op->src[1]->type != GGML_TYPE_F16 || op->src[1]->ne[1] < 16384)) {
         return 0;
     }
 
-    return rows <= 16 ? 1 : rows <= 32 ? 2 : 0;
+    // up to GQA_MAX_Q queries per head (the main NAX kernel is faster beyond)
+    if (ne01 > GQA_MAX_Q) {
+        return 0;
+    }
+
+    // 8 tiles need 2 KB of threadgroup memory per simdgroup, too much for the 4 simdgroups per tile of DK 512
+    const int wm_max = op->src[1]->ne[0] <= 256 ? 8 : 4;
+
+    return std::min(rows <= 16 ? 1 : rows <= 32 ? 2 : rows <= 64 ? 4 : 8, wm_max);
 }
 
 // returns the n_kv_max hint if the sparse path is available for this op, or 0 otherwise
@@ -4151,8 +4163,10 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     const bool use_sparse = n_kv_max_sparse > 0;
     const int n_kv_max_padded = use_sparse ? GGML_PAD(n_kv_max_sparse, OP_FLASH_ATTN_EXT_VEC_NCPSG) : 0;
 
-    // the vec kernels dequantize the KV inline; no need for the F16 dequant pass in the sparse path
-    const bool use_kv_f16 = !use_sparse && ggml_metal_op_flash_attn_ext_use_kv_f16(op);
+    const int gqa_wm = use_sparse ? 0 : ggml_metal_op_flash_attn_ext_gqa_wm(op, props_dev->has_tensor);
+
+    // the vec kernels dequantize the KV inline, and so does the GQA kernel; no need for the F16 dequant pass there
+    const bool use_kv_f16 = !use_sparse && gqa_wm == 0 && ggml_metal_op_flash_attn_ext_use_kv_f16(op);
 
     ggml_metal_buffer_id bid_idx = bid_kv_f16;
     bid_idx.offs += ggml_metal_op_flash_attn_ext_extra_kv_f16(op);
@@ -4257,10 +4271,10 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         }
     }
 
-    const int gqa_wm = use_sparse || use_kv_f16 ? 0 : ggml_metal_op_flash_attn_ext_gqa_wm(op, props_dev->has_tensor);
-
     if (gqa_wm > 0) {
-        const int nwg = 32;
+        // KV splits; the partial results go to the temp buffer of the vec kernels, sized for 32 splits of up to 32
+        // queries per head
+        const int nwg = std::min<int64_t>(32, 1024/ne01);
         const int nwn = std::max(1, (int) (ne00/128));
         const int nsg = gqa_wm*nwn;
 
@@ -4320,7 +4334,9 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
 
         ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
-        ggml_metal_encoder_dispatch_threadgroups(enc, nwg, ne12, ne03, 32, nsg, 1);
+        const int64_t nrb = (ne01*(ne02/ne12) + 16*gqa_wm - 1)/(16*gqa_wm); // blocks of packed rows
+
+        ggml_metal_encoder_dispatch_threadgroups(enc, nwg*nrb, ne12, ne03, 32, nsg, 1);
 
         ggml_metal_op_concurrency_reset(ctx);
 
