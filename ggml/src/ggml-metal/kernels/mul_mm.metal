@@ -1714,4 +1714,153 @@ MV_NAX_INSTANCE(bf16,    bfloat4x4,     1,     dequantize_bf16)
 #endif
 NAX_QTYPES(MV_NAX_INSTANCE)
 MV_NAX_INSTANCE(q5_K,    block_q5_K,    QK_NL, dequantize_q5_K_nax)
+
+// SCRATCH prototype: tiled NAX mat-mat, weights dequantized straight into fragments (no f16 copy of the weights).
+// threadgroup tile: WM*TM*16 src1 rows x WN*TP*32 weight rows; K permuted inside 64-weight chunks as in kernel_mul_mv_nax_f32
+template<typename block_q, short nl, void (*deq)(device const block_q *, short, thread half4x4 &), short WM, short WN, short TM, short TP>
+kernel void kernel_mul_mm_naxq_f32(
+        constant ggml_metal_kargs_mul_mv_ext & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const short2 lc = nax_coord(tiisg);
+    const short fn = lc.x;
+    const short fm = lc.y;
+
+    const short sm = sgitg/WN;
+    const short sn = sgitg%WN;
+
+    const int i01 = tgpig.x*(WN*TP*32) + sn*(TP*32);
+    const int i11 = tgpig.y*(WM*TM*16) + sm*(TM*16);
+    const int im  = tgpig.z;
+
+    const int i12 = im%args.ne12;
+    const int i13 = im/args.ne12;
+
+    const uint64_t offset0 = (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
+    const uint64_t offset1 = i12*args.nb12 + i13*args.nb13;
+
+    device const block_q * x[TP][2][2];
+    FOR_UNROLL (short q = 0; q < TP; ++q) {
+        FOR_UNROLL (short h = 0; h < 2; ++h) {
+            FOR_UNROLL (short i = 0; i < 2; ++i) {
+                const int r = min(i01 + 32*q + 16*h + fm + 8*i, args.ne01 - 1);
+                x[q][h][i] = (device const block_q *) (src0 + offset0 + (uint64_t) r*args.nb01);
+            }
+        }
+    }
+
+    device const float * y[TM][2];
+    FOR_UNROLL (short m = 0; m < TM; ++m) {
+        FOR_UNROLL (short i = 0; i < 2; ++i) {
+            const int r = min(i11 + 16*m + fm + 8*i, args.ne11 - 1);
+            y[m][i] = (device const float *) (src1 + offset1 + (uint64_t) r*args.nb11);
+        }
+    }
+
+    vec<float, 8> c[TM][TP][2];
+    FOR_UNROLL (short m = 0; m < TM; ++m) {
+        FOR_UNROLL (short q = 0; q < TP; ++q) {
+            c[m][q][0] = 0.0f;
+            c[m][q][1] = 0.0f;
+        }
+    }
+
+    const int nch = args.ne00/64;
+
+    #pragma clang loop unroll(disable)
+    for (int ch = 0; ch < nch; ++ch) {
+        if ((ch & 3) == 0) {
+            threadgroup_barrier(mem_flags::mem_none);
+        }
+
+        volatile int compiler_barrier;
+
+        const int p = 64*ch + 4*fn;
+        const int ib = p/(16*nl);
+        const short il = (p/16)%nl;
+
+        vec<half, 8> a[TM][4];
+        FOR_UNROLL (short m = 0; m < TM; ++m) {
+            FOR_UNROLL (short s = 0; s < 4; ++s) {
+                FOR_UNROLL (short i = 0; i < 2; ++i) {
+                    const float4 v = *((device const float4 *) (y[m][i] + p + 4*s));
+                    FOR_UNROLL (short jj = 0; jj < 4; ++jj) {
+                        a[m][s][4*i + jj] = (half) v[jj];
+                    }
+                }
+            }
+        }
+
+        FOR_UNROLL (short q = 0; q < TP; ++q) {
+            vec<half, 8> b[4][2];
+            FOR_UNROLL (short h = 0; h < 2; ++h) {
+                FOR_UNROLL (short i = 0; i < 2; ++i) {
+                    half4x4 w;
+                    deq(x[q][h][i] + ib, il, w);
+                    FOR_UNROLL (short s = 0; s < 4; ++s) {
+                        FOR_UNROLL (short jj = 0; jj < 4; ++jj) {
+                            b[s][h][4*i + jj] = w[s][jj];
+                        }
+                    }
+                }
+            }
+
+            FOR_UNROLL (short m = 0; m < TM; ++m) {
+                FOR_UNROLL (short s = 0; s < 4; ++s) {
+                    nax_mma<float, half, half, true>(c[m][q][0], c[m][q][1], a[m][s], b[s][0], b[s][1]);
+                }
+            }
+        }
+
+        (void) compiler_barrier;
+    }
+
+    device float * dst_f32 = (device float *) dst + (uint64_t) im*args.ne0*args.ne1;
+
+    FOR_UNROLL (short m = 0; m < TM; ++m) {
+        FOR_UNROLL (short i = 0; i < 2; ++i) {
+            const int r1 = i11 + 16*m + fm + 8*i;
+            if (r1 >= args.ne11) {
+                continue;
+            }
+            FOR_UNROLL (short q = 0; q < TP; ++q) {
+                FOR_UNROLL (short h = 0; h < 2; ++h) {
+                    const int r0 = i01 + 32*q + 16*h + fn;
+                    device float * d = dst_f32 + (uint64_t) r1*args.ne0 + r0;
+                    const float4 v = float4(c[m][q][h][4*i + 0], c[m][q][h][4*i + 1], c[m][q][h][4*i + 2], c[m][q][h][4*i + 3]);
+                    if (r0 + 3 < args.ne01) {
+                        *((device float4 *) d) = v;
+                    } else {
+                        for (short jj = 0; jj < 4; ++jj) {
+                            if (r0 + jj < args.ne01) {
+                                d[jj] = v[jj];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+typedef decltype(kernel_mul_mm_naxq_f32<block_q4_K, QK_NL, dequantize_q4_K, 2, 2, 2, 2>) mul_mm_naxq_t;
+
+#define MM_NAXQ_INSTANCE(name, block_q, nl, deq) \
+template [[host_name("kernel_mul_mm_naxq_" #name "_f32_c0")]] kernel mul_mm_naxq_t kernel_mul_mm_naxq_f32<block_q, nl, deq, 2, 2, 2, 2>; \
+template [[host_name("kernel_mul_mm_naxq_" #name "_f32_c1")]] kernel mul_mm_naxq_t kernel_mul_mm_naxq_f32<block_q, nl, deq, 2, 2, 4, 1>; \
+template [[host_name("kernel_mul_mm_naxq_" #name "_f32_c2")]] kernel mul_mm_naxq_t kernel_mul_mm_naxq_f32<block_q, nl, deq, 4, 2, 2, 2>; \
+template [[host_name("kernel_mul_mm_naxq_" #name "_f32_c3")]] kernel mul_mm_naxq_t kernel_mul_mm_naxq_f32<block_q, nl, deq, 2, 4, 4, 1>;
+
+MM_NAXQ_INSTANCE(f16,    half4x4,       1,     dequantize_f16)
+MM_NAXQ_INSTANCE(q4_0,   block_q4_0,    2,     dequantize_q4_0)
+MM_NAXQ_INSTANCE(q8_0,   block_q8_0,    2,     dequantize_q8_0)
+MM_NAXQ_INSTANCE(q4_K,   block_q4_K,    QK_NL, dequantize_q4_K)
+MM_NAXQ_INSTANCE(q6_K,   block_q6_K,    QK_NL, dequantize_q6_K)
+MM_NAXQ_INSTANCE(mxfp4,  block_mxfp4,   2,     dequantize_mxfp4)
+MM_NAXQ_INSTANCE(iq4_xs, block_iq4_xs,  QK_NL, dequantize_iq4_xs)
+MM_NAXQ_INSTANCE(q5_K,   block_q5_K,    QK_NL, dequantize_q5_K_nax)
 #endif // GGML_METAL_HAS_TENSOR

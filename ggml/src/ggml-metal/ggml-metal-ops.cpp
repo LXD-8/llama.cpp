@@ -2876,6 +2876,28 @@ static int ggml_metal_op_mul_mat_nax_i8(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+
+// SCRATCH: route MUL_MAT through kernel_mul_mm_naxq_* for src1 rows in [min, max]: GGML_METAL_MM_NAXQ="min,max,cfg"
+static int ggml_metal_op_mul_mat_naxq_cfg(const ggml_tensor * op, bool has_tensor) {
+    static int lo = -1, hi = -1, cfg = 0;
+    if (lo < 0) {
+        const char * e = getenv("GGML_METAL_MM_NAXQ");
+        lo = 0; hi = -1;
+        if (e) { sscanf(e, "%d,%d,%d", &lo, &hi, &cfg); }
+    }
+    if (!has_tensor || op->src[1]->type != GGML_TYPE_F32 || op->ne[1] < lo || op->ne[1] > hi || op->src[0]->ne[0] % 64 != 0 ||
+        !ggml_is_contiguous(op->src[0]) || op->src[1]->nb[0] != sizeof(float)) {
+        return -1;
+    }
+    switch (op->src[0]->type) {
+        case GGML_TYPE_F16: case GGML_TYPE_Q4_0: case GGML_TYPE_Q8_0: case GGML_TYPE_Q4_K: case GGML_TYPE_Q6_K:
+        case GGML_TYPE_MXFP4: case GGML_TYPE_IQ4_XS: case GGML_TYPE_Q5_K:
+            return cfg;
+        default:
+            return -1;
+    }
+}
+
 int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -2886,6 +2908,36 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
 
     if (ggml_metal_op_mul_mat_use_fwht(op, props_dev->max_theadgroup_memory_size)) {
         return ggml_metal_op_fwht(ctx, idx);
+    }
+
+    if (const int cfg = ggml_metal_op_mul_mat_naxq_cfg(op, props_dev->has_tensor); cfg >= 0) {
+        GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
+        GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
+        GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
+        GGML_TENSOR_LOCALS(uint64_t, nb1, op->src[1], nb);
+        GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
+
+        static const int WM[4] = {2, 2, 4, 2}, WN[4] = {2, 2, 2, 4}, TM[4] = {2, 4, 2, 4}, TP[4] = {2, 1, 2, 1};
+        const int bm = WM[cfg]*TM[cfg]*16, bn = WN[cfg]*TP[cfg]*32;
+
+        char name[64];
+        snprintf(name, sizeof(name), "kernel_mul_mm_naxq_%s_f32_c%d", ggml_type_name(op->src[0]->type), cfg);
+        auto pipeline = ggml_metal_library_get_pipeline_by_name(lib, name);
+
+        ggml_metal_kargs_mul_mv_ext args = {
+            ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, ne0, ne1,
+            (int16_t) (ne12/ne02), (int16_t) (ne13/ne03),
+        };
+
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+
+        ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + bn - 1)/bn, (ne11 + bm - 1)/bm, ne12*ne13, 32, WM[cfg]*WN[cfg], 1);
+
+        return 1;
     }
 
     if (props_dev->has_simdgroup_mm && (ggml_metal_op_mul_mat_use_mma(op) || (props_dev->has_tensor && ggml_metal_op_mul_mat_mv_nax_mr(op) > 0))) {
