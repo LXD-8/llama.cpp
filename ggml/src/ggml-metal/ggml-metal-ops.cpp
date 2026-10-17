@@ -967,6 +967,15 @@ static bool ggml_metal_op_mul_mat_use_f16_act(const ggml_tensor * op, bool has_t
     return has_tensor && ggml_metal_op_mul_mat_f16_act_shape(op, has_nax) && ((uintptr_t) op->src[1]->data) % 16 == 0;
 }
 
+// the weights the NAX mat-mat multiplies in int8: the quantized formats, K a multiple of the scale group
+// GGML_METAL_MM_I8_DISABLE keeps them on the f16 operands, which are more accurate
+static bool ggml_metal_op_mul_mat_i8_type(const ggml_tensor * op) {
+    static const bool disabled = getenv("GGML_METAL_MM_I8_DISABLE") != nullptr; // read once per process
+
+    return !disabled && op->src[0]->type != GGML_TYPE_F16 && op->src[0]->type != GGML_TYPE_BF16 &&
+        op->src[0]->ne[0] % OP_MUL_MM_I8_G == 0;
+}
+
 // the register-resident NAX mat-mat takes f16 operands only, so quantized weights are first dequantized to f16 in the extra buffer
 bool ggml_metal_op_mul_mat_nax_shape(const ggml_tensor * op) {
     static const bool disabled = getenv("GGML_METAL_MM_NAX_DISABLE") != nullptr;
@@ -1018,9 +1027,9 @@ bool ggml_metal_op_mul_mat_nax_shape(const ggml_tensor * op) {
         return false;
     }
 
-    // the copy of the weights pays off from about 1000 src1 rows
+    // the copy of the weights pays off from about 1000 src1 rows with f16 operands, and from about 450 with int8 ones
     // GGML_METAL_MM_NAX_MIN_ROWS overrides the threshold (used to run the unit tests through the kernels)
-    int64_t min_rows = 1024;
+    int64_t min_rows = ggml_metal_op_mul_mat_i8_type(op) ? 448 : 1024;
 
     if (min_rows_env != nullptr) {
         const int val = atoi(min_rows_env);
@@ -1042,13 +1051,8 @@ static bool ggml_metal_op_mul_mat_use_nax(const ggml_tensor * op, bool has_nax) 
     return ggml_metal_op_mul_mat_use_f16_act(op, has_nax, has_nax) && ggml_metal_op_mul_mat_nax_shape(op);
 }
 
-// int8 operands for the NAX mat-mat; GGML_METAL_MM_I8_DISABLE keeps the f16 operands, which are more accurate
 static bool ggml_metal_op_mul_mat_use_i8(const ggml_tensor * op, bool has_nax) {
-    static const bool disabled = getenv("GGML_METAL_MM_I8_DISABLE") != nullptr; // read once per process
-
-    return !disabled && op->src[0]->type != GGML_TYPE_F16 && op->src[0]->type != GGML_TYPE_BF16 &&
-        op->src[0]->ne[0] % OP_MUL_MM_I8_G == 0 &&
-        ggml_metal_op_mul_mat_use_nax(op, has_nax);
+    return ggml_metal_op_mul_mat_i8_type(op) && ggml_metal_op_mul_mat_use_nax(op, has_nax);
 }
 
 static size_t ggml_metal_op_mul_mat_extra_act(const ggml_tensor * op) {
