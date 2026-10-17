@@ -645,7 +645,6 @@ template<
     short DV,
     short WN,
     short WM,
-    short NWG = 32,
     short BK  = OP_FLASH_ATTN_EXT_NAX_NCPSG>
 kernel void kernel_flash_attn_ext_nax_gqa(
         constant ggml_metal_kargs_flash_attn_ext & args,
@@ -657,6 +656,7 @@ kernel void kernel_flash_attn_ext_nax_gqa(
         device       char * tmp,
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig [[threadgroup_position_in_grid]],
+        uint3  tgpg  [[threadgroups_per_grid]],
         ushort tiisg [[thread_index_in_simdgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
     constexpr short kU  = 16;
@@ -668,13 +668,16 @@ kernel void kernel_flash_attn_ext_nax_gqa(
     static_assert(TK % 2 == 0,  "scores are computed in pairs of fragments");
     static_assert(TDh % 2 == 0, "O is accumulated in pairs of fragments");
 
-    const int iwg = tgpig[0]%NWG;
-    const int irb = tgpig[0]/NWG; // block of WM*16 packed rows
-    const int hk  = tgpig[1];
-    const int iq3 = tgpig[2];
-
     const int G = args.ne02/args.ne_12_2; // query heads per KV head
     const int R = G*args.ne01;            // packed rows
+
+    // grid x: NWG splits of the KV range for each block of WM*16 packed rows
+    const int NWG = tgpg[0]/((R + WM*kU - 1)/(WM*kU));
+
+    const int iwg = tgpig[0]%NWG;
+    const int irb = tgpig[0]/NWG;
+    const int hk  = tgpig[1];
+    const int iq3 = tgpig[2];
 
     const short row_group = sgitg/WN;
     const short d_group   = sgitg%WN;

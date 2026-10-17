@@ -3807,8 +3807,8 @@ static int ggml_metal_op_flash_attn_ext_gqa_wm(const ggml_tensor * op, bool has_
     }
 
     static const int max_rows = getenv("GGML_METAL_FA_GQA_MAX_ROWS") ? atoi(getenv("GGML_METAL_FA_GQA_MAX_ROWS")) : 128; // scratch sweep
-    // the partial results go to the temp buffer of the vec kernels, sized for up to 32 queries per head
-    if (rows > max_rows || ne01 > 32) {
+    static const int max_q = getenv("GGML_METAL_FA_GQA_MAX_Q") ? atoi(getenv("GGML_METAL_FA_GQA_MAX_Q")) : 32; // scratch sweep
+    if (rows > max_rows || ne01 > max_q) {
         return 0;
     }
     const int wm_max = op->src[1]->ne[0] <= 256 ? 8 : 4;
@@ -4264,7 +4264,9 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     const int gqa_wm = gqa_wm_pre > 0 ? gqa_wm_pre : use_sparse || use_kv_f16 ? 0 : ggml_metal_op_flash_attn_ext_gqa_wm(op, props_dev->has_tensor);
 
     if (gqa_wm > 0) {
-        const int nwg = 32;
+        // the partial results go to the temp buffer of the vec kernels, sized for 32 splits of the KV range of up to 32
+        // queries per head
+        const int nwg = std::min<int64_t>(32, 1024/ne01);
         const int nwn = std::max(1, (int) (ne00/128));
         const int nsg = gqa_wm*nwn;
 
