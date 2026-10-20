@@ -996,8 +996,9 @@ int ggml_metal_op_glu(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 2);
     }
     if (mm) {
-        ggml_metal_buffer_id bid_act = ggml_metal_get_buffer_id(mm);
-        bid_act.offs += ggml_nbytes(mm);
+        // the activations take the place of the f32 result, which nothing else reads: unlike the extra buffer of the
+        // mat-mat, this memory cannot alias the GLU inputs, and the f16 (or int8 + scales) data is at most half its size
+        const ggml_metal_buffer_id bid_act = ggml_metal_get_buffer_id(op);
 
         ggml_metal_encoder_set_buffer(enc, bid_act, 3);
 
@@ -1021,7 +1022,6 @@ int ggml_metal_op_glu(ggml_metal_op_t ctx, int idx) {
     }
 
     if (mm) {
-        // the extra buffer is not covered by the concurrency tracking
         ggml_metal_op_concurrency_reset(ctx);
 
         ctx->mm_act_ready = mm;
@@ -2826,13 +2826,13 @@ static int ggml_metal_op_mul_mat_nax_i8(ggml_metal_op_t ctx, int idx) {
     ggml_metal_buffer_id bid_base = ggml_metal_get_buffer_id(op);
     bid_base.offs += ggml_nbytes(op);
 
-    ggml_metal_buffer_id bid_a  = bid_base;
-    ggml_metal_buffer_id bid_sa = bid_base; bid_sa.offs += GGML_PAD((size_t) M*K, 32);
+    // the activations may have been quantized already by a fused GLU, in place of its f32 result
+    const bool act_ready = ctx->mm_act_ready == op;
+
+    ggml_metal_buffer_id bid_a  = act_ready ? ggml_metal_get_buffer_id(op->src[1]) : bid_base;
+    ggml_metal_buffer_id bid_sa = bid_a;    bid_sa.offs += GGML_PAD((size_t) M*K, 32);
     ggml_metal_buffer_id bid_w  = bid_base; bid_w.offs  += ggml_metal_op_mul_mat_extra_act(op);
     ggml_metal_buffer_id bid_sw = bid_w;    bid_sw.offs += GGML_PAD((size_t) N*K, 32);
-
-    // the activations may have been quantized already by a fused GLU
-    const bool act_ready = ctx->mm_act_ready == op;
 
     // the extra buffer is not covered by the concurrency tracking
     ggml_metal_op_concurrency_reset(ctx);
@@ -3045,13 +3045,10 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
             return ggml_metal_op_mul_mat_nax_i8(ctx, idx);
         }
 
-        // the f16 activations may have been written already by a fused GLU
+        // the f16 activations may have been written already by a fused GLU, in place of its f32 result (bid_src1)
         const bool act_ready = ctx->mm_act_ready == op && ggml_metal_op_mul_mat_use_nax(op, props_dev->has_tensor);
 
         if (use_f16_act && act_ready) {
-            bid_src1 = ggml_metal_get_buffer_id(op);
-            bid_src1.offs += ggml_nbytes(op);
-
             nb10_mm = sizeof(ggml_fp16_t);
             nb11_mm = nb10_mm*ne10;
             nb12_mm = nb11_mm*ne11;
