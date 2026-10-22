@@ -3747,6 +3747,11 @@ static bool ggml_metal_op_flash_attn_ext_use_nax(const ggml_tensor * op) {
         return false;
     }
 
+    // above the GQA batches the BF16 tensor kernel is faster for head size 512
+    if (op->src[1]->type == GGML_TYPE_BF16 && dk == 512 && op->src[0]->ne[1] > GQA_MAX_Q) {
+        return false;
+    }
+
     float max_bias;
     float logit_softcap;
 
