@@ -3726,6 +3726,9 @@ static bool ggml_metal_op_flash_attn_ext_use_tensor(const ggml_tensor * op, bool
     return op->src[1]->ne[1] % OP_FLASH_ATTN_EXT_TENSOR_NCPSG == 0;
 }
 
+// queries per head up to which the GQA kernel beats the main NAX kernel
+static constexpr int64_t GQA_MAX_Q = 32;
+
 // the register-resident NAX kernel covers the tensor kernel for equal K/V head sizes of 64, 128, 256 or 512 and the
 // MLA shapes 192/128 and 576/512, with or without sinks, and no ALiBi or softcap. GGML_METAL_FA_NAX_DISABLE turns it
 // off for comparisons
@@ -3757,6 +3760,12 @@ static bool ggml_metal_op_flash_attn_ext_use_nax(const ggml_tensor * op) {
         return false;
     }
 
+    // above the GQA batches, a BF16 cache of head size 512 is faster on the upstream BF16 tensor kernel
+    // (gemma-4-26B-A4B pp2048 at 8k / 32k: +6 / +16%); 256 is not (Qwen3.8-27B: NAX +1 / +5%)
+    if (op->src[1]->type == GGML_TYPE_BF16 && dk == 512 && op->src[0]->ne[1] > GQA_MAX_Q) {
+        return false;
+    }
+
     float max_bias;
     float logit_softcap;
 
@@ -3766,9 +3775,6 @@ static bool ggml_metal_op_flash_attn_ext_use_nax(const ggml_tensor * op) {
     return max_bias == 0.0f && logit_softcap == 0.0f &&
            op->src[1]->ne[1] % OP_FLASH_ATTN_EXT_NAX_NCPSG == 0;
 }
-
-// queries per head up to which the GQA kernel beats the main NAX kernel
-static constexpr int64_t GQA_MAX_Q = 32;
 
 // small batches with grouped KV heads: the queries of the heads that share a KV head are packed into tiles of
 // wm*16 rows; returns wm, or 0 for the other kernels
