@@ -591,10 +591,8 @@ template [[host_name("kernel_flash_attn_ext_nax_bf16_dk128_dv128")]] kernel flas
 template [[host_name("kernel_flash_attn_ext_nax_f16_dk256_dv256")]] kernel flash_attn_ext_nax_t kernel_flash_attn_ext_nax<half, 256, 256, 2>;
 template [[host_name("kernel_flash_attn_ext_nax_bf16_dk256_dv256")]] kernel flash_attn_ext_nax_t kernel_flash_attn_ext_nax<bfloat, 256, 256, 2>;
 template [[host_name("kernel_flash_attn_ext_nax_f16_dk512_dv512")]] kernel flash_attn_ext_nax_t kernel_flash_attn_ext_nax<half, 512, 512, 4>;
-template [[host_name("kernel_flash_attn_ext_nax_bf16_dk512_dv512")]] kernel flash_attn_ext_nax_t kernel_flash_attn_ext_nax<bfloat, 512, 512, 4>;
 template [[host_name("kernel_flash_attn_ext_nax_f16_dk192_dv128")]]  kernel flash_attn_ext_nax_t kernel_flash_attn_ext_nax<half,   192, 128, 1>;
 template [[host_name("kernel_flash_attn_ext_nax_bf16_dk192_dv128")]] kernel flash_attn_ext_nax_t kernel_flash_attn_ext_nax<bfloat, 192, 128, 1>;
 template [[host_name("kernel_flash_attn_ext_nax_f16_dk576_dv512")]]  kernel flash_attn_ext_nax_t kernel_flash_attn_ext_nax<half,   576, 512, 4>;
-template [[host_name("kernel_flash_attn_ext_nax_bf16_dk576_dv512")]] kernel flash_attn_ext_nax_t kernel_flash_attn_ext_nax<bfloat, 576, 512, 4>;
 
 #endif // GGML_METAL_HAS_TENSOR
