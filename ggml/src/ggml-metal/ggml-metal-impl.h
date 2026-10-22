@@ -1453,6 +1453,42 @@ typedef struct {
 } ggml_metal_kargs_argmax;
 
 typedef struct {
+    int64_t  n_kv;
+    int64_t  ne1;
+    int64_t  ne2;
+    int64_t  m1;
+    int64_t  m2;
+    int64_t  m3;
+    int64_t  n_top;
+    int64_t  n_pick;
+    int64_t  n_blk;
+    int64_t  n_extra;
+    uint64_t nbm1;
+    uint64_t nbm2;
+    uint64_t nbm3;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+    uint64_t nbk0;
+    uint64_t nbk1;
+    uint64_t nbk2;
+    uint64_t nbk3;
+    uint64_t nbs0;
+    uint64_t nbs1;
+    uint64_t nbs2;
+    uint64_t nbs3;
+    uint64_t nbb0;
+    uint64_t nbb1;
+    uint64_t nbe0;
+    uint64_t nbe1;
+    uint64_t nbe2;
+    uint64_t nbe3;
+    int32_t  has_score;
+    int32_t  has_blocks;
+    int32_t  vec;
+} ggml_metal_kargs_top_k_mask;
+
+typedef struct {
     int64_t  np;
 } ggml_metal_kargs_opt_step_adamw;
 

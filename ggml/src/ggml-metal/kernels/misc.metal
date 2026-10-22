@@ -906,3 +906,76 @@ kernel void kernel_dsv4_hc_post_f32(
         *(device float *) (dst + i0*args.nb_d0 + idst*args.nb_d1 + it*args.nb_d2) = result[idst];
     }
 }
+
+// one threadgroup per row: fill the row with -inf, then copy the mask cells of the live picks and the extra cells
+template<typename T, typename T4>
+kernel void kernel_top_k_mask(
+        constant ggml_metal_kargs_top_k_mask & args,
+        device const char * mask,
+        device const char * top_k,
+        device const char * score,
+        device const char * blocks,
+        device const char * extra,
+        device       char * dst,
+        uint   tgpig[[threadgroup_position_in_grid]],
+        ushort tpitg[[thread_position_in_threadgroup]],
+        ushort ntg  [[threads_per_threadgroup]]) {
+    const int64_t i1 = tgpig % args.ne1;
+    const int64_t i2 = (tgpig / args.ne1) % args.ne2;
+    const int64_t i3 = tgpig / (args.ne1*args.ne2);
+
+    device const T * mask_row = (device const T *) (mask + (i1 % args.m1)*args.nbm1 + (i2 % args.m2)*args.nbm2 + (i3 % args.m3)*args.nbm3);
+    device       T * dst_row  = (device       T *) (dst  + i1*args.nb1 + i2*args.nb2 + i3*args.nb3);
+
+    device const char * top_k_row = top_k + i1*args.nbk1 + i2*args.nbk2 + i3*args.nbk3;
+    device const char * extra_row = extra + i1*args.nbe1 + i2*args.nbe2 + i3*args.nbe3;
+
+    if (args.vec) {
+        for (int64_t i = tpitg; i < args.n_kv/4; i += ntg) {
+            ((device T4 *) dst_row)[i] = T4(-INFINITY);
+        }
+    } else {
+        for (int64_t i = tpitg; i < args.n_kv; i += ntg) {
+            dst_row[i] = T(-INFINITY);
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_device);
+
+    // one thread per pick or extra cell; cells kept twice get the same value
+    for (int64_t i = tpitg; i < args.n_top + args.n_extra; i += ntg) {
+        if (i >= args.n_top) {
+            const int32_t c = *(device const int32_t *) (extra_row + (i - args.n_top)*args.nbe0);
+            if (c >= 0 && c < args.n_kv) {
+                dst_row[c] = mask_row[c];
+            }
+            continue;
+        }
+
+        const int32_t p = *(device const int32_t *) (top_k_row + i*args.nbk0);
+        if (p < 0 || p >= args.n_pick) {
+            continue;
+        }
+        if (args.has_score &&
+            !(*(device const float *) (score + p*args.nbs0 + i1*args.nbs1 + i2*args.nbs2 + i3*args.nbs3) > -INFINITY)) {
+            continue;
+        }
+        if (!args.has_blocks) {
+            if (p < args.n_kv) {
+                dst_row[p] = mask_row[p];
+            }
+            continue;
+        }
+        for (int64_t k = 0; k < args.n_blk; ++k) {
+            const int32_t c = *(device const int32_t *) (blocks + k*args.nbb0 + p*args.nbb1);
+            if (c >= 0 && c < args.n_kv) {
+                dst_row[c] = mask_row[c];
+            }
+        }
+    }
+}
+
+typedef decltype(kernel_top_k_mask<float, float4>) kernel_top_k_mask_t;
+
+template [[host_name("kernel_top_k_mask_f32")]] kernel kernel_top_k_mask_t kernel_top_k_mask<float, float4>;
+template [[host_name("kernel_top_k_mask_f16")]] kernel kernel_top_k_mask_t kernel_top_k_mask<half,  half4>;

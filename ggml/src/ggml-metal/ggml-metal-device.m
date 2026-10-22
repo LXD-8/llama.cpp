@@ -1687,6 +1687,8 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 op->type == GGML_TYPE_I64;
         case GGML_OP_ARGMAX:
             return has_simdgroup_reduction;
+        case GGML_OP_TOP_K_MASK:
+            return (op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32) && op->nb[0] == ggml_type_size(op->type);
         case GGML_OP_NORM:
         case GGML_OP_RMS_NORM:
             return has_simdgroup_reduction && (ggml_is_contiguous_rows(op->src[0]));
