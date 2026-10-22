@@ -3812,6 +3812,11 @@ static bool ggml_metal_op_flash_attn_ext_use_nax(const ggml_tensor * op) {
         if (bf16_disabled || op->src[2]->type != GGML_TYPE_BF16) {
             return false;
         }
+
+        // the BF16 tensor kernel is faster for the large head sizes
+        if (dk >= 512) {
+            return false;
+        }
     }
 
     float max_bias;
