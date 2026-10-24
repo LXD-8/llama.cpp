@@ -3741,15 +3741,12 @@ static bool ggml_metal_op_flash_attn_ext_use_nax(const ggml_tensor * op) {
         return false;
     }
 
-    // a BF16 cache is read as is and converted to f16 in registers; GGML_METAL_FA_NAX_BF16_DISABLE leaves it to the
-    // tensor kernel
-    static const bool bf16_disabled = getenv("GGML_METAL_FA_NAX_BF16_DISABLE") != nullptr; // read once per process
-    if (op->src[1]->type == GGML_TYPE_BF16 && (bf16_disabled || op->src[2]->type != GGML_TYPE_BF16)) {
+    // a BF16 cache is converted to f16 in registers
+    if (op->src[1]->type == GGML_TYPE_BF16 && op->src[2]->type != GGML_TYPE_BF16) {
         return false;
     }
 
-    // above the GQA batches, a BF16 cache of head size 512 is faster on the upstream BF16 tensor kernel
-    // (gemma-4-26B-A4B pp2048 at 8k / 32k: +6 / +16%); 256 is not (Qwen3.8-27B: NAX +1 / +5%)
+    // above the GQA batches the BF16 tensor kernel is faster for head size 512
     if (op->src[1]->type == GGML_TYPE_BF16 && dk == 512 && op->src[0]->ne[1] > GQA_MAX_Q) {
         return false;
     }
@@ -3775,28 +3772,22 @@ static int ggml_metal_op_flash_attn_ext_gqa_wm(const ggml_tensor * op, bool has_
     const int64_t ne02 = op->src[0]->ne[2];
     const int64_t ne12 = op->src[1]->ne[2];
 
-    // a quantized cache (32-value blocks) is dequantized in registers; GGML_METAL_FA_GQA_Q_DISABLE leaves it to the
-    // vec kernels
-    static const bool q_disabled = getenv("GGML_METAL_FA_GQA_Q_DISABLE") != nullptr; // read once per process
-
-    bool kv_q = false;
+    // a quantized cache is dequantized in registers
     switch (op->src[1]->type) {
         case GGML_TYPE_F16:
         case GGML_TYPE_BF16:
-            break;
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_IQ4_NL:
-            kv_q = true;
             break;
         default:
             return 0;
     }
 
-    if ((kv_q && q_disabled) || op->src[2]->type != op->src[1]->type ||
+    if (op->src[2]->type != op->src[1]->type ||
         ne12 == 0 || ne02 % ne12 != 0 || ne02/ne12 < 2 ||
         op->src[3] == nullptr || op->src[3]->ne[1] < ne01) {
         return 0;

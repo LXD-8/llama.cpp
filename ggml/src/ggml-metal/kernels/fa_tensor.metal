@@ -299,8 +299,7 @@ template [[host_name("kernel_flash_attn_ext_tensor_bf16_dk576_dv512")]] kernel f
 constant bool FC_flash_attn_ext_nax_has_mask  [[function_constant(FC_FLASH_ATTN_EXT_NAX + 0)]];
 constant bool FC_flash_attn_ext_nax_has_sinks [[function_constant(FC_FLASH_ATTN_EXT_NAX + 1)]];
 
-// K/V elements of the NAX attention kernels: f16 as is, bf16 converted to f16 in registers (exact within the f16 range,
-// larger values are clamped), so that Q, K, V and P stay f16 in the MMA
+// K/V elements of the NAX attention kernels: bf16 is converted to f16 in registers and clamped to the f16 range
 static inline half4 fa_nax_kv4(device const half * p) {
     return *((device const half4 *) p);
 }
@@ -309,7 +308,7 @@ static inline half4 fa_nax_kv4(device const bfloat * p) {
     return (half4) clamp(float4(*((device const bfloat4 *) p)), -65504.0f, 65504.0f);
 }
 
-// a quantized cache (32-value blocks) is read as stored by the GQA kernel: 4 values at column col of a row
+// a quantized cache is read as stored by the GQA kernel: 4 values at column col of a row
 template<typename T> constexpr bool fa_nax_kv_is_q() { return !(is_same<T, half>::value || is_same<T, bfloat>::value); }
 
 static inline void fa_nax_dq4(device const block_q4_0   * b, short il, thread float4 & r) { dequantize_q4_0_t4  (b, il, r); }
