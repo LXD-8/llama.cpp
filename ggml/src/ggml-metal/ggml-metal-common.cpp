@@ -148,19 +148,14 @@ static int64_t ggml_metal_mul_mv_mma_rows_min(enum ggml_type type) {
     }
 }
 
-// q4_K with 2..3 src1 rows and q5_K with 2 (MTP verify with 1-2 drafts, 2-3 parallel sequences): the cross-row mat-vec
-// unpacks each block once for all rows. measured on an M5 Max: q4_K 4-10% faster than the 1-row mat-vec per row (2 rows)
-// or the few-row MMA (3 rows), from 4 rows on the MMA kernel is faster; q5_K 21% faster at 2 rows, from 3 rows on the
-// NAX few-row kernel is faster. GGML_METAL_MV_XR_DISABLE turns it off
+// q4_K with 2-3 src1 rows and q5_K with 2: the cross-row mat-vec unpacks each block once for all rows
 int ggml_metal_op_mul_mat_xr_rows(const struct ggml_tensor * op) {
-    static const bool disabled = getenv("GGML_METAL_MV_XR_DISABLE") != nullptr; // read once per process
-
     const ggml_tensor * src0 = op->src[0];
     const ggml_tensor * src1 = op->src[1];
 
     const int64_t rows_max = src0->type == GGML_TYPE_Q4_K ? 3 : src0->type == GGML_TYPE_Q5_K ? 2 : 0;
 
-    const bool ok = !disabled && src1->type == GGML_TYPE_F32 && src1->ne[1] >= 2 && src1->ne[1] <= rows_max;
+    const bool ok = src1->type == GGML_TYPE_F32 && src1->ne[1] >= 2 && src1->ne[1] <= rows_max;
 
     return ok ? (int) src1->ne[1] : 0;
 }
@@ -186,8 +181,7 @@ bool ggml_metal_op_mul_mat_may_use_mma(const struct ggml_tensor * op) {
     return ggml_metal_mul_mv_mma_type_supported(op->src[0]->type) && op->src[1]->type == GGML_TYPE_F32;
 }
 
-// the most src1 rows for which the NAX few-row kernel, in passes of 32 rows, beats the mat-mat kernels (M5 Max,
-// synthetic weights); past 64 rows it is slower for every type
+// the most src1 rows for which the NAX few-row kernel beats the mat-mat kernels
 static int64_t ggml_metal_mul_mv_nax_rows_max(enum ggml_type type) {
     switch (type) {
         case GGML_TYPE_F32:
@@ -212,9 +206,8 @@ static int64_t ggml_metal_mul_mv_nax_rows_max(enum ggml_type type) {
     }
 }
 
-// whether the NAX few-row kernel beats the other kernels at ne11 src1 rows (M5 Max, every weight type on synthetic
-// weights): from 17 rows the mat-mat kernels for every type, from 9 rows the few-row MMA kernels for every quantized
-// type, and below that only for the types whose dequantization costs the MMA kernels the most
+// whether the NAX few-row kernel beats the other kernels at ne11 src1 rows
+// below 9 rows it only wins for the types with the most expensive dequantization
 static bool ggml_metal_mul_mv_nax_rows_ok(enum ggml_type type, int64_t ne11) {
     if (ne11 < 2 || ne11 > ggml_metal_mul_mv_nax_rows_max(type)) {
         return false;
@@ -255,14 +248,12 @@ static bool ggml_metal_mul_mv_nax_rows_ok(enum ggml_type type, int64_t ne11) {
 }
 
 int ggml_metal_op_mul_mat_mv_nax_mr(const struct ggml_tensor * op) {
-    static const bool disabled = getenv("GGML_METAL_MV_NAX_DISABLE") != nullptr; // read once per process
-
     const ggml_tensor * src0 = op->src[0];
     const ggml_tensor * src1 = op->src[1];
 
     const int64_t ne11 = src1->ne[1];
 
-    const bool ok = !disabled && ggml_metal_mul_mv_mma_type_supported(src0->type) && src1->type == GGML_TYPE_F32 &&
+    const bool ok = ggml_metal_mul_mv_mma_type_supported(src0->type) && src1->type == GGML_TYPE_F32 &&
         ggml_metal_mul_mv_nax_rows_ok(src0->type, ne11) &&
         src0->ne[0] % 64 == 0 && src0->ne[0] % ggml_blck_size(src0->type) == 0 &&
         src0->nb[0] == ggml_type_size(src0->type) && !ggml_is_transposed(src0) &&

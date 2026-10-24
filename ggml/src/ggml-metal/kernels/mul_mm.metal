@@ -1512,10 +1512,8 @@ template [[host_name("kernel_mul_mm_id_tq2_0_f16")]]   kernel mul_mm_id kernel_m
 template [[host_name("kernel_mul_mm_id_tq1_0_f16")]]   kernel mul_mm_id kernel_mul_mm_id<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_tq1_0,   QK_NL, dequantize_tq1_0,   float,  float4x4,  half, half2x4>;
 
 #ifdef GGML_METAL_HAS_TENSOR
-// few-row mat-mat on the NAX units (2..32 src1 rows, e.g. MTP verify batches, short prompts): the src1 rows are the M = 16
-// rows of a 16x32x16 matmul2d (MR of them per pass), 32 weight rows are its N columns. each lane dequantizes 16 weights per
-// step straight into a half fragment (no threadgroup memory); the NSG simdgroups split K and are summed at the end. the lane
-// layout is that of nax_coord
+// few-row mat-mat on the NAX units: the src1 rows are the M rows of a 16x32x16 matmul2d and 32 weight rows are its N columns
+// each lane dequantizes its weights straight into a half fragment; the NSG simdgroups split K and are summed at the end
 
 // the 16 weights of dequantize_q5_K, with 16-byte loads and bit operations instead of a branch per weight
 template <typename type4x4>
@@ -1542,10 +1540,8 @@ void dequantize_q5_K_nax(device const block_q5_K * xb, short il, thread type4x4 
     }
 }
 
-// the weights go through the dequantize function of their type. a lane needs 4 weights at K offsets fn..fn + 3 of each
-// 16-wide K slice s, so K is permuted inside each 64-weight chunk: logical (s, fn + jj) is physical 16*(fn/4) + 4*s + jj,
-// identically for src0 and src1. a lane then dequantizes one whole 16-weight group per weight row and chunk, which is the
-// unit of the dequantize functions
+// K is permuted the same way for src0 and src1 inside each 64-weight chunk, logical (s, fn + jj) -> physical 16*(fn/4) + 4*s + jj
+// so that each lane dequantizes whole 16-weight groups, the unit of the dequantize functions
 template<typename block_q, short nl, void (*deq)(device const block_q *, short, thread half4x4 &), short MR, bool ADD>
 kernel void kernel_mul_mv_nax_f32(
         constant ggml_metal_kargs_mul_mv_ext & args,

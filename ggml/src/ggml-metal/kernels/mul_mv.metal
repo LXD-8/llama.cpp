@@ -1632,8 +1632,8 @@ kernel void kernel_mul_mv_q4_K_f32(
     kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
 }
 
-// q4_K mat-vec for nr1 src1 rows at once (a few tokens): the lanes and the dot products are those of kernel_mul_mv_q4_K_f32_impl,
-// but the quants and scales of a block are unpacked once and dotted with all nr1 rows. rows past ne11 repeat the last row
+// q4_K mat-vec for nr1 src1 rows: as kernel_mul_mv_q4_K_f32_impl, but each block is unpacked once for all nr1 rows
+// rows past ne11 repeat the last row
 template<short nr1>
 kernel void kernel_mul_mv_q4_K_f32_xr(
         constant ggml_metal_kargs_mul_mv & args,
@@ -1680,7 +1680,6 @@ kernel void kernel_mul_mv_q4_K_f32_xr(
     float sumf[nr0][nr1] = {{0.f}};
 
     for (int ib = ix; ib < nb; ib += 4) {
-        // unpacked once per block: the masked (unshifted) quants, the scales and the mins of the nr0 rows.
         // the quants are exact in half, which keeps the register use low enough
         half   ql[nr0][16];
         half   qh[nr0][16];
@@ -1910,8 +1909,7 @@ kernel void kernel_mul_mv_q5_K_f32(
     kernel_mul_mv_q5_K_f32_impl<N_R0_Q5_K, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
 }
 
-// q5_K mat-vec for nr1 src1 rows at once: the lanes and the dot products are those of kernel_mul_mv_q5_K_f32_impl, but the
-// 5-bit quants (with the high bit applied) and the scales of a block are unpacked once and dotted with all nr1 rows
+// q5_K mat-vec for nr1 src1 rows: as kernel_mul_mv_q5_K_f32_impl, but each block is unpacked once for all nr1 rows
 template<short nr1>
 kernel void kernel_mul_mv_q5_K_f32_xr(
         constant ggml_metal_kargs_mul_mv & args,
