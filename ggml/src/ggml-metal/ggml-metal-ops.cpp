@@ -3727,26 +3727,16 @@ static bool ggml_metal_op_flash_attn_ext_use_tensor(const ggml_tensor * op, bool
 // queries per head up to which the GQA kernel beats the main NAX kernel
 static constexpr int64_t GQA_MAX_Q = 32;
 
-// the register-resident NAX kernel covers the tensor kernel for equal K/V head sizes of 64, 128, 256 or 512 and the
-// MLA shapes 192/128 and 576/512, with or without sinks, and no ALiBi or softcap. GGML_METAL_FA_NAX_DISABLE turns it
-// off for comparisons
+// the register-resident NAX kernel covers the tensor kernel for K/V head sizes 64, 128, 256, 512 and the MLA shapes, without ALiBi or softcap
 static bool ggml_metal_op_flash_attn_ext_use_nax(const ggml_tensor * op) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
-
-    static const bool disabled = getenv("GGML_METAL_FA_NAX_DISABLE") != nullptr;
-    if (disabled) {
-        return false;
-    }
 
     const int64_t dk = op->src[1]->ne[0];
     const int64_t dv = op->src[2]->ne[0];
 
-    // equal K/V head sizes, and the MLA shapes (192/128 and 576/512, the latter with V a view of K);
-    // GGML_METAL_FA_NAX_MLA_DISABLE leaves the MLA shapes to the tensor kernel
-    static const bool mla_disabled = getenv("GGML_METAL_FA_NAX_MLA_DISABLE") != nullptr; // read once per process
-
+    // MLA: 192/128, and 576/512 with V a view of K
     const bool dk_dv_ok = (dk == dv && (dk == 64 || dk == 128 || dk == 256 || dk == 512)) ||
-                          (!mla_disabled && ((dk == 192 && dv == 128) || (dk == 576 && dv == 512)));
+                          (dk == 192 && dv == 128) || (dk == 576 && dv == 512);
     if (!dk_dv_ok) {
         return false;
     }

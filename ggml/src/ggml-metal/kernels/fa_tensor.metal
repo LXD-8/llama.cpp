@@ -326,11 +326,8 @@ static inline half4 fa_nax_kvq4(device const char * row, int col) {
     return (half4) r;
 }
 
-// flash attention with the scores, the probabilities and O kept in registers
-// WM simdgroups split the queries (16 each), WN simdgroups split the head dim; the WN partial Q*K^T scores are summed
-// through threadgroup memory in a fixed order, then every simdgroup runs the same softmax on its own copy
-// the structure follows MLX steel attention_nax_dsplit (MIT, Apple Inc.)
-// no ALiBi or softcap - the host uses kernel_flash_attn_ext_tensor for those
+// flash attention with the scores, the probabilities and O kept in registers; no ALiBi or softcap
+// WM simdgroups split the queries and WN simdgroups split the head dim, as in MLX steel attention_nax_dsplit (MIT, Apple Inc.)
 template<
     typename KV,                                // K/V element type: half or bfloat
     short DK,
