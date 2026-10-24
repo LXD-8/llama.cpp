@@ -632,11 +632,8 @@ template [[host_name("kernel_flash_attn_ext_nax_bf16_dk192_dv128")]] kernel flas
 template [[host_name("kernel_flash_attn_ext_nax_f16_dk576_dv512")]]  kernel flash_attn_ext_nax_t kernel_flash_attn_ext_nax<half,   576, 512, 4>;
 template [[host_name("kernel_flash_attn_ext_nax_bf16_dk576_dv512")]] kernel flash_attn_ext_nax_t kernel_flash_attn_ext_nax<bfloat, 576, 512, 4>;
 
-// small batches (decode, MTP verify): the G query heads that share a KV head and the ne01 queries are packed into
-// rows (packed row p = g*ne01 + i), WM*16 rows per threadgroup, so every K/V block is loaded once for all of them. the
-// KV range is split over NWG threadgroups per row block; each writes its unnormalized O and its S, M into the temp
-// buffer of the vec kernels, and kernel_flash_attn_ext_vec_reduce combines them; the first one also folds in the
-// sink. no ALiBi or softcap
+// small batches: the queries of the G heads that share a KV head are packed into rows p = g*ne01 + i, so each K/V block is loaded once
+// the KV range is split over NWG threadgroups, combined by kernel_flash_attn_ext_vec_reduce; no ALiBi or softcap
 template<
     typename KV,                                // K/V element type: half or bfloat
     short DK,
@@ -894,8 +891,7 @@ kernel void kernel_flash_attn_ext_nax_gqa(
         }
     }
 
-    // partial results in the layout of kernel_flash_attn_ext_vec_reduce: O as float4 chunks interleaved over the NWG
-    // workgroups, then S and M (natural log) per row and workgroup
+    // partial results in the layout of kernel_flash_attn_ext_vec_reduce: O, then S and M (natural log)
     const int nrows = args.ne1*args.ne2*args.ne3;
 
     device float4 * o4 = (device float4 *) tmp;

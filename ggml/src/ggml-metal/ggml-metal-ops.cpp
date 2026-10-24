@@ -3764,12 +3764,10 @@ static bool ggml_metal_op_flash_attn_ext_use_nax(const ggml_tensor * op) {
            op->src[1]->ne[1] % OP_FLASH_ATTN_EXT_NAX_NCPSG == 0;
 }
 
-// small batches with grouped KV heads: the queries of the heads that share a KV head are packed into tiles of
-// wm*16 rows; returns wm, or 0 for the other kernels
+// small batches with grouped KV heads: the queries of the heads that share a KV head are packed into tiles of wm*16 rows
+// returns wm, or 0 for the other kernels; equal K/V head sizes only
 static int ggml_metal_op_flash_attn_ext_gqa_wm(const ggml_tensor * op, bool has_tensor) {
-    static const bool disabled = getenv("GGML_METAL_FA_GQA_DISABLE") != nullptr; // read once per process
-    // equal K/V head sizes only
-    if (disabled || !has_tensor || !ggml_metal_op_flash_attn_ext_use_nax(op) || op->src[1]->ne[0] != op->src[2]->ne[0]) {
+    if (!has_tensor || !ggml_metal_op_flash_attn_ext_use_nax(op) || op->src[1]->ne[0] != op->src[2]->ne[0]) {
         return 0;
     }
 
@@ -3806,14 +3804,11 @@ static int ggml_metal_op_flash_attn_ext_gqa_wm(const ggml_tensor * op, bool has_
 
     const int64_t rows = ne01*(ne02/ne12);
 
-    // a tile with only up to 4 used rows (single-token decode with 4 query heads per KV head) loses to the vec kernel:
-    // on an F16 cache until the KV range is long (Llama-3.1-8B: -1-2% below 16k, +2-5% from 16k), on a BF16 or
-    // quantized cache at any length (BF16: -14% at 32k; q8_0: -8% at 8k, -18% at 32k)
+    // up to 4 used rows (one token, 4 query heads per KV head) lose to the vec kernel, on an F16 cache only below 16k of KV
     if (rows <= 4 && (op->src[1]->type != GGML_TYPE_F16 || op->src[1]->ne[1] < 16384)) {
         return 0;
     }
 
-    // up to GQA_MAX_Q queries per head (the main NAX kernel is faster beyond)
     if (ne01 > GQA_MAX_Q) {
         return 0;
     }
@@ -4270,8 +4265,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     }
 
     if (gqa_wm > 0) {
-        // KV splits; the partial results go to the temp buffer of the vec kernels, sized for 32 splits of up to 32
-        // queries per head
+        // KV splits: the partial results go to the temp buffer of the vec kernels, sized for 32 splits of up to 32 queries per head
         const int nwg = std::min<int64_t>(32, 1024/ne01);
         const int nwn = std::max(1, (int) (ne00/128));
         const int nsg = gqa_wm*nwn;
