@@ -712,8 +712,7 @@ static bool ggml_metal_fusion_check_mul_mat_add(
         (add->data == res->data || !ggml_metal_fusion_overlap(add, res));
 }
 
-// GLU + MUL_MAT: the GLU result is only read by the mat-mat (as src1), which converts its activations to f16 first;
-// the GLU then writes them in f16 (or int8) directly and its own f32 result is never materialized
+// GLU + MUL_MAT: the GLU result is only read by the NAX mat-mat, so the GLU writes its f16 (or int8) activations directly
 static bool ggml_metal_fusion_check_glu_mul_mat(
         const ggml_metal_fusion       * fusion,
         const ggml_tensor * const     * nodes,

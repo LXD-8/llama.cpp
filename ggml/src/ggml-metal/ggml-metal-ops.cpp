@@ -940,9 +940,7 @@ int ggml_metal_op_glu(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * mm = nullptr;
     bool mm_i8 = false;
 
-    static const bool glu_mm_disabled = getenv("GGML_METAL_GLU_MM_DISABLE") != nullptr; // read once per process
-
-    if (ctx->use_fusion() && !glu_mm_disabled) {
+    if (ctx->use_fusion()) {
         int n = 1;
         const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
 
@@ -1000,8 +998,7 @@ int ggml_metal_op_glu(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 2);
     }
     if (mm) {
-        // the activations take the place of the f32 result, which nothing else reads: unlike the extra buffer of the
-        // mat-mat, this memory cannot alias the GLU inputs, and the f16 (or int8 + scales) data is at most half its size
+        // the activations go where the unused f32 result would be: this memory cannot alias the GLU inputs and is large enough
         const ggml_metal_buffer_id bid_act = ggml_metal_get_buffer_id(op);
 
         ggml_metal_encoder_set_buffer(enc, bid_act, 3);
