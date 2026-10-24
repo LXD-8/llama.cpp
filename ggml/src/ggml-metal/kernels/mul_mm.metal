@@ -293,13 +293,10 @@ void kernel_mul_mm_nax_f16(
 #endif // GGML_METAL_HAS_TENSOR
 
 #ifdef GGML_METAL_HAS_TENSOR
-// ---- int8 NAX mat-mat ---------------------------------------------------------------------------------------------
-// both operands are quantized to symmetric int8 with one scale per (row, OP_MUL_MM_I8_G consecutive K): q = round(x/s),
-// s = amax/127, after a Walsh-Hadamard transform of each group (i8_wht128, same on both sides, so the dot product is
-// kept). the NAX int8 matmul accumulates a group in int32, which is then folded into the f32 accumulators
-// with s_a(m, g)*s_w(n, g). scales are stored group-major: s[g*rows + row]
+// int8 NAX mat-mat: symmetric int8 with one scale per (row, OP_MUL_MM_I8_G values of K), after a Walsh-Hadamard transform of each group
+// the scales are stored group-major: s[g*rows + row]
 
-// f32 activations -> int8 rows [M][K] + scales [K/G][M]; one simdgroup per group of 128 (32 lanes x float4)
+// f32 activations -> int8 rows [M][K] + scales [K/G][M], one simdgroup per group
 kernel void kernel_mul_mm_q8a_f32(
         constant ggml_metal_kargs_mul_mm_q8a & args,
         device const char   * src1,
@@ -330,8 +327,7 @@ kernel void kernel_mul_mm_q8a_f32(
     }
 }
 
-// quantized weights -> dequantized -> int8 rows [N][K] + scales [K/G][N]; one simdgroup per group of 128:
-// lane l dequantizes the 16-value chunk l/4 and keeps its row l%4 (4 values)
+// quantized weights -> int8 rows [N][K] + scales [K/G][N], one simdgroup per group
 template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread float4x4 &)>
 kernel void kernel_mul_mm_dq_i8(
         constant ggml_metal_kargs_mul_mm_dq_i8 & args,

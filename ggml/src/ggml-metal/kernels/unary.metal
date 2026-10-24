@@ -285,8 +285,7 @@ typedef decltype(kernel_swiglu<float>) kernel_swiglu_t;
 template [[host_name("kernel_swiglu_f32")]] kernel kernel_swiglu_t kernel_swiglu<float>;
 template [[host_name("kernel_swiglu_f16")]] kernel kernel_swiglu_t kernel_swiglu<half>;
 
-// f32 inputs, output quantized for the int8 NAX mat-mat: int8 rows + one scale per (row, OP_MUL_MM_I8_G), scales
-// group-major (see kernel_mul_mm_q8a_f32); one simdgroup per group of 128
+// output quantized for the int8 NAX mat-mat, in the layout of kernel_mul_mm_q8a_f32
 kernel void kernel_swiglu_q8a(
         constant ggml_metal_kargs_glu & args,
         device const char * src0,

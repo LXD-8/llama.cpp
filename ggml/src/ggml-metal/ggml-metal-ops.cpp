@@ -2800,8 +2800,8 @@ static void ggml_metal_op_mul_mat_nax_dispatch(ggml_metal_op_t ctx, const ggml_t
     }
 }
 
-// int8 NAX mat-mat: quantize the activations and the (dequantized) weights to int8 with per-128 scales, then run the
-// int8 kernel. layout of the extra buffer (within the f16 reservation): [act i8][act scales] | [w i8][w scales]
+// int8 NAX mat-mat: quantize both operands to int8 with one scale per 128 values, then multiply
+// extra buffer layout: [act i8][act scales] | [w i8][w scales]
 static int ggml_metal_op_mul_mat_nax_i8(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -3210,6 +3210,7 @@ static bool ggml_metal_op_mul_mat_use_f16_act(const ggml_tensor * op, bool has_t
 }
 
 // the weights the NAX mat-mat multiplies in int8: the quantized formats, K a multiple of the scale group
+// GGML_METAL_MM_I8_DISABLE keeps them on the f16 operands, which are more accurate
 static bool ggml_metal_op_mul_mat_i8_type(const ggml_tensor * op) {
     static const bool disabled = getenv("GGML_METAL_MM_I8_DISABLE") != nullptr; // read once per process
 
@@ -3271,7 +3272,6 @@ static bool ggml_metal_op_mul_mat_use_nax(const ggml_tensor * op, bool has_tenso
     return ggml_metal_op_mul_mat_use_f16_act(op, has_tensor) && ggml_metal_op_mul_mat_nax_shape(op);
 }
 
-// int8 operands for the NAX mat-mat (prefill +27% on Qwen3.8-27B, KL divergence to upstream 0.0007); GGML_METAL_MM_I8_DISABLE=1 turns it off
 static bool ggml_metal_op_mul_mat_use_i8(const ggml_tensor * op, bool has_tensor) {
     return ggml_metal_op_mul_mat_i8_type(op) && ggml_metal_op_mul_mat_use_nax(op, has_tensor);
 }
