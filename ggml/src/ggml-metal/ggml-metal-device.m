@@ -1993,8 +1993,8 @@ struct ggml_metal_buffer {
     bool is_shared;
     bool owned;
 
-    // the data is still all zeros as handed out by vm_allocate: nothing has been written to the buffer or bound to a
-    // GPU command since. a clear to zero can then be skipped instead of touching every page (e.g. a 16 GiB KV cache)
+    // the data is still all zeros from vm_allocate: nothing wrote to the buffer or bound it to a GPU command since
+    // a clear to zero can then be skipped, instead of touching every page
     atomic_bool is_zero;
 
     // multiple buffers are used only to avoid the maximum buffer size limitation when using mmap
@@ -2080,13 +2080,10 @@ static bool ggml_metal_buffer_rset_init(ggml_metal_buffer_t buf, bool request) {
     return true;
 }
 
-// the first residency request maps every page of the buffer for the GPU: ~0.4 s for a fresh 16 GiB KV cache (M5 Max).
-// for a buffer that has not been touched yet it runs in the background and the set joins the keep-alive collection after,
-// so that the keep-alive loop does not hold the collection lock meanwhile. GGML_METAL_RSET_ASYNC_DISABLE turns this off
+// the first residency request maps every page of the buffer for the GPU, which takes long for a large fresh buffer
+// for an untouched buffer it runs in the background, and the set joins the keep-alive collection after it
 static bool ggml_metal_buffer_rset_async(ggml_metal_buffer_t buf) {
-    const bool disabled = getenv("GGML_METAL_RSET_ASYNC_DISABLE") != NULL;
-
-    return !disabled && buf->is_shared && atomic_load_explicit(&buf->is_zero, memory_order_relaxed);
+    return buf->is_shared && atomic_load_explicit(&buf->is_zero, memory_order_relaxed);
 }
 
 static void ggml_metal_buffer_rset_add(ggml_metal_buffer_t buf, bool async) {
@@ -2166,7 +2163,7 @@ ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size,
         res->all_data = ggml_metal_host_malloc(size_aligned);
         res->is_shared = true;
 #if TARGET_OS_OSX
-        atomic_init(&res->is_zero, getenv("GGML_METAL_CLEAR_SKIP_DISABLE") == NULL);
+        atomic_init(&res->is_zero, true);
 #endif
     } else {
         // use virtual address
