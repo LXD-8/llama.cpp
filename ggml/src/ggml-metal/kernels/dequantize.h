@@ -419,9 +419,7 @@ void dequantize_nvfp4_t4(device const block_nvfp4 * xb, short il, thread type4 &
     reg[3] = d * kvalues_mxfp4_f[(q[3] >> shr) & 0x0F];
 }
 
-// TQ1_0: base-3 digits, 5 per byte in qs and 4 per byte in qh (value = digit - 1, times d); the digit n of a byte b is
-// ((uint8_t) (b*3^n)*3) >> 8. values 0..159: qs[0..31], digit n = v/32; 160..239: qs[32..47], digit n = (v-160)/16;
-// 240..255: qh[0..3], digit n = (v-240)/4. il selects 16 consecutive values
+// TQ1_0: base-3 digits as in the CPU reference, digit n of a byte b is ((uint8_t) (b*3^n)*3) >> 8; il selects 16 values
 template <typename type4x4>
 void dequantize_tq1_0(device const block_tq1_0 * xb, short il, thread type4x4 & reg) {
     const float d = xb->d;
