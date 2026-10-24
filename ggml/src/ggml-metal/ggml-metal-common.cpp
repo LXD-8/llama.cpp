@@ -41,16 +41,13 @@ bool ggml_metal_op_mul_mat_use_mm(const struct ggml_tensor * op, bool has_simdgr
            has_simdgroup_mm && ne00 >= 64 && ne11 > 8;
 }
 
-// with the tensor units (M5) the mat-mat kernel beats the per-entry mat-vec kernel from 16 tokens (MoE models with
-// 32 and 128 experts: 1.06-1.9x at 16..31 tokens). GGML_METAL_MM_ID_MIN16_DISABLE keeps 32
+// with the tensor units the mat-mat kernel beats the per-entry mat-vec kernel from 16 tokens
 bool ggml_metal_op_mul_mat_id_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm, bool has_tensor) {
-    static const bool min16_off = getenv("GGML_METAL_MM_ID_MIN16_DISABLE") != nullptr; // read once per process
-
     const int64_t ne00 = op->src[0]->ne[0];
     const int64_t ne02 = op->src[0]->ne[2];
     const int64_t ne21 = op->src[2]->ne[1];
 
-    return has_simdgroup_mm && ne00 >= 64 && ne02 <= 1024 && ne21 >= (has_tensor && !min16_off ? 16 : 32);
+    return has_simdgroup_mm && ne00 >= 64 && ne02 <= 1024 && ne21 >= (has_tensor ? 16 : 32);
 }
 
 // the most src1 rows of the few-row MMA kernels

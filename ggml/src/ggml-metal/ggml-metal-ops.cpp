@@ -3324,18 +3324,14 @@ size_t ggml_metal_op_mul_mat_id_extra_amax(const ggml_tensor * op) {
     return 8 + N_MM_NPART_AMAX*sizeof(float);
 }
 
-// tiles of 64 entries for the tensor mul_mm_id kernel: the weights of an expert are dequantized once per tile instead
-// of once per 32 entries. from 128 entries per expert on average this is faster for every type (M5 Max, 25 types,
-// gemma-4 and gpt-oss expert shapes: +5-35% per mat-mul); below that the half-empty tiles cost more than they save.
-// GGML_METAL_MM_ID_WIDE_DISABLE turns it off
+// tiles of 64 entries for the tensor mul_mm_id kernel, so that the weights of an expert are dequantized half as often
+// they pay off from 128 entries per expert on average
 static bool ggml_metal_op_mul_mat_id_wide(const ggml_tensor * op) {
-    static const bool disabled = getenv("GGML_METAL_MM_ID_WIDE_DISABLE") != nullptr; // read once per process
-
     const int64_t ne02 = op->src[0]->ne[2]; // n_expert
     const int64_t ne20 = op->src[2]->ne[0]; // n_expert_used
     const int64_t ne21 = op->src[2]->ne[1]; // n_token
 
-    return !disabled && ne20*ne21 >= 128*ne02;
+    return ne20*ne21 >= 128*ne02;
 }
 
 int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
