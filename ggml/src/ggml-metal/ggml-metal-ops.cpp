@@ -1997,11 +1997,6 @@ int ggml_metal_op_rwkv(ggml_metal_op_t ctx, int idx) {
 }
 
 bool ggml_metal_op_gated_delta_net_use_lpr(const ggml_tensor * op) {
-    static const bool disabled = getenv("GGML_METAL_GDN_R8_DISABLE") != nullptr; // read once per process
-    if (disabled) {
-        return false;
-    }
-
     const int64_t S_v = op->src[2]->ne[0];
 
     return (S_v == 64 || S_v == 128 || S_v == 256) &&
@@ -2013,8 +2008,7 @@ bool ggml_metal_op_gated_delta_net_use_lpr(const ggml_tensor * op) {
            ((uintptr_t) op->src[0]->data) % 16 == 0 && ((uintptr_t) op->src[1]->data) % 16 == 0;
 }
 
-// 4 lanes per row is the fastest for S_v <= 128 (M5 Max, Qwen3.8-27B prefill: 1.98x vs the 32-lane kernel, 8 lanes 1.87x);
-// S_v = 256 would need 64 state registers per lane with 4 lanes, so it takes 8
+// 4 lanes per row is the fastest for S_v <= 128; S_v = 256 takes 8, since 4 lanes would need 64 state registers each
 int ggml_metal_op_gated_delta_net_lpr(const ggml_tensor * op) {
     return op->src[2]->ne[0] >= 256 ? 8 : 4;
 }

@@ -151,9 +151,8 @@ template [[host_name("kernel_gated_delta_net_f32_1")]] kernel kernel_gated_delta
 template [[host_name("kernel_gated_delta_net_f32_2")]] kernel kernel_gated_delta_net_t kernel_gated_delta_net_impl<2>;
 template [[host_name("kernel_gated_delta_net_f32_4")]] kernel kernel_gated_delta_net_t kernel_gated_delta_net_impl<4>;
 
-// same recurrence with LPR lanes per state row instead of 32: each lane keeps S_v/LPR state elements, so the two
-// per-token dot products need log2(LPR) shuffle steps instead of 5 and the q/k loads are amortized over more state
-// a simdgroup handles 32/LPR rows, the threadgroup NSG simdgroups; only for G == 1 and 16-byte aligned q/k
+// same recurrence with LPR lanes per state row instead of 32, so the per-token dot products need fewer shuffles
+// only for G == 1 and 16-byte aligned q/k
 template<short SV, short NSG, short LPR>
 kernel void kernel_gated_delta_net_lpr_impl(
         constant ggml_metal_kargs_gated_delta_net & args,
