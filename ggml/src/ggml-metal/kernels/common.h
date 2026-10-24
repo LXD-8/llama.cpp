@@ -21,8 +21,8 @@ using namespace metal;
 #define FOR_UNROLL(x) _Pragma("clang loop unroll(full)") for (x)
 
 #ifdef GGML_METAL_HAS_TENSOR
-// register fragments of the NAX kernels: a 16x32x16 simdgroup matmul2d on 16x16 fragments, each lane holding rows fm
-// and fm + 8, columns fn .. fn + 3. the layout follows MLX steel/gemm/nax.h (MIT, Apple Inc.)
+// register fragments of the NAX kernels: each lane holds rows fm and fm + 8, columns fn .. fn + 3 of a 16x16 fragment
+// the layout follows MLX steel/gemm/nax.h (MIT, Apple Inc.)
 static inline short2 nax_coord(ushort lane) {
     const short qid = lane >> 2;
     const short fm  = (qid & 4) | ((lane >> 1) & 3);

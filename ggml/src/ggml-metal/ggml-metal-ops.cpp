@@ -2731,12 +2731,8 @@ static int ggml_metal_op_mul_mat_mv(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
-// the register-resident NAX mat-mat dst = src1 * src0^T over the whole M x N grid, with src0 and src1 already in the
-// operand type of the pipeline (row strides ldb and lda in elements). groups of 4 neighbouring src1 tiles run next to
-// each other, so that they share the src0 tile in the cache. long K is split into partitions processed by consecutive
-// dispatches that accumulate into dst, so that the operand slices of a partition stay in the cache while the grid
-// sweeps over them. the int8 pipeline also takes the scales of src0 and src1 (bid_s), and its K steps and partitions
-// are whole scale groups
+// dst = src1 * src0^T on the register-resident NAX kernel, with src0 and src1 already in the operand type of the pipeline
+// long K is split into partitions run by consecutive dispatches that accumulate into dst, so that the operand slices stay in the cache
 static void ggml_metal_op_mul_mat_nax_dispatch(ggml_metal_op_t ctx, const ggml_tensor * op,
         ggml_metal_pipeline_with_params pipeline,
         ggml_metal_buffer_id bid_src0, int32_t ldb,
@@ -3182,9 +3178,7 @@ static int64_t ggml_metal_op_mul_mat_id_max_tiles(const ggml_tensor * op) {
     return n_rows < tiles ? n_rows : tiles;
 }
 
-// the tensor mul_mm kernels are ~1.25x faster with half activations than with f32 ones (M5, Q4_K and Q8_0 prefill
-// shapes), so f32 activations are converted to f16 into the extra buffer first
-// GGML_METAL_MM_F16_ACT_DISABLE turns this off for comparisons
+// the tensor mul_mm kernels are faster with half activations, so f32 activations are first converted to f16 into the extra buffer
 static bool ggml_metal_op_mul_mat_f16_act_shape_any(const ggml_tensor * op) {
     const ggml_tensor * src1 = op->src[1];
 
@@ -3201,32 +3195,20 @@ static bool ggml_metal_op_mul_mat_f16_act_shape(const ggml_tensor * op) {
            (op->src[0]->type != GGML_TYPE_BF16 || ggml_metal_op_mul_mat_nax_shape(op));
 }
 
-// the conversion is an extra dispatch with a barrier on each side, a fixed cost per mul_mm: below 128 src1 rows it
-// costs more than the half activations save (M5, Qwen3.8 27B Q4_K_M: +8-13 ms per step at 17-96 rows, break-even at
-// 128, -4% at 256), and so it does for small products (below 4 GFLOP, e.g. the K/V projections at 128-512 rows:
-// gpt-oss-20b pp128 -7%, Llama-3.1-8B Q8_0 -10%). The NAX mat-mat takes f16 activations only, so its shapes always
-// convert. GGML_METAL_MM_F16_ACT_ROWS_128_DISABLE converts at any size
+// the conversion is an extra dispatch with a barrier on each side, which costs more than it saves for small products
+// the NAX mat-mat takes f16 activations only, so its shapes always convert
 static bool ggml_metal_op_mul_mat_f16_act_rows(const ggml_tensor * op) {
-    static const bool disabled = getenv("GGML_METAL_MM_F16_ACT_ROWS_128_DISABLE") != nullptr; // read once per process
-
     const double flop = 2.0*op->src[0]->ne[0]*op->src[0]->ne[1]*ggml_nrows(op->src[1]);
 
-    return disabled || (op->src[1]->ne[1] >= 128 && flop >= 4e9) || ggml_metal_op_mul_mat_nax_shape(op);
+    return (op->src[1]->ne[1] >= 128 && flop >= 4e9) || ggml_metal_op_mul_mat_nax_shape(op);
 }
 
 static bool ggml_metal_op_mul_mat_use_f16_act(const ggml_tensor * op, bool has_tensor) {
-    static const bool disabled = getenv("GGML_METAL_MM_F16_ACT_DISABLE") != nullptr; // read once per process
-
-    return has_tensor && !disabled && ggml_metal_op_mul_mat_f16_act_shape(op) &&
+    return has_tensor && ggml_metal_op_mul_mat_f16_act_shape(op) &&
            ggml_metal_op_mul_mat_f16_act_rows(op) &&
            ((uintptr_t) op->src[1]->data) % 16 == 0;
 }
 
-// the extra buffer is only reserved for ops that can actually use it - the check above is a subset of this one,
-// so a conversion that runs always finds the buffer allocated
-// the register-resident NAX mat-mat takes f16 operands only: quantized weights are first dequantized to f16 in the
-// extra buffer (after the converted activations), which pays off once there are enough src1 rows to amortize it
-// GGML_METAL_MM_NAX_DISABLE turns this off for comparisons
 // the weights the NAX mat-mat multiplies in int8: the quantized formats, K a multiple of the scale group
 static bool ggml_metal_op_mul_mat_i8_type(const ggml_tensor * op) {
     static const bool disabled = getenv("GGML_METAL_MM_I8_DISABLE") != nullptr; // read once per process
@@ -3235,6 +3217,7 @@ static bool ggml_metal_op_mul_mat_i8_type(const ggml_tensor * op) {
         op->src[0]->ne[0] % OP_MUL_MM_I8_G == 0;
 }
 
+// the register-resident NAX mat-mat takes f16 operands only, so quantized weights are first dequantized to f16 in the extra buffer
 bool ggml_metal_op_mul_mat_nax_shape(const ggml_tensor * op) {
     const ggml_tensor * src0 = op->src[0];
     const ggml_tensor * src1 = op->src[1];
@@ -3272,17 +3255,10 @@ bool ggml_metal_op_mul_mat_nax_shape(const ggml_tensor * op) {
             return false;
     }
 
-    // the copy of the weights pays off from ~1000 src1 rows with f16 operands (512 rows: 11-13% slower), and from
-    // ~450 rows with the int8 ones of the quantized formats (448-896 rows: +12-47% on 4096x4096 to 28672x8192;
-    // 256-384 rows: -6% to +9%). GGML_METAL_MM_NAX_MIN_ROWS overrides both, e.g. so that test-backend-ops covers the
-    // kernels
-    static const int64_t min_rows_env = getenv("GGML_METAL_MM_NAX_MIN_ROWS") ? atoi(getenv("GGML_METAL_MM_NAX_MIN_ROWS")) : 0;
-    const int64_t min_rows = min_rows_env > 0 ? min_rows_env : ggml_metal_op_mul_mat_i8_type(op) ? 448 : 1024;
+    // the copy of the weights pays off from about 1000 src1 rows with f16 operands, and from about 450 with int8 ones
+    const int64_t min_rows = ggml_metal_op_mul_mat_i8_type(op) ? 448 : 1024;
 
-    // GGML_METAL_MM_NAX_BF16_DISABLE leaves BF16 weights to the upstream f32 path
-    static const bool bf16_disabled = getenv("GGML_METAL_MM_NAX_BF16_DISABLE") != nullptr; // read once per process
-
-    return ggml_metal_op_mul_mat_f16_act_shape_any(op) && !(src0->type == GGML_TYPE_BF16 && bf16_disabled) &&
+    return ggml_metal_op_mul_mat_f16_act_shape_any(op) &&
            src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
            src0->ne[0] % 32 == 0 && src1->ne[1] >= min_rows &&
            (src0->type != GGML_TYPE_F16 || (src0->nb[0] == sizeof(ggml_fp16_t) && src0->nb[1] % 16 == 0)) &&
@@ -3292,9 +3268,7 @@ bool ggml_metal_op_mul_mat_nax_shape(const ggml_tensor * op) {
 }
 
 static bool ggml_metal_op_mul_mat_use_nax(const ggml_tensor * op, bool has_tensor) {
-    static const bool disabled = getenv("GGML_METAL_MM_NAX_DISABLE") != nullptr; // read once per process
-
-    return !disabled && ggml_metal_op_mul_mat_use_f16_act(op, has_tensor) && ggml_metal_op_mul_mat_nax_shape(op);
+    return ggml_metal_op_mul_mat_use_f16_act(op, has_tensor) && ggml_metal_op_mul_mat_nax_shape(op);
 }
 
 // int8 operands for the NAX mat-mat (prefill +27% on Qwen3.8-27B, KL divergence to upstream 0.0007); GGML_METAL_MM_I8_DISABLE=1 turns it off
@@ -3307,18 +3281,15 @@ static size_t ggml_metal_op_mul_mat_extra_act(const ggml_tensor * op) {
 }
 
 size_t ggml_metal_op_mul_mat_extra_f16_act(const ggml_tensor * op, bool has_tensor) {
-    static const bool disabled     = getenv("GGML_METAL_MM_F16_ACT_DISABLE") != nullptr; // read once per process
-    static const bool disabled_nax = getenv("GGML_METAL_MM_NAX_DISABLE")     != nullptr;
-
     assert(op->op == GGML_OP_MUL_MAT);
 
-    if (disabled || !has_tensor || !ggml_metal_op_mul_mat_f16_act_shape(op) || !ggml_metal_op_mul_mat_f16_act_rows(op)) {
+    if (!has_tensor || !ggml_metal_op_mul_mat_f16_act_shape(op) || !ggml_metal_op_mul_mat_f16_act_rows(op)) {
         return 0;
     }
 
     size_t res = ggml_metal_op_mul_mat_extra_act(op);
 
-    if (!disabled_nax && ggml_metal_op_mul_mat_nax_shape(op) && op->src[0]->type != GGML_TYPE_F16) {
+    if (ggml_metal_op_mul_mat_nax_shape(op) && op->src[0]->type != GGML_TYPE_F16) {
         res += GGML_PAD(op->src[0]->ne[0]*op->src[0]->ne[1]*sizeof(ggml_fp16_t), 32);
     }
 

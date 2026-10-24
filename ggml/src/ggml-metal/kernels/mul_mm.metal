@@ -11,8 +11,7 @@ constant bool FC_mul_mm_id_amax [[function_constant(FC_MUL_MM + 6)]];
 constant int32_t FC_mul_mm_id_map0_ne02 [[function_constant(FC_MUL_MM + 7)]];
 constant bool FC_mul_mm_id_wide [[function_constant(FC_MUL_MM + 8)]]; // tiles of 64 entries instead of 32 (tensor kernel)
 
-// converts the f32 activations of a mul_mm to contiguous f16 rows, so that the tensor kernels take half operands
-// values are saturated to the half range - the simdgroup kernels round the activations to half as well
+// converts the f32 activations of a mul_mm to contiguous f16 rows, saturated to the half range
 kernel void kernel_mul_mm_cvt_f32_f16(
         constant ggml_metal_kargs_mul_mm_cvt & args,
         device const char * src1,
@@ -54,8 +53,7 @@ kernel void kernel_mul_mm_dq_f16(
     }
 }
 
-// the quantized weight types of the NAX mat-mat paths (name, block, nl, dequantize); q5_K is listed per path, because
-// the few-row kernel dequantizes it with dequantize_q5_K_nax
+// the quantized weight types of the NAX mat-mat paths; q5_K is listed per path, since the few-row kernel uses dequantize_q5_K_nax
 #define NAX_QTYPES(X) \
     X(q4_0,    block_q4_0,    2,     dequantize_q4_0) \
     X(q4_1,    block_q4_1,    2,     dequantize_q4_1) \
@@ -93,11 +91,8 @@ DQ_F16_INSTANCE(q5_K, block_q5_K, QK_NL, dequantize_q5_K)
 DQ_F16_INSTANCE(bf16, bfloat4x4,  1,     dequantize_bf16)
 #endif
 
-// dst[m][n] = sum_k src1[m][k] * src0[n][k] with f16 or int8 operands loaded straight into registers
-// no threadgroup memory: the BM x BN tile is split across WM x WN simdgroups, each owning a (BM/WM) x (BN/WN) block
-// of 16x16 fragments; the threadgroups are swizzled so that neighbouring ones share src0 rows in the cache
-// int8 (see kernel_mul_mm_q8a_f32): each OP_MUL_MM_I8_G group of K is accumulated in int32 and folded into the f32
-// accumulators with the scales s1 (src1 rows) and s0 (src0 rows); the K ranges are multiples of OP_MUL_MM_I8_G
+// dst[m][n] = sum_k src1[m][k] * src0[n][k] with f16 or int8 operands loaded straight into registers, no threadgroup memory
+// int8: each OP_MUL_MM_I8_G group of K is accumulated in int32, then folded into the f32 accumulators with the scales s1 and s0
 template<typename T, short BM, short BN, short WM, short WN>
 static inline void kernel_mul_mm_nax_impl(
         constant ggml_metal_kargs_mul_mm_nax & args,
