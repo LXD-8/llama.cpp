@@ -2,21 +2,21 @@
 
 [中文](#apple-m5nax上的-llamacpp-metal-优化简略版) | [English](#llamacpp-metal-optimizations-for-apple-m5-nax-short-version)
 
-本项目优化 llama.cpp 的 Metal 后端在 Apple M5 上的性能，目标是让各种模型（稠密、MoE、不同注意力结构）和量化格式都基本达到硬件上限，范围包括预填充、解码、投机解码、并发、短提示、启动和多轮对话缓存。24 项优化，每项一个提交、可单独关闭，基于上游 `master` 的 `dde879bc4f`（b12032）。测试设备：MacBook Pro（Mac17,6），Apple M5 Max，40 核 GPU，128 GB，macOS 27.2。详见[完整报告](metal-m5.md)。
+本项目优化 llama.cpp 的 Metal 后端在 Apple M5 上的性能，目标是让各种模型（稠密、MoE、不同注意力结构）和量化格式都基本达到硬件上限，范围包括预填充、解码、投机解码、并发、短提示、启动和多轮对话缓存。24 项优化，每项一个提交、可单独关闭，基于上游 `master` 的 `785322d17f`（b12033）。测试设备：MacBook Pro（Mac17,6），Apple M5 Max，40 核 GPU，128 GB，macOS 27.2。详见[完整报告](metal-m5.md)。
 
-全部改动开启，与上游、oMLX 对比（满功率，服务器端到端；oMLX 开启 INT8 预填充，两边都关 KV 量化）：
+全部改动开启，与上游、oMLX 对比（满功率，服务器端到端；oMLX 开启 INT8 预填充，两边都关 KV 量化；oMLX 的 MTP 在解码列关闭、投机解码列开启）：
 
 | 模型 | 8k 预填充 t/s：本分支 / 上游 / oMLX | 对上游 | 30k 解码 t/s：本 / 上 / oMLX | 对上游 | 30k 投机解码 t/s：本 / 上 / oMLX |
 |---|---|---|---|---|---|
-| Qwen3.8-27B Q5_K_M | 1101 / 652 / 1101 | 1.69x | 22.8 / 21.9 / 23.4 | 1.04x | 40.8 / 32.9 / 43.7 |
-| gemma-4-26B-A4B Q4_0 | 4211 / 3714 / 4343 | 1.13x | 102.7 / 84.7 / 95.0 | 1.21x | 109.8 / 76.6 / 81.1 |
+| Qwen3.8-27B Q5_K_M | 1086 / 642 / 1128 | 1.69x | 22.5 / 21.7 / 25.0 | 1.04x | 41.2 / 34.5 / 47.1 |
+| gemma-4-26B-A4B Q4_0 | 4054 / 3313 / 4456 | 1.22x | 106.2 / 89.7 / 67.8 | 1.18x | 117.2 / 83.9 / 97.0 |
 
-- 预填充：llama-bench `pp2048` 为上游的 1.5-2.0 倍（Qwen 1.75 倍，gemma 1.14-1.33 倍，深度越大越多）。服务器端到端 8k 提示：Qwen 1.69 倍，gemma 1.13 倍。
-- 解码：短上下文与上游持平（0.99-1.01 倍），长上下文更快：30k 时 Qwen +4%、gemma +21%（H3 的 GQA 打包注意力）。
-- 投机解码与小批量：一步 16-64 个 token 是上游的 1.0-2.7 倍（H4 / M1）；30k 上 Qwen 的 MTP 40.8 对 32.9 t/s，gemma 的 DFlash 109.8 对 76.6 t/s。
+- 预填充：8k 服务器端到端 Qwen 1.69 倍、gemma 1.22 倍；llama-bench `pp8192 @8k` 1.77 / 1.21 倍。
+- 解码：短上下文与上游持平（0.99-1.01 倍），长上下文更快：30k 时 Qwen +4%、gemma +18%（H3 的 GQA 打包注意力）。
+- 投机解码与小批量：一步 16-64 个 token 是上游的 1.0-2.7 倍（H4 / M1）；30k 上 Qwen 的 MTP 41.2 对 34.5 t/s，gemma 的 DFlash 117.2 对 83.9 t/s。
 - 并发（App 的 4 路布局）：2-4 路合计 1.0-1.22 倍，4 路投机解码 Qwen 1.36 倍、gemma 1.18 倍。gemma 单路投机解码 0.97 倍是这一个提示上的接受率差异（0.206 对关闭 A2 门槛时 0.227，提示的数值略有不同导致生成的文本不同），不是内核变慢：这一步里被门槛影响的只有 342 token 的提示预填充。
-- 与 oMLX：预填充 Qwen 持平、gemma 慢 3-9%；解码 gemma 快 8%、Qwen 慢 2-7%；Qwen 的 MTP 在 8k 上 oMLX 明显更快（见第 10 节）。
-- 启动与内存：Qwen 就绪 1.9 对 2.7 s，常驻内存 3.3 对约 21 GB；关闭思考后不再重新处理整段对话。
+- 与 oMLX：8k 预填充 Qwen 慢 4%、gemma 慢 10%；30k 解码（oMLX 关 MTP）Qwen 慢 10%、gemma 快 57%；投机解码 MTP 对 MTP：Qwen 慢 13%、gemma 快 21%。
+- 启动与内存（上一轮）：Qwen 就绪 1.9 对 2.7 s，常驻内存 3.3 对约 21 GB；关闭思考后不再重新处理整段对话。
 - 精度：除 I8 外的改动与上游一致到参照量级；I8 在 gemma 上有可见代价，可单独关闭（第 9 节）。
 
 ## 改动
@@ -67,27 +67,27 @@ MoE 预填充仍比 oMLX 慢 3-9%（按专家分块的 mat-mat 仍明显慢于�
 
 ## 代码与 AI 使用说明
 
-代码在 `LXD-8/llama.cpp` 的 `metal-m5` 分支，基于上游 `master` 的 `dde879bc4f`（b12032），每项改动一个提交。项目目标、测试方法和取舍由我决定；调研、编写代码、测试和撰写文档时使用了 AI 工具，产出经过我人工检查。中文为原文，英文版由 AI 翻译。
+代码在 `LXD-8/llama.cpp` 的 `metal-m5` 分支，基于上游 `master` 的 `785322d17f`（b12033），每项改动一个提交。项目目标、测试方法和取舍由我决定；调研、编写代码、测试和撰写文档时使用了 AI 工具，产出经过我人工检查。中文为原文，英文版由 AI 翻译。
 
 ---
 
 # llama.cpp Metal optimizations for Apple M5 (NAX): short version
 
-This project optimizes the Metal backend of llama.cpp on Apple M5, with the goal that every kind of model (dense, MoE, different attention structures) and weight format runs close to the hardware limit, covering prefill, decode, speculative decoding, concurrency, short prompts, start-up and the multi-turn conversation cache. 24 optimizations on upstream `master` at `dde879bc4f` (b12032), one commit per change, each can be switched off on its own. Test machine: MacBook Pro (Mac17,6), Apple M5 Max, 40-core GPU, 128 GB, macOS 27.2. See the [full report](metal-m5.md).
+This project optimizes the Metal backend of llama.cpp on Apple M5, with the goal that every kind of model (dense, MoE, different attention structures) and weight format runs close to the hardware limit, covering prefill, decode, speculative decoding, concurrency, short prompts, start-up and the multi-turn conversation cache. 24 optimizations on upstream `master` at `785322d17f` (b12033), one commit per change, each can be switched off on its own. Test machine: MacBook Pro (Mac17,6), Apple M5 Max, 40-core GPU, 128 GB, macOS 27.2. See the [full report](metal-m5.md).
 
-All changes on, compared with upstream and oMLX (full power, server end to end; oMLX with INT8 prefill on, KV quantization off on both sides):
+All changes on, compared with upstream and oMLX (full power, server end to end; oMLX with INT8 prefill on, KV quantization off on both sides; oMLX MTP is off for the decode column and on for the speculative column):
 
 | Model | 8k prefill t/s: ours / upstream / oMLX | vs upstream | 30k decode t/s: ours / up / oMLX | vs upstream | 30k speculative decode t/s: ours / up / oMLX |
 |---|---|---|---|---|---|
-| Qwen3.8-27B Q5_K_M | 1101 / 652 / 1101 | 1.69x | 22.8 / 21.9 / 23.4 | 1.04x | 40.8 / 32.9 / 43.7 |
-| gemma-4-26B-A4B Q4_0 | 4211 / 3714 / 4343 | 1.13x | 102.7 / 84.7 / 95.0 | 1.21x | 109.8 / 76.6 / 81.1 |
+| Qwen3.8-27B Q5_K_M | 1086 / 642 / 1128 | 1.69x | 22.5 / 21.7 / 25.0 | 1.04x | 41.2 / 34.5 / 47.1 |
+| gemma-4-26B-A4B Q4_0 | 4054 / 3313 / 4456 | 1.22x | 106.2 / 89.7 / 67.8 | 1.18x | 117.2 / 83.9 / 97.0 |
 
-- Prefill: llama-bench `pp2048` is 1.5-2.0x upstream (Qwen 1.75x, gemma 1.14-1.33x, more at larger depth). Server end to end with an 8k prompt: Qwen 1.69x, gemma 1.13x.
-- Decode: on par with upstream at short context (0.99-1.01x), faster at long context: at 30k Qwen +4%, gemma +21% (H3, the GQA-packed attention).
-- Speculative decoding and small batches: steps of 16-64 tokens are 1.0-2.7x upstream (H4 / M1); at 30k, Qwen MTP 40.8 vs 32.9 t/s, gemma DFlash 109.8 vs 76.6 t/s.
+- Prefill: at 8k end to end, Qwen 1.69x, gemma 1.22x; llama-bench `pp8192 @8k` 1.77 / 1.21x.
+- Decode: on par with upstream at short context (0.99-1.01x), faster at long context: at 30k Qwen +4%, gemma +18% (H3, the GQA-packed attention).
+- Speculative decoding and small batches: steps of 16-64 tokens are 1.0-2.7x upstream (H4 / M1); at 30k, Qwen MTP 41.2 vs 34.5 t/s, gemma DFlash 117.2 vs 83.9 t/s.
 - Concurrency (the app's 4-slot layout): 2-4 streams 1.0-1.22x in total, 4 speculative streams Qwen 1.36x, gemma 1.18x. The 0.97x for a single speculative gemma stream is a difference in acceptance on this one prompt (0.206 vs 0.227 with the A2 gate off, slightly different prompt numerics lead to different generated text), not a slower kernel: the only work the gate touches there is the 342-token prompt prefill.
-- Against oMLX: prefill on par for Qwen, 3-9% slower for gemma; decode 8% faster for gemma, 2-7% slower for Qwen; Qwen MTP at 8k is clearly faster in oMLX (section 10).
-- Start-up and memory: Qwen ready in 1.9 vs 2.7 s, resident memory 3.3 vs about 21 GB; turning thinking off no longer reprocesses the whole conversation.
+- Against oMLX: 8k prefill Qwen 4% slower, gemma 10% slower; 30k decode (oMLX with MTP off) Qwen 10% slower, gemma 57% faster; speculative MTP vs MTP: Qwen 13% slower, gemma 21% faster.
+- Start-up and memory (previous round): Qwen ready in 1.9 vs 2.7 s, resident memory 3.3 vs about 21 GB; turning thinking off no longer reprocesses the whole conversation.
 - Accuracy: the changes other than I8 match upstream to the order of the reference; I8 has a visible cost on gemma and can be switched off alone (section 9).
 
 ## Changes
@@ -138,4 +138,4 @@ MoE prefill is still 3-9% behind oMLX (the per-expert mat-mat is still clearly s
 
 ## Code and use of AI
 
-The code is on the `metal-m5` branch of `LXD-8/llama.cpp`, based on upstream `master` at `dde879bc4f` (b12032), one commit per change. The goals, test methodology and decisions are my own; AI tools were used for research, writing code, testing and writing the documents, and their output was reviewed by me. The Chinese version is the original; the English version was translated by AI.
+The code is on the `metal-m5` branch of `LXD-8/llama.cpp`, based on upstream `master` at `785322d17f` (b12033), one commit per change. The goals, test methodology and decisions are my own; AI tools were used for research, writing code, testing and writing the documents, and their output was reviewed by me. The Chinese version is the original; the English version was translated by AI.
