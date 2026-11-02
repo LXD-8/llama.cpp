@@ -1,495 +1,6 @@
-# Apple M5（NAX）上的 llama.cpp Metal 优化：面向各种模型与量化格式
-
-[中文](#apple-m5nax上的-llamacpp-metal-优化面向各种模型与量化格式) | [English](#llamacpp-metal-optimizations-for-apple-m5-nax-for-every-model-and-weight-format)
-
-中文为原文，英文版由 AI 基于中文版翻译。/ The Chinese version is the original; the English version is an AI translation of it.
-
-本项目优化 llama.cpp 的 Metal 后端在 Apple M5 上的性能，目标是让各种模型（稠密、MoE、不同注意力结构）和各种量化格式都基本达到这台机器的硬件上限。范围包括提示处理（预填充）、解码、投机解码（MTP / DFlash）、并发、短提示、启动和多轮对话缓存。全部改动基于上游 `master` 的 `785322d17f`（b12033）：24 项优化，每项一个提交，每项都可以单独关闭。
-
-下表是全部改动开启时、与上游和 oMLX 的对比（M5 Max，满功率，服务器端到端，流式客户端，temperature 0；oMLX 开启其 INT8 预填充，两边都关闭 KV 量化）：
-
-| 模型 | 8k 预填充 t/s：本分支 / 上游 / oMLX | 对上游 | 30k 解码 t/s：本 / 上 / oMLX | 对上游 | 30k 投机解码 t/s：本 / 上 / oMLX |
-|---|---|---|---|---|---|
-| Qwen3.8-27B Q5_K_M | 1086 / 642 / 1128 | 1.69x | 22.5 / 21.7 / 25.0 | 1.04x | 41.2 / 34.5 / 47.1 |
-| gemma-4-26B-A4B Q4_0 | 4054 / 3313 / 4456 | 1.22x | 106.2 / 89.7 / 67.8 | 1.18x | 117.2 / 83.9 / 97.0 |
-
-"投机解码"一列：Qwen 用模型内置的 MTP 头（`--spec-type draft-mtp --spec-draft-n-max 3`），gemma 用 ggml-org 同一仓库提供的 DFlash 草稿模型（`--spec-type draft-dflash`）；oMLX 两者都用模型自带的 MTP 头。
-
-范围：24 个代码提交，26 个文件，+3374 / -121。23 个在引擎（以 `ggml/src/ggml-metal/` 为主，`common/` 一行，`tests/test-backend-ops.cpp` 增加测试用例），1 个在内置 Web UI（`tools/ui`，即 Llama.app 的界面）。NAX 内核只在支持 Metal tensor API 的设备上生效（默认为 M5 / A19 及更新的芯片），其他设备保持上游路径。除 NVFP4 / TQ1_0 这类格式本身没有单独开关外，每项引擎改动都可以用环境变量关闭，便于 A/B 测试。
-
-测过的模型：Qwen3.8-27B Q5_K_M（稠密，GDN + 全注意力，q5_K / q6_K）、gemma-4-26B-A4B Q4_0（MoE，128 专家选 8，含 head size 512 的全局注意力层）。其余量化格式用 `test-backend-ops` 做了数值校验，并在合成权重上做了内核级计时（第 7 节）。
-
-测试设备：MacBook Pro（Mac17,6），Apple M5 Max：18 核 CPU（6 个超大核 + 12 个性能核）、40 核 GPU、128 GB 统一内存；系统为 macOS 27.2。本文所有数据均在这台机器上测得。
-
-### 关于本项目与 AI 的使用
-
-本项目源于日常使用中的发现：在我的设备上，llama.cpp（Llama.app 的引擎）的预填充和解码明显慢于基于 MLX 的 oMLX。项目目标、调研思路、测试方法以及依据测试结果对方案的取舍，均由我本人决定。调研、编写代码、测试和撰写本文档的过程中使用了 AI 工具，其产出都经过我人工检查。本文档的中文版为原文，英文版由 AI 基于中文版翻译。
-
-目录：
-
-- [1. 为什么做](#1-为什么做)
-- [2. 改动一览](#2-改动一览)
-- [3. 效果](#3-效果)
-- [4. 方法](#4-方法)
-- [5. 调研到的候选方案](#5-调研到的候选方案)
-- [6. 各项结果与取舍](#6-各项结果与取舍)
-- [7. 量化格式](#7-量化格式)
-- [8. 保留项的实现](#8-保留项的实现)
-- [9. 数值精度](#9-数值精度)
-- [10. 剩余差距](#10-剩余差距)
-- [11. 复现](#11-复现)
-- [关于代码](#关于代码)
-
-## 1. 为什么做
-
-在 M5 Max 上，原版 llama.cpp 的 Metal 后端处理提示的速度只有 oMLX 的约 55-70%（例如 Qwen3.8-27B 8k 提示 653 对 1187 t/s），MoE 模型和长上下文下差距更大。实际使用中还有几处明显的损失：投机解码每一步要验证几个 token，这一步比单 token 慢很多；App 默认的 4 路并发，合计吞吐远低于单路的 4 倍；追问、新一轮对话这类短提示落在一段很慢的批次大小上；App 启动后要 3 秒多才出第一个 token，并占用约 21 GB 内存；在界面里关闭思考会让整段对话被重新处理。
-
-M5 这一代在每个 GPU 核心里加入了矩阵单元（NAX，通过 Metal tensor API / MetalPerformancePrimitives 的 `matmul2d` 调用）。MLX 用寄存器常驻的内核驱动它；上游 llama.cpp 只通过一个用 threadgroup 内存分块、以 f32 激活为输入的内核来用它，大部分新增算力没有用上。
-
-目标：
-- 尽可能接近 M5 Max 的硬件上限，在可公平对比的项目上追平或超过 oMLX；
-- 合适的地方借鉴 MLX、oMLX 等 Apple Silicon 引擎的做法，也做出它们都没有的优化；
-- 讲究性价比：单项最终增幅低于 1.5%（噪声级）、却需要复杂验证或大量改动的方案不做；保留的方案用必要最小的改动实现；收益大时允许较大的重构；
-- 只改 Metal 后端（以及外面必要的最少几处），每项改动都可开关、都经过数值验证；
-- 覆盖 Metal 矩阵乘内核支持的全部权重格式，以及稠密、MoE 和各种注意力结构，而不只是测试模型用到的情形。
-
-在本机实测的硬件上限（M5 Max，40 核 GPU，128 GB）：
-
-| | 数值 |
-|---|---|
-| 内存带宽（Apple 规格） | 614 GB/s |
-| 实测可持续带宽 | 530-580 GB/s（随测试内核、传输大小和运行状态浮动） |
-| NAX f16 mat-mat，可达 | ~60 TFLOP/s（MLX 稠密 f16 gemm 59-60；下文 A3 为 59.7） |
-| NAX int8 mat-mat | ~2.1x f16（同样的寄存器常驻内核结构） |
-
-解码受带宽限制：例如 Qwen3.8-27B Q5_K_M 每个 token 读 18.34 GB 权重；本分支单 token 解码中矩阵乘部分的读取速度为 517-540 GB/s，已在可持续带宽范围内，剩下的是注意力和小算子（第 10 节）。
-
-## 2. 改动一览
-
-按分支中的顺序，每项一个提交。"格式"一栏说明矩阵乘类改动作用于哪些权重格式；其余改动与权重格式无关。
-
-| # | 提交 | 改动 | 行数 | 格式 | 开关 |
-|---|---|---|---|---|---|
-| A1 | `a7f094140` | 寄存器常驻的 NAX flash attention（预填充，head size 128 / 256 / 512） | +461 / -9 | -（F16 K/V） | `GGML_METAL_FA_NAX_DISABLE` |
-| A2 | `0a39acbcd` | tensor mul_mm 前的 f32 -> f16 激活转换 | +136 / -7 | F16 与量化格式 | `GGML_METAL_MM_F16_ACT_DISABLE` |
-| A3 | `d42a64b1b` | 反量化到 f16 + 寄存器常驻的 NAX mat-mat，长 K 用 split-K（>= 1024 行） | +397 / -4 | F16 + 23 种量化格式 | `GGML_METAL_MM_NAX_DISABLE` |
-| A4 | `d5346f1aa` | gated delta net 每状态行 4 个 lane | +157 / -2 | - | `GGML_METAL_GDN_R8_DISABLE` |
-| I8 | `87b8d9db5` | int8 NAX mat-mat（每 128 列一个 scale，量化前做 Walsh-Hadamard 变换） | +276 / -7 | 23 种量化格式 | `GGML_METAL_MM_I8_DISABLE` |
-| A5 | `eb3b224e3` | SWIGLU 融合进使用它的 NAX mat-mat | +213 / -7 | 同 A3 | `GGML_METAL_GLU_MM_DISABLE` |
-| S1 | `866581197` | 关闭思考时保留对话缓存（Web UI） | +12 / -1 | - | 界面设置 |
-| S2-a | `9510455c9` | 加载时不对新分配的 KV / 递推状态缓冲区清零 | +44 / -1 | - | `GGML_METAL_CLEAR_SKIP_DISABLE` |
-| K3 | `8d0c74072` | 2-3 行的跨行 mat-vec | +316 / -1 | q4_K（2-3 行）、q5_K（2 行） | `GGML_METAL_MV_XR_DISABLE` |
-| S2-c | `c1506b989` | 新缓冲区的首次驻留请求放到后台 | +44 / -5 | - | `GGML_METAL_RSET_ASYNC_DISABLE` |
-| A2 门槛 | `2ff0114a8` | 128 行且 4 GFLOP 起才做 f16 激活转换 | +9 / -2 | 同 A2 | `GGML_METAL_MM_F16_ACT_ROWS_128_DISABLE` |
-| H3 | `9849c6771` | 共享 KV 头的 query 头打包进一个 NAX 注意力 tile（解码、投机解码验证；head size 128-512） | +411 / -4 | -（F16 K/V） | `GGML_METAL_FA_GQA_DISABLE` |
-| H4 | `9c50c4081` | 2-64 行的 NAX few-row mat-mat | +321 / -10 | few-row 内核支持的全部格式，行数范围见第 7 节 | `GGML_METAL_MV_NAX_DISABLE` |
-| M1 | `be6587734` | MoE mat-mat（MUL_MAT_ID）从 16 个 token 起使用（原为 32） | +9 / -8 | 全部格式 | `GGML_METAL_MM_ID_MIN16_DISABLE` |
-| M2 | `a03983a37` | MoE mat-mat 每块 64 个条目（专家平均 >= 128 个条目时） | +90 / -25 | 全部格式 | `GGML_METAL_MM_ID_WIDE_DISABLE` |
-| A6 | `8768dad0f` | BF16 K/V 缓存的 NAX flash attention（预填充与 GQA，寄存器内转 f16） | +64 / -42 | BF16 | `GGML_METAL_FA_NAX_BF16_DISABLE` |
-| A8 | `9d2cb5214` | BF16 权重的 NAX mat-mat（1024 行起） | +20 / -6 | BF16 | `GGML_METAL_MM_NAX_BF16_DISABLE` |
-| A7 | `7479b2600` | MLA 头尺寸 192/128、576/512 的 NAX flash attention | +34 / -20 | MLA | `GGML_METAL_FA_NAX_MLA_DISABLE` |
-| A9 | `ca8a15013` | NVFP4 / TQ1_0 权重 | +308 / -7 | NVFP4、TQ1_0 | -（格式本身无开关） |
-| H5 | `b70bdbe19` | 量化 K/V 缓存的 NAX GQA 注意力 | +112 / -9 | q4_0 / q4_1 / q5_0 / q5_1 / q8_0 / iq4_nl | `GGML_METAL_FA_GQA_Q_DISABLE` |
-| H3b | `13d9243e1` | GQA 内核：最多 8 个 16 行 tile、行块、运行期 KV 份数 | +105 / -162 | F16 与量化缓存 | `GGML_METAL_FA_GQA_DISABLE` |
-| A3b | `e11f1820d` | int8 的 NAX mat-mat 门槛降到 448 行 | +13 / -9 | int8 路径的量化格式 | `GGML_METAL_MM_NAX_MIN_ROWS` |
-| A5b | `971b41a44` | 融合 GLU 把激活写进 mat-mat 自己的结果（修内存竞争） | +16 / -24 | 同 A3 | `GGML_METAL_GLU_MM_DISABLE` |
-| A10 | `e46a6c395` | BF16 + head size 512 的大 batch 预填充让回 tensor 内核 | +5 / -0 | BF16 | `GGML_METAL_FA_NAX_BF16_DISABLE` |
-| | | **合计** | **+3374 / -121** | | |
-
-## 3. 效果
-
-对 oMLX 的公平原则：凡是本分支的改动在 oMLX 里有同类选项的，oMLX 也打开：其 INT8 激活预填充（与 I8 对应）开启。其余改动（NAX 注意力、NAX mat-mat、GDN 内核、激活融合）对应的是 MLX/oMLX 一直在用、没有开关的路径。KV 缓存量化两边都关闭；不开投机解码的对比两边都关，开的对比两边都开（oMLX 的 MTP 可在模型设置里关闭，测量前切换、测量后恢复并核对）。oMLX 的设置在测量前读出、测量后恢复并核对。oMLX 在单独的时间段测量，所以对 oMLX 的比值是跨时间段的。
-
-端到端：本轮 8k / 30k 提示实测 8,020 / 29,686 token（oMLX 分词不同，token 数略有出入），生成 128 / 256 / 256 token；2k / 16k 与并发、启动的旧数字保留并标注未复测。本分支与上游正序、反序各一轮取均值。llama-bench：`-fa 1`，本轮 8k 预填充用 `-p 8192 -d 8192 -ub 2048`（llama-bench 默认的 512 低于 NAX mat-mat 1024 行的门槛），正反序各一轮。
-
-### 3.1 Qwen3.8-27B Q5_K_M
-
-`Qwen3.8-27B-Q5_K_M.gguf`（19.5 GB；64 层：48 层 gated-delta-net + 16 层全注意力，24 个 query 头共享 4 个 KV 头，head size 256；权重 q5_K 与 q6_K；MTP 头内置在同一文件中）。oMLX 对照 `Qwen3.8-27B-oQ5e-mtp`。
-
-端到端（t/s）：
-
-| t/s | 2k 预填充 | 8k 预填充 | 30k 预填充 | 2k 解码 | 8k 解码 | 30k 解码 |
-|---|---|---|---|---|---|---|
-| 本分支 | 1062* | 1086 | 951* | 26.0* | 24.6* | 22.5 |
-| 上游 | 692* | 642 | 554* | 25.7* | 24.3* | 21.7 |
-| oMLX（关 MTP） | 1018* | 1128 | 974* | 26.5* | 25.8* | 25.0 |
-| 本分支，投机解码 | - | 1069* | 916* | - | 42.7* | 41.2 |
-| 上游，投机解码 | - | 650* | 533* | - | 38.3* | 34.5 |
-| oMLX，MTP | - | 1098 | 915* | - | 57.5* | 47.1 |
-
-\* 本轮只复测 8k 预填充、30k 解码与 30k 投机解码，带 * 的单元格保留上一轮数字。llama-bench `pp8192 @8k`：本分支 1008、上游 569 t/s（1.77 倍）。
-
-预填充与解码（llama-bench，t/s）：
-
-| t/s | pp2048 @0 | pp2048 @8k | pp2048 @32k | pp512 @0 | pp512 @8k | pp512 @32k | tg64 @0 | tg64 @8k | tg64 @32k |
-|---|---|---|---|---|---|---|---|---|---|
-| 本分支 | 1134 | 1018 | 790 | 809 | 723 | 613 | 25.9 | 24.6 | 23.0 |
-| 上游 | 650 | 585 | 451 | 719 | 608 | 469 | 25.9 | 24.3 | 22.0 |
-| 本分支 / 上游 | 1.75x | 1.74x | 1.75x | 1.12x | 1.19x | 1.31x | 1.00x | 1.01x | 1.05x |
-
-每步耗时（llama-bench，深度 0，ms/步；一步 2-64 个 token 对应投机解码验证、几路并发和短提示）：
-
-| 每步 token | 1 | 2 | 4 | 8 | 16 | 24 | 32 | 48 | 64 | 96 |
-|---|---|---|---|---|---|---|---|---|---|---|
-| 本分支 | 38.9 | 42.5 | 51.2 | 51.0 | 56.0 | 74.4 | 82.1 | 132.2 | 145.2 | 220.9 |
-| 上游 | 38.8 | 55.8 | 56.8 | 56.2 | 90.4 | 195.9 | 195.6 | 201.7 | 207.3 | 223.9 |
-| 上游 / 本分支 | 1.00x | 1.31x | 1.11x | 1.10x | 1.61x | 2.63x | 2.38x | 1.53x | 1.43x | 1.01x |
-
-并发（合计解码 t/s）：
-
-| 并发路数 | 1 | 2 | 3 | 4 | 1，投机解码 | 4，投机解码 |
-|---|---|---|---|---|---|---|
-| 本分支 | 26.1 | 42.6 | 54.1 | 67.7 | 37.6 | 101.6 |
-| 上游 | 26.0 | 34.9 | 48.8 | 61.1 | 35.0 | 74.6 |
-| 本分支 / 上游 | 1.00x | 1.22x | 1.11x | 1.11x | 1.08x | 1.36x |
-
-App 启动（App 的参数：262k 上下文、mmproj、MTP、`--fit-target 1024`）：本分支就绪 1.9 s、首个请求 TTFT 0.24 s，上游 2.7 s / 0.33 s；两个请求后的常驻内存（不含 mmap 的权重文件）本分支 3.3 GB，上游约 21 GB。两边的贪心输出逐字节相同。
-
-### 3.2 gemma-4-26B-A4B Q4_0
-
-`gemma-4-26B-A4B-it-Q4_0.gguf`（ggml-org，14.6 GB；30 层 MoE，128 个专家每 token 选 8 个，另有共享的稠密 FFN；滑动窗口层 head size 256，全局层 head size 512）。投机解码用同一仓库的 `dflash-gemma-4-26B-A4B-it-Q8_0.gguf`。oMLX 对照 `gemma-4-26B-A4B-it-oQ4e-mtp`。
-
-| t/s | 2k 预填充 | 8k 预填充 | 30k 预填充 | 2k 解码 | 8k 解码 | 30k 解码 |
-|---|---|---|---|---|---|---|
-| 本分支 | 3869* | 4054 | 3354* | 121.4* | 114.9* | 106.2 |
-| 上游 | 3521* | 3313 | 2703* | 120.0* | 108.1* | 89.7 |
-| oMLX（关 MTP） | 3588* | 4456 | 3522* | 113.4* | 109.0* | 67.8 |
-| 本分支，投机解码 | - | 3893* | 3151* | - | 117.4* | 117.2 |
-| 上游，投机解码 | - | 3439* | 2564* | - | 109.3* | 83.9 |
-| oMLX，MTP | - | 4412 | 3534* | - | 107.0* | 97.0 |
-
-\* 本轮只复测 8k 预填充、30k 解码与 30k 投机解码，带 * 的单元格保留上一轮数字。llama-bench `pp8192 @8k`：本分支 3820、上游 3144 t/s（1.21 倍）。oMLX 的 `gemma-4-26B-A4B-it-oQ4e-mtp` 关闭 MTP 后 30k 解码为 67.8，开启 MTP 为 97.0。
-
-| t/s | pp2048 @0 | pp2048 @8k | pp2048 @32k | pp512 @0 | pp512 @8k | pp512 @32k | tg64 @0 | tg64 @8k | tg64 @32k |
-|---|---|---|---|---|---|---|---|---|---|
-| 本分支 | 5218 | 4204 | 2613 | 4274 | 3359 | 2161 | 127.6 | 113.5 | 102.0 |
-| 上游 | 4567 | 3548 | 1958 | 4164 | 3220 | 1913 | 126.9 | 108.5 | 86.3 |
-| 本分支 / 上游 | 1.14x | 1.18x | 1.33x | 1.03x | 1.04x | 1.13x | 1.01x | 1.05x | 1.18x |
-
-| 每步 token | 1 | 2 | 4 | 8 | 16 | 24 | 32 | 48 | 64 | 96 |
-|---|---|---|---|---|---|---|---|---|---|---|
-| 本分支 | 8.1 | 10.1 | 12.2 | 15.7 | 22.4 | 24.1 | 26.2 | 33.7 | 35.5 | 54.9 |
-| 上游 | 8.2 | 10.1 | 12.2 | 15.5 | 24.9 | 45.6 | 41.9 | 46.0 | 48.2 | 53.9 |
-| 上游 / 本分支 | 1.00x | 1.00x | 1.00x | 0.99x | 1.11x | 1.89x | 1.60x | 1.36x | 1.36x | 0.98x |
-
-| 并发路数 | 1 | 2 | 3 | 4 | 1，投机解码 | 4，投机解码 |
-|---|---|---|---|---|---|---|
-| 本分支 | 122.9 | 190.7 | 261.9 | 321.2 | 98.9 | 202.6 |
-| 上游 | 122.4 | 189.9 | 262.3 | 311.3 | 102.3 | 171.0 |
-| 本分支 / 上游 | 1.00x | 1.00x | 1.00x | 1.03x | 0.97x | 1.18x |
-
-App 启动：本分支就绪 2.2 s，上游 2.3 s。
-
-### 3.3 小结
-
-- 预填充：本轮 8k 预填充服务器端到端 Qwen 1.69 倍、gemma 1.22 倍；llama-bench `pp8192 @8k` 为 1.77 / 1.21 倍（上一轮 `pp2048` 为 1.5-2.0 倍）。
-- 解码：短上下文与上游持平（0.99-1.01 倍），长上下文更快：30k 时 Qwen +4%、gemma +18%（H3 的 GQA 打包注意力）。
-- 投机解码与小批量：一步 16-64 个 token 是上游的 1.0-2.7 倍（H4 / M1）；30k 上 Qwen 的 MTP 41.2 对 34.5 t/s，gemma 的 DFlash 117.2 对 83.9 t/s。
-- 并发（App 的 4 路布局）：2-4 路合计 1.0-1.22 倍，4 路投机解码 Qwen 1.36 倍、gemma 1.18 倍。gemma 单路投机解码 0.97 倍是这一个提示上的接受率差异（0.206 对关闭 A2 门槛时 0.227，提示的数值略有不同导致生成的文本不同），不是内核变慢：这一步里被门槛影响的只有 342 token 的提示预填充。
-- 与 oMLX：8k 预填充 Qwen 慢 4%、gemma 慢 10%；30k 解码（oMLX 关 MTP）Qwen 慢 10%、gemma 快 57%；投机解码 MTP 对 MTP：Qwen 慢 13%（41.2 对 47.1）、gemma 快 21%（117.2 对 97.0）。
-- 启动与内存（上一轮）：Qwen 就绪 1.9 对 2.7 s，常驻内存 3.3 对约 21 GB；关闭思考后不再重新处理整段对话。
-- 精度：除 I8 外的改动与上游一致到参照量级；I8 在 gemma 上有可见代价，可单独关闭（第 9 节）。
-
-## 4. 方法
-
-- **先算差距账。** 动手之前，先用调试开关逐类跳过算子，测出每类算子的耗时并与硬件上限比较；只处理上限明显高于 1.5% 的部分。例如 gemma 的 MoE 预填充大部分时间在专家矩阵乘（MUL_MAT_ID）上，这一部分只跑到稠密路径一半的算力，M1 / M2 由此而来。
-- **先筛选，再确认。** 受算力限制的候选先在合成权重上做内核级 A/B（同一进程内交错），增幅超过 1.5% 且多轮方向一致才进入真实模型测量。保留的方案全部在满功率（`powermode 0`）下确认，本文所有数字都是满功率数据。
-- **交错测量。** 不同场次之间绝对数值会随发热状态漂移 5-15%。每次对比都在同一场次里按正序再反序运行各配置，只比较同一场次内的比值。测试之间间隔 2 分钟；漂移过大的测试段作废重测。
-- **按留一法取舍。** 一项改动看的是它在最终组合中的贡献（全部开启减去这一项），而不只是单独开启时的效果。
-- **按格式、按形状逐一验证。** 矩阵乘类改动对每一种权重格式分别在合成权重上做内核级 A/B（稠密：17408x5120 与 5120x17408；MoE：gemma-4 的专家形状），只对确实更快的格式和行数范围开启；同时比对两条路径的输出校验和。
-- **按模型结构验证。** 注意力类改动在 Qwen 与 gemma 的结构上测：每个 KV 头对应 6 / 8 个 query 头，head size 128 / 256 / 512。某个结构上变慢的情形用门槛排除（例如 H3 对每 KV 头 4 个 query 头的单 token 解码）。
-- **精度把关。** 每个模型都以上游的完整 logits 为基准测 KL 散度（逐 token 配对比较，比困惑度灵敏得多），并以上游自身 `-fa on` 与 `-fa off` 之间的差作为"正常数值差异"的参照；有损的改动要么改进到参照量级附近，要么写明代价并可单独关闭（见第 9 节）。
-- **固定提示。** 投机解码的速度取决于生成文本接受了多少草稿；对单项改动的端到端对比使用固定提示，并确认输出文本相同后再比较耗时。
-- **上游核查。** 每次都在上游 `master` 上重建并重新测量；本文基于 `785322d17f`（b12033）。
-
-## 5. 调研到的候选方案
-
-调研来源：MLX（steel attention / gemm NAX 内核、`gated_delta` 内核、`gather_qmm`）、oMLX 0.7.1、uzu、BaseRT、MTPLX、dflash-mlx、mlx-dspark、vllm-mlx、mlx-vlm、FastVLM、llama.cpp 自己的 CUDA 后端（MMQ），以及 llama.cpp 的服务器和 Web UI 代码。
-
-| 方面 | 候选方案 | 来源 | 结局 |
-|---|---|---|---|
-| 预填充注意力 | 寄存器常驻的 NAX flash attention | MLX `steel_attention_nax` | 保留（A1） |
-| 预填充矩阵乘 | tensor mat-mat 使用 half 激活 | 自研 | 保留（A2） |
-| 预填充矩阵乘 | 寄存器常驻的 NAX mat-mat，长 K 用 split-K | MLX `steel_gemm_fused_nax` / split-K | 保留（A3） |
-| 预填充 GDN | 递推每状态行用更少的 lane | oMLX `gated_delta_pipelined` | 保留（A4） |
-| 预填充矩阵乘 | INT8 激活 mat-mat | CUDA MMQ、uzu、oMLX oq_a8 | 保留（I8） |
-| 预填充 | 激活直接写成下一个 mat-mat 的输入格式 | 自研 | 保留（A5） |
-| 多轮缓存 | 关闭思考时不改变渲染出的提示 | 自研 | 保留（S1） |
-| 启动 | 加载时不清零新分配的 KV / 递推状态 | 自研 | 保留（S2-a） |
-| 启动 | 首次驻留请求放到后台 | 自研 | 保留（S2-c） |
-| 并发 / 投机解码 | 2-3 行的跨行 mat-vec | 自研 | 保留（K3） |
-| 短提示 | 小批次不做 f16 激活转换 | A2 的后续 | 保留（A2 门槛） |
-| 投机解码 / 长上下文 | 共享 KV 头的 query 头打包进一个 NAX 注意力 tile | MLX 多行注意力的思路，自研 | 保留（H3） |
-| 并发 / 投机解码 / 短提示 | 2-64 行在 NAX 上做矩阵乘，所有格式共用一个内核 | 自研，基于上游 few-row MMA | 保留（H4） |
-| MoE 短批次 | MoE mat-mat 的使用门槛 | 自研 | 保留（M1） |
-| MoE 预填充 | 每块更多条目，减少专家权重的反量化次数 | MLX `gather_qmm` 按专家分段的思路 | 保留（M2） |
-
-不在本项目范围内：KV 量化（turboquant）、GPU 采样、MTL4 命令编码、媒体缓存。
-
-## 6. 各项结果与取舍
-
-取舍规则：单项增幅在多轮中方向一致且超过 1.5%；作为其他显著优化前提的改动除外。
-
-### 6.1 预填充，稠密模型（Qwen3.8-27B Q5_K_M，llama-bench `-fa 1 -ub 2048`，8k 上下文下 pp2048）
-
-"单独" = 只开这一项、其余全关（A3 依赖 A2；I8 依赖 A2 和 A3；A5 依赖 A3）。"留一法" = 全部开启、只关这一项。正反序两轮，按每轮内的比值取均值。
-
-| # | 单独（相对全关） | 留一法 |
-|---|---|---|
-| A1 | +4.5% | +3.5% |
-| A2 | +12.1% | （A3/I8 的前提） |
-| A3 | 相对 A2 +10.9% | （I8 的前提） |
-| A4 | +1.8% | +3.4% |
-| I8 | 相对 A2+A3 +26.2% | +32.2% |
-| A5 | 相对 A2+A3 +0.4% | +2.7% |
-| **全部开启** | **上游的 1.73 倍** | |
-
-A4 单独开启只有 +1.8%，在完整组合中为 +3.4%：其他部分变快后，GDN 在总时间中的占比变大。A5 同理。
-
-内核级（同进程交错 A/B，2048 行）：
-- A1：flash attention q2048 x kv8192 21.6 -> 11.8 ms，kv32768 100 -> 55 ms（对比上游 tensor-API 内核）。
-- A3：f16 GEMM 17408x5120 7.1 -> 6.1 ms（59.7 TFLOP/s，与 MLX 稠密 f16 NAX gemm 持平）；量化格式 gate/up 形状 +8-17%，down 形状（K = 17408，split-K）+15-22%。
-- A4：GDN 每 2048 token 192 -> 97 ms。
-- I8：每个 mat-mat 上 int8 路径是 f16 NAX 路径的 1.3 倍（纯 int8 NAX 吞吐为 f16 的 2.1 倍）。
-
-### 6.2 注意力结构与 MoE（A1 / H3 的扩展，M1，M2）
-
-| 项 | 模型 | 效果（开 vs 关） |
-|---|---|---|
-| A1 扩展到 head size 512 | gemma-4-26B-A4B | pp2048 @0 / @8k / @32k：+0.4% / +3.4% / +12% |
-| H3（解码，2k / 8k / 16k / 32k） | Qwen3.8-27B（每 KV 头 6 个 query 头） | +5% / +3% / +6% / +8% |
-| | gemma-4-26B-A4B（8 个） | +1.5% / +6% / +9% / +18% |
-| H3（4 token 的一步，即投机解码验证） | Qwen / gemma | +6% 至 +55%（2k-32k），32k 时 1.2-2.0 倍 |
-| M1（一步 16 / 20 / 24 / 28 token） | gemma-4-26B-A4B | +6% / +14% / +23% / +30% |
-| | gemma-4-26B-A4B | 0 / +4.5% / +5~9% / +3~4% |
-
-- M1：上游在 32 个 token 以下对每个（token, 专家）条目各读一遍专家权重；改用 mat-mat 后每块最多 32 个条目共用一次读取。12 token 时两个模型方向相反（-3% / +7%），所以门槛定在 16。
-- M2：上游的 MoE mat-mat 每块最多 32 个条目，每块都要把专家权重反量化一次。每专家平均 128 个条目及以上时，64 条目的块对全部 25 种格式、三种专家形状都更快（+5~35%，第 7.3 节）；条目更少时半空的块得不偿失，所以只在此时启用。gemma 的 pp1024（每专家 64 个条目）低于门槛，保持原样。
-
-### 6.3 解码与服务路径（Qwen3.8-27B Q5_K_M）
-
-| # | 效果（开 vs 关） | 测法 |
-|---|---|---|
-| S1 | 7k token 对话关闭思考后需要重新处理的 token：7330 -> 4（预填充 38.3 s -> 0.37 s） | Qwen3.8 的聊天模板，功能性改动 |
-| S2-a | 就绪 2.96 -> 2.03 s（-31%）；常驻内存 21 GB -> 3.3 GB | App 参数，各 2 次 |
-| S2-c | 就绪 2.24 -> 2.01 s（-10%） | 同上 |
-| K3 | 每步耗时：2 行 57.7 -> 42.5 ms（+36%），3-32 行 +3-5% | llama-bench，正反序 |
-| H4 | 每步耗时：12 / 16 / 24 / 32 / 48 / 64 行 90.9 / 93.5 / 200.3 / 199.3 / 201 / 207 -> 52.8 / 56.0 / 74.3 / 82.0 / 132 / 145 ms；2-8 行 +5-16% | 同上 |
-| H3 | 开 MTP 解码：30k 27.9 -> 31.2 t/s（+11.9%），8k 26.3 -> 27.5（+4.8%）；输出文本逐字节相同 | 固定提示，正反序各 2 轮 |
-| A2 门槛 | 128 行以下保持 f32 激活，避免额外的转换派发；每步耗时 12-96 行快 2-6% | llama-bench |
-| 并发（K3：2 路；H4：4 路开 MTP） | 2 路 +18%（K3），4 路开 MTP +42%（H4 与 H3） | 同一轮次内的比值 |
-
-S2-c 依赖 S2-a：清零会触碰页面，缓冲区就不再是"新的"，所以只关 S2-a 时 S2-c 不起作用。K3 与 H4 按格式和行数分工（第 7 节）：q5_K 在 2 行走 K3，3 行起走 H4。
-
-### 6.4 其余改动的数据
-
-以下改动的效果数据来自各自的测量（提交说明），测于同一台机器。
-
-- **A6 BF16 K/V 的 NAX 注意力**：预填充和 GQA 内核直接读 BF16 缓存、在寄存器里转成 f16（钳到 f16 范围）；与 F16 缓存 logits 的 KL 为 Qwen 0.00054、gemma 0.056，与同一 BF16 缓存上的 tensor 内核同量级。
-- **A8 BF16 权重的 NAX mat-mat**：1024 行起把权重转一次 f16 后走 NAX，不使用 int8 变体。
-- **A7 MLA 形状 192/128、576/512 的 NAX 注意力**：K、V 头维分别拆分；GQA 内核仍只做等头尺寸。
-- **A9 NVFP4 / TQ1_0 权重**：这两种格式原先在 Metal 上回退到 CPU；现在覆盖 mat-vec、few-row MMA、mat-mat、MoE mat-mat 和 NAX 路径，test-backend-ops 新增 58 / 78 个用例。
-- **H5 量化 K/V 缓存的 GQA 注意力**：q4_0 / q4_1 / q5_0 / q5_1 / q8_0 / iq4_nl 缓存按原格式读、在寄存器内反量化；q8_0 缓存 tg64 @32k：gemma 93.3 对 vec 内核 73.0。
-- **H3b GQA 内核重写**：每个 threadgroup 最多 8 个 16 行 tile（head size 512 为 4），沿网格分块，KV 份数在运行期取 min(32, 1024/ne01)；16 token 一步 @32k：gemma 188 -> 427 t/s。
-- **A3b int8 门槛降到 448 行**：448-896 行每个 mat-mul +12-47%。
-- **A5b 融合 GLU 写回原位**：激活写进 mat-mat 自己的 f32 结果，消除与 gate/up 释放后的内存竞争。
-- **A10 BF16 + head size 512 + 超过 32 个 query 的预填充**让回 tensor 内核：gemma pp2048 在 8k / 32k 上下文下上游快 6% / 16%。
-
-## 7. 量化格式
-
-### 7.1 各改动覆盖的格式
-
-- **与权重格式无关**：A1、H3（注意力，只看 F16 K/V）、A4（GDN）、A2 与 A2 门槛（激活转换）、S1、S2-a、S2-c。
-- **A3 / I8 / A5（>= 1024 行的预填充）**：F16 与 23 种量化格式：q4_0、q4_1、q5_0、q5_1、q8_0、q1_0、q2_0、mxfp4、q2_K、q3_K、q4_K、q5_K、q6_K、iq1_s、iq1_m、iq2_xxs、iq2_xs、iq2_s、iq3_xxs、iq3_s、iq4_nl、iq4_xs、tq2_0（I8 不含 F16）。权重先经各格式的反量化函数转成 f16，所以每种格式只需要一个反量化实例。
-- **M1 / M2（MoE）**：上游 MoE mat-mat 支持的全部格式；M2 在 25 种格式上逐一测过（第 7.3 节）。
-- **H4（2-64 行）**：few-row 内核支持的全部 26 种格式（上面 23 种加 f32、f16、bf16），按格式和行数开启：
-
-| 行数 | 开启的格式 |
-|---|---|
-| 33-64 | 按格式的上限：64（q4_0、q4_1、q5_0、q5_1、q8_0、q2_K、q4_K、q5_K、q6_K、f16、bf16、tq2_0、q1_0、q2_0），56（mxfp4、iq4_nl、iq4_xs、iq2_xxs、iq2_s），48（q3_K、iq3_xxs、iq3_s、iq1_s），40（iq2_xs、iq1_m）；f32 不开 |
-| 17-32 | 全部 26 种 |
-| 9-16 | 全部量化格式（f32 / f16 / bf16 不更快，保持原路径） |
-| 2-8 | iq 系列、q1_0、q2_0（2 行起）；q2_K、tq2_0、q5_K（3 行起）；q6_K（2-4 行） |
-
-- **K3（2-3 行）**：q4_K（2-3 行）、q5_K（2 行）。
-
-### 7.2 稠密矩阵乘的内核级数据（合成权重，M5 Max，满功率，相对原路径的速度比）
-
-| 格式 | 2-8 行：H4 / 原路径 | 9-16 行：H4 / MMA | 17-32 行：H4 / mat-mat | 33-64 行：H4 / mat-mat | 2048 行：A3+I8 / mat-mat |
-|---|---|---|---|---|---|
-| f32 | 0.99-1.01x | 1.01-1.02x | 1.10-1.14x | - | - |
-| f16 | 0.97-0.99x | 0.98x | 1.60-1.62x | 1.11-1.38x | 原有覆盖 |
-| bf16 | 0.99-1.00x | 0.97-0.99x | 1.63-1.68x | 1.19-1.50x | - |
-| q1_0 | 1.01-1.56x | 2.13-2.41x | 2.67-3.32x | 1.42-1.96x | 1.42x |
-| q2_0 | 1.16-1.49x | 2.17-2.28x | 2.65-3.06x | 1.43-1.79x | 1.44x |
-| q4_0 | 1.00-1.17x | 1.64-1.74x | 2.35-3.11x | 1.35-1.74x | 原有覆盖 |
-| q4_1 | 0.99-1.22x | 1.58-1.62x | 2.27-2.89x | 1.27-1.77x | 原有覆盖 |
-| q5_0 | 0.92-1.00x | 1.71-1.72x | 2.27-2.56x | 1.23-1.48x | 原有覆盖 |
-| q5_1 | 0.94-1.02x | 1.62-1.66x | 2.17-2.44x | 1.17-1.42x | 原有覆盖 |
-| q8_0 | 0.92-0.93x | 1.09-1.13x | 1.90-2.16x | 1.21-1.46x | 原有覆盖 |
-| mxfp4 | 0.94-1.02x | 1.56-1.58x | 1.88-2.23x | 1.07-1.26x | 1.41x |
-| q2_K | 0.93-1.40x | 1.77-2.04x | 2.38-2.91x | 1.35-1.63x | 1.46x |
-| q3_K | 0.91-1.12x | 1.69-1.73x | 1.63-1.93x | 1.01-1.09x | 1.49x |
-| q4_K | 0.80-1.04x | 1.48-1.49x | 2.13-2.52x | 1.23-1.45x | 原有覆盖 |
-| q5_K | 0.88-1.22x | 1.62-1.74x | 1.92-2.37x | 1.14-1.37x | 原有覆盖 |
-| q6_K | 0.99-1.68x | 1.55-1.56x | 1.73-2.08x | 1.11-1.20x | 原有覆盖 |
-| iq1_s | 1.10-1.44x | 1.94x | 1.75-2.13x | 1.00-1.23x | 1.45x |
-| iq1_m | 1.00-1.31x | 1.92-2.00x | 1.71-2.07x | 1.01-1.16x | 1.43x |
-| iq2_xxs | 0.96-1.25x | 1.86x | 1.65-2.24x | 1.11-1.23x | 1.41x |
-| iq2_xs | 1.02-1.42x | 1.93-2.06x | 1.65-1.98x | 0.99-1.14x | 1.41x |
-| iq2_s | 1.08-1.32x | 1.71-1.94x | 1.97-2.29x | 1.04-1.27x | 1.42x |
-| iq3_xxs | 1.05-1.25x | 1.83-1.87x | 1.75-2.21x | 1.00-1.19x | 1.45x |
-| iq3_s | 1.06-1.23x | 1.87-1.91x | 1.63-2.10x | 1.01-1.18x | 1.43x |
-| iq4_nl | 0.98-1.15x | 1.57-1.65x | 1.84-2.34x | 1.06-1.27x | 1.45x |
-| iq4_xs | 0.99-1.17x | 1.68-1.71x | 1.83-2.23x | 1.07-1.16x | 1.44x |
-| tq2_0 | 0.65-1.25x | 2.06-2.09x | 2.51-2.95x | 1.41-1.71x | 1.43x |
-
-- 形状 17408x5120 与 5120x17408，两轮取均值；范围是各行数中的最小与最大。2-8 行一栏是对所有格式测得的结果，只有第 7.1 节列出的格式和行数实际开启；33-64 行一栏是开启范围内的结果。
-- "原有覆盖"表示该格式在 A3/I8 最初就已支持，其效果见第 6.1 节。
-- 2-3 行跨行 mat-vec（K3）：q5_K 在 2 行比原路径快 21%，3 行快 6%（3 行 H4 更快，所以 3 行用 H4）。
-
-### 7.3 MoE 矩阵乘的内核级数据（M2：64 条目的块 vs 32 条目，合成权重，随机路由）
-
-形状：gemma-4 的 gate_up（128 专家选 8，K = 2816，N = 1408）与 down（K = 704，N = 2816）。K 不是 256 倍数的形状无法存放 K-quant 与 IQ 格式，这些格式只测 gemma gate_up。T = 128 / 512 / 2048 个 token，相当于每专家 8 / 32 / 128 个条目。两轮中位数。
-
-| 格式 | gemma gate_up（T = 128 / 512 / 2048） | gemma down |
-|---|---|---|
-| mxfp4 | +2%/+22%/+32% | -8%/-11%/+24% |
-| q4_0 | -7%/+14%/+14% | -25%/-3%/+10% |
-| q4_1 | -8%/-12%/+12% | -3%/+28%/+9% |
-| q5_0 | -5%/+11%/+31% | -7%/+35%/+5% |
-| q5_1 | -4%/+13%/+29% | -6%/-18%/+24% |
-| q8_0 | +3%/-0%/+20% | -1%/+9%/+13% |
-| f16 | +1%/+3%/+16% | -0%/+4%/+6% |
-| bf16 | +1%/+3%/+9% | +2%/+4%/+8% |
-| q2_K | -3%/+28%/+20% | - |
-| q3_K | +202%/+13%/+33% | - |
-| q4_K | -5%/-8%/+24% | - |
-| q5_K | -3%/+18%/+32% | - |
-| q6_K | +12%/+11%/+20% | - |
-| iq2_xxs | -9%/+18%/+21% | - |
-| iq2_xs | -4%/+15%/+19% | - |
-| iq2_s | +10%/+12%/+19% | - |
-| iq3_xxs | -26%/+23%/+21% | - |
-| iq3_s | +12%/-16%/+24% | - |
-| iq1_s | -5%/+19%/+19% | - |
-| iq1_m | +15%/+27%/+21% | - |
-| iq4_nl | -15%/+9%/+29% | -9%/-6%/+21% |
-| iq4_xs | -13%/+14%/+28% | - |
-| tq2_0 | +48%/+20%/+21% | - |
-| q1_0 | -3%/+20%/+8% | - |
-| q2_0 | +4%/-27%/+12% | -5%/-22%/+10% |
-
-### 7.4 解码 mat-vec 的带宽（单 token）
-
-单 token 解码的矩阵乘受带宽限制，原有的 mat-vec 内核在各格式上已接近可持续带宽：f16 约 545 GB/s，q4_K 528，q8_0 524，q5_K 501-531，q6_K 507-520（同一场次，合成权重）。q5_K / q6_K 的内核参数调优最多只有 +0.9%，所以单 token 路径没有改动。
-
-## 8. 保留项的实现
-
-**A1：NAX flash attention**（`kernels/fa_tensor.metal`，派发在 `ggml-metal-ops.cpp`）。F16 K/V 的预填充注意力把分数、概率和 O 都留在寄存器里（16x32x16 的 `matmul2d` 片段，BQ = 64，BK = 32），结构参照 MLX 的 `steel_attention_nax`；head dim 分给 WN 个 simdgroup（head size 128 为 1 个，256 为 2 个，512 为 4 个），各自的部分分数按固定顺序经 threadgroup 内存相加。每个块的掩码标志提前一块预取：否则跳过全掩码块的那个分支每次迭代都要等设备内存读取（单这一点端到端 +4-8%）。遇到 ALiBi 和 softcap 时回退到原有的 tensor 内核。
-
-**A2：f16 激活**（`kernels/mul_mm.metal`、`ggml-metal-ops.cpp`、`ggml-metal.cpp`）。tensor `mul_mm` 内核用 half 激活比用 f32 快约 1.25 倍，所以先把 f32 激活转换（饱和到 +/-65504）到一个额外的缓冲区。只用于稠密 mat-mat（MoE 的版本单独评估）。
-
-**A3：NAX mat-mat**（`kernels/mul_mm.metal`、`ggml-metal-impl.h`、`ggml-metal-ops.cpp`）。批次至少 1024 行时（`GGML_METAL_MM_NAX_MIN_ROWS`，测试用参数），每个 mat-mat 先把权重经该格式的反量化函数转成 f16 一次，然后在一个不用 threadgroup 内存的内核上做乘法：操作数直接载入片段，每个 64x128 tile 由 2x4 个 simdgroup 计算，threadgroup 做 swizzle，每 256 K 一次 barrier。禁止 K 循环展开是它变快的关键（0% -> 15%）。当 K >= 3*max(M, N) 时，K 被切成 4096 宽的分段依次派发、累加到 dst，使操作数切片留在缓存里（MLX 对长 K 也这样做）。
-
-**A4：GDN 每行 4 个 lane**（`kernels/gated_delta_net.metal`、`ggml-metal-ops.cpp`）。原来每个状态行 32 个 lane，递推受指令数限制（每个 token 两次 5 步归约）。改为每行 4 个 lane（状态大小 256 时为 8 个，否则每个 lane 需要 64 个寄存器）后，每个 lane 保存 32 个状态值，归约只需 2 步（8 lane：1.87 倍，4 lane：1.98 倍）。其他形状、非标量 gate 和未对齐的输入仍走原有内核。
-
-**I8：int8 mat-mat**（`kernels/mul_mm.metal`：`kernel_mul_mm_q8a_f32`、`kernel_mul_mm_dq_<type>_i8`、`kernel_mul_mm_nax_i8`）。激活和反量化后的权重都量化为对称 int8，每（行，128 列）一个 scale；量化前对每组 128 个值做一次不归一化的 Walsh-Hadamard 变换（`i8_wht128`，32 个 lane 各持 4 个值，组内 2 级加减 + 5 级 `simd_shuffle_xor`），两边用同一个变换，点积不变（1/128 折进激活的 scale），而离群值被摊到整组，scale 不再被少数大值撑大。`matmul2d<int8, int8, int32>` 累加 128 宽的一组 K，然后折回到 f32 累加器（`c += s_a*s_w*ci`）。tile 结构和 split-K 与 A3 相同；它复用 A3 预留的缓冲区，不需要额外内存。每 32 列一个 scale 精度也更好，但折回次数多 4 倍，Qwen pp2048 慢 25%，所以保持 128 列、用变换补精度：KL 散度 Qwen 0.0023 -> 0.0007、Llama 0.0009 -> 0.0004、gemma 0.112 -> 0.067，速度代价 0-2%。这与 CUDA MMQ 路径的 q8_1 激活以及 oMLX 的 oq_a8 属于同一类有损捷径（精度见第 9 节）。
-
-**A5：SWIGLU -> down 投影**（`ggml-metal-fusion.cpp`、`kernels/unary.metal`）。当 SWIGLU 的输出送入一个 NAX mat-mat 时，GLU 内核直接写出该 mat-mat 所需的 f16 或 int8 激活（含 scale）；f32 的 GLU 输出和单独的转换那一遍都省掉了。结果与不融合的路径逐位相同。
-
-**S1：关闭思考时保留对话缓存**（`tools/ui`）。界面的思考档位 低 / 中 / 高 原本就以 `thinking_budget_tokens` 发送，切换不会打断缓存；只有"关闭"发送 `chat_template_kwargs.enable_thinking=false`，Qwen3.8 的模板会因此去掉系统部分开头的一段说明，整段对话从第 5 个 token 左右起被重新处理。现在"关闭"改为发送 `thinking_budget_tokens: 0`，输出与模板的空思考块相同，提示前缀不变。新增设置"关闭思考时保留对话缓存"（设置 -> 开发者，默认开启）。
-
-**S2-a：加载时不清零**（`ggml-metal-device.cpp`、`common/common.cpp`）。Metal 的共享缓冲区来自 `vm_allocate`，本来就是零，但 KV 缓存在分配后清零一次、预热后又清零一次，触碰并提交了每个页面（262k 上下文时 KV 约 16 GiB、递推状态 2.4 GiB）。Metal 端记录缓冲区自分配以来是否被触碰过，未触碰时跳过清零；`common` 端在预热后只重置 KV 单元，不擦除数据。
-
-**K3：2-3 行的跨行 mat-vec**（`kernels/mul_mv.metal`）。与单行 mat-vec 相同的 lane 布局，但一个块的量化值和 scale 只解包一次，与 2-3 行激活分别做点积；解包后的值用 half 保存以限制寄存器用量。q4_K 用于 2-3 行，q5_K 用于 2 行。
-
-**S2-c：首次驻留请求放到后台**（`ggml-metal-device.cpp`）。驻留集的第一次 `requestResidency` 会为 GPU 映射每个页面，262k 上下文的 KV 约需 0.4 s。对自分配以来未被触碰的共享缓冲区，这个请求放到后台队列执行，完成后驻留集再加入保活集合；释放缓冲区时会等待它。
-
-**A2 门槛**（`ggml-metal-ops.cpp`）。A2 在 tensor mul_mm 之前把 f32 激活转为 f16，每次 mul_mm 多一次派发和前后两个 barrier，是固定成本；128 行以下这部分成本大于 half 激活省下的时间；128-512 行时，计算量小的矩阵乘（K/V 投影、递推状态的小投影）也是如此。现在 128 行且单次矩阵乘 4 GFLOP 起才转换（NAX mat-mat 只吃 f16，照旧转换），额外缓冲区也按同一条件预留。门槛扫过 2 / 4 / 8 / 16 GFLOP：4 是 Qwen 与 gemma 的 pp128 / 256 / 512 上都不变慢的取值。
-
-**H3 / H3b：GQA 打包的 NAX 注意力**（`kernels/fa_tensor.metal`：`kernel_flash_attn_ext_nax_gqa`；`ggml-metal-ops.cpp`）。解码和投机解码验证时，vec 内核对每个 query 头读一遍 K/V。新内核把共享一个 KV 头的 G 个 query 头和 ne01 个 token 打包成一个 NAX tile 的行（p = g*ne01 + i），每个 K/V 块只读一次；每个 threadgroup 打包最多 8 个 16 行 tile（head size 512 为 4），沿网格按行块派发，KV 范围按 min(32, 1024/ne01) 切分交给这些 threadgroup；结果写成 vec 内核的临时缓冲区格式，由现有的 `kernel_flash_attn_ext_vec_reduce` 合并。条件：head size 128-512、F16 K/V、有掩码、没有 ALiBi / softcap、每个 KV 头至少 2 个 query 头；打包后只有不到 5 行（每 KV 头 4 个 query 头的单 token 解码）且 KV 短于 16k 时，tile 的大部分是空行，保持 vec 内核。
-
-**H4：2-64 行的 NAX few-row mat-mat**（`kernels/mul_mm.metal`：`kernel_mul_mv_nax_f32`；`ggml-metal-common.cpp`、`ggml-metal-ops.cpp`）。src1 的行是 16x32x16 matmul2d 的 M = 16 行（一次一个或两个 16 行 tile，更多的行沿网格的第二维分成多遍），32 个权重行是它的 N；每个 lane 通过该格式的反量化函数把 16 个权重直接解到 half 片段里，不用 threadgroup 内存；4 个 simdgroup 切分 K，最后在 threadgroup 内存里求和。为了让每个 lane 一次解出一个完整的 16 权重组（反量化函数的单位），K 在每个 64 权重的块内做了排列，src0 与 src1 用同一个排列。q5_K 另有一个用 16 字节加载和位运算代替逐权重分支的反量化函数。各格式在哪些行数开启由一个函数集中决定（第 7.1 节）。支持与 MUL_MAT + ADD（残差加）融合。
-
-**M1：MoE mat-mat 从 16 个 token 起**（`ggml-metal-common.cpp`）。`ggml_metal_op_mul_mat_id_use_mm` 在有 tensor 单元的设备上把门槛从 32 改为 16；其他设备保持 32。
-
-**M2：MoE mat-mat 每块 64 个条目**（`kernels/mul_mm.metal`：`kernel_mul_mm_id_map0`、`kernel_mul_mm_id`；`ggml-metal-device.cpp`、`ggml-metal-ops.cpp`）。路由预处理把每个专家的条目切成块，主内核对每块把 64 行权重反量化一次并与块内的条目相乘。一个函数常量把块大小从 32 切换到 64（预处理与主内核同时切换）：64 条目的块按 16 行的四分之一块做 `matmul2d`，没有条目的四分之一块跳过；每个线程多装载一行激活；threadgroup 内存从 8 KB 增加到 16 KB。只在有 tensor 单元的设备上、专家平均至少 128 个条目时使用。
-
-**A6 / A7 / A8 / A10：BF16 与 MLA**（`kernels/fa_tensor.metal`、`kernels/mul_mm.metal`、`ggml-metal-ops.cpp`）。BF16 缓存按原格式读入、在寄存器里钳到 f16 再做 MMA；MLA 的 192/128 与 576/512 把 K、V 头维分开拆（576/512 的 K 用 1 个 simdgroup、V 用 4 个）；BF16 权重 1024 行起转一次 f16 后走 NAX。BF16 + head size 512 + 超过 32 个 query 的预填充仍让回 tensor 内核。
-
-**A9 / A3b：更多权重格式**（`kernels/mul_mv.metal`、`kernels/dequantize.h`、`ggml-metal-ops.cpp`）。NVFP4 的 UE4M3 子块 scale 与 TQ1_0 的三进制位在核心里解码，两种格式接入全部 Metal 路径；int8 的 NAX 门槛从 1024 行降到 448 行。
-
-**H3b / H5：GQA 内核**（`kernels/fa_tensor.metal`、`ggml-metal-ops.cpp`）。每个 threadgroup 打包最多 8 个 16 行 tile（head size 512 为 4），沿网格分块；量化缓存按原格式读、每次载入解 4 个值；KV 份数取 min(32, 1024/ne01)。
-
-**A5b：融合 GLU 写回原位**（`ggml-metal-fusion.cpp`）。激活写进 mat-mat 自己的 f32 结果，消除与 gate/up 释放后的内存竞争。每项改动的环境变量见第 2 节的开关一列。
-
-## 9. 数值精度
-
-- `test-backend-ops -b MTL0`：MUL_MAT 3892/3892（few-row 用例覆盖全部格式的 2-64 行；在 `GGML_METAL_MM_NAX_MIN_ROWS=1` 下也通过，该设置让所有符合条件的用例都走 NAX / int8 内核），MUL_MAT_ADD 384/384，MUL_MAT_ID 867/867（M2 的 32 / 64 条目两种块都通过），FLASH_ATTN_EXT 4973/4973（含 head size 128 / 256 / 512 与 MLA 的 NAX 路径），GATED_DELTA_NET 30/30。每个提交单独编译并通过与它相关的测试。
-- KL 散度（主要指标）：以上游的完整 logits 为基准（`llama-perplexity --kl-divergence-base`，8 x 2048 token，`-c 2048 -b 2048 -ub 2048 -fa on`，文本为 llama.cpp 仓库文档），逐 token 比较本分支的输出分布。每格为平均 KL 散度 / top-1 一致率。参照列是上游自己换一种等价设置（`-fa off`，或 `-ub 512`）时与它本身的差，代表"正常的数值差异"：
-
-| 模型 | 本分支，全部开启 | 本分支，关 I8 | 参照：上游 -fa off | 参照：上游 -ub 512 |
-|---|---|---|---|---|
-| Qwen3.8-27B Q5_K_M | 0.0007 / 99.00% | <0.0001 / 99.96% | <0.0001 / 99.96% | <0.0001 / 100.00% |
-| gemma-4-26B-A4B Q4_0 | 0.0670 / 90.20% | 0.0236 / 94.89% | 0.0244 / 94.92% | 0.0042 / 98.90% |
-
-  - 除 I8 以外的改动在 Qwen 上与上游几乎逐位一致（KL 散度 < 0.0001）；在 gemma 上与参照同一量级。gemma 对任何数值差异都更敏感：上游自己 `-fa on` 与 `-fa off` 之间就差 0.024。逐项开关定位（全部关闭再单独打开一项）显示这部分来自 A1（NAX 注意力）与 A2/A3（f16 路径），各约 0.02；其余改动（H3、H4、K3、M1、M2、A5）与上游逐位相同。结果是确定的：重复运行、关闭并发都得到完全相同的数值。
-  - I8 是唯一有实质代价的改动：int8 激活在 Qwen 上增加约 0.0007，在 gemma 上约 +0.043（top-1 一致率 94.9% -> 90.2%），是参照的约 3 倍。量化前的 Walsh-Hadamard 变换已把这部分误差降到原来的 1/3（Qwen）到 3/5（gemma），见第 8 节。I8 默认开启，因为它是稠密模型预填充最大的单项收益（Qwen 留一法 +32%，gemma +7%）；在意精度的场景可以用 `GGML_METAL_MM_I8_DISABLE=1` 单独关闭，其余改动不受影响。
-- 困惑度（同样的文本与设置），全部改动开启 vs 上游，作为补充：
-
-| 模型 | 本分支 | 上游 | 差 | 统计误差 |
-|---|---|---|---|---|
-| Qwen3.8-27B Q5_K_M | 3.4648 | 3.4652 | -0.01% | +/-0.08 |
-| gemma-4-26B-A4B Q4_0 | 65.5324 | 64.6739 | +1.33% | +/-3.42 |
-
-  困惑度的统计误差远大于上面的 KL 散度差，只能排除大的错误。注意 gemma 的 `--kl-divergence-base` 那一轮报告的困惑度（62.71）与同一个上游二进制普通运行的结果（64.67）不同，而两轮 logits 完全相同（KL 散度为 0），所以 gemma 的困惑度比值不可信，以 KL 散度为准。
-- 贪心输出：启动测试中本分支与上游的输出逐字节相同；H3 开与关的输出逐字节相同；A5 与不融合的路径 KL 散度相同（Qwen 0.00070 vs 0.00073，差在误差内；融合后编译器对乘加的合并不同，不再逐位相同）；M1、M2 与上游的 MoE 路径逐位相同。
-
-## 10. 剩余差距
-
-1. **MoE 预填充。** gemma 的 8k 提示比 oMLX 慢 9%（30k 预填充本轮未复测）。M2 之前，gemma 的预填充大部分时间在 MUL_MAT_ID 上，只跑到稠密路径约一半的算力；M2 之后快了 24-37%，但按专家分块的 mat-mat 仍明显低于稠密路径。下一步是把 A3 那样寄存器常驻的 NAX 内核用到按专家分块的 mat-mat 上（按专家分块的 few-row 方案在大批量下更慢）。
-2. **Qwen 的 MTP。** 8k 时 oMLX 的 MTP 解码 57.5 t/s，本分支 42.7（上一轮，本轮未复测 8k 投机）；30k 时 47.1 对 41.2。不用投机解码时两者差 10%（25.0 对 22.5），所以差距主要在投机解码这一层（草稿长度、接受率、草稿头本身的开销），本项目只改了 Metal 后端，没有拆分这部分。
-3. **解码带宽。** 短上下文的解码已和上游持平，但离带宽上限还有距离：Qwen 2k 解码 26.0 t/s x 19.5 GB ≈ 507 GB/s，即 614 GB/s 标称带宽的 83%。oMLX 在 Qwen 上快 10%。
-4. **I8 的精度。** 在 gemma 上，I8 使 KL 散度约为上游 `-fa on`/`-fa off` 参照的 3 倍（第 9 节）。更细的分组太慢（每 32 列：Qwen -25%），Walsh-Hadamard 变换已收回一部分；彻底解决需要能逐矩阵判断激活分布的办法，目前只能整体关闭。
-
-## 11. 复现
-
-```sh
-# 构建（macOS，Metal）
-cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j --target llama-bench llama-server llama-perplexity test-backend-ops
-
-# 数值校验
-build/bin/test-backend-ops -o MUL_MAT -b MTL0
-GGML_METAL_MM_NAX_MIN_ROWS=1 build/bin/test-backend-ops -o MUL_MAT -b MTL0
-build/bin/test-backend-ops -o MUL_MAT_ADD -b MTL0
-build/bin/test-backend-ops -o MUL_MAT_ID -b MTL0
-build/bin/test-backend-ops -o FLASH_ATTN_EXT -b MTL0
-build/bin/test-backend-ops -o GATED_DELTA_NET -b MTL0
-
-# 预填充 A/B：llama-bench 默认 -ub 512，NAX mat-mat 需要至少 1024 行
-build/bin/llama-bench -m model.gguf -fa 1 -ub 2048 -p 2048 -n 0 -d 8192
-GGML_METAL_MM_I8_DISABLE=1 build/bin/llama-bench -m model.gguf -fa 1 -ub 2048 -p 2048 -n 0 -d 8192
-GGML_METAL_MM_ID_WIDE_DISABLE=1 build/bin/llama-bench -m moe-model.gguf -fa 1 -ub 2048 -p 2048 -n 0
-
-# 每步耗时（2-64 token：K3、H4、M1）与长上下文解码（H3）
-build/bin/llama-bench -m model.gguf -fa 1 -ub 2048 -p 1,2,4,16,24,32,48,64 -n 0
-GGML_METAL_MV_NAX_DISABLE=1 GGML_METAL_MV_XR_DISABLE=1 GGML_METAL_MM_ID_MIN16_DISABLE=1 build/bin/llama-bench -m model.gguf -fa 1 -ub 2048 -p 1,2,4,16,24,32,48,64 -n 0
-build/bin/llama-bench -m model.gguf -fa 1 -p 4 -n 64 -d 32768
-GGML_METAL_FA_GQA_DISABLE=1 build/bin/llama-bench -m model.gguf -fa 1 -p 4 -n 64 -d 32768
-
-# 投机解码的服务器（模型文件内置 MTP 头时不需要单独的草稿模型）
-build/bin/llama-server -m model.gguf -fa on -np 4 -kvu --spec-type draft-mtp --spec-draft-n-max 3
-build/bin/llama-server -m gemma-4-26B-A4B-it-Q4_0.gguf -fa on -np 4 -kvu --spec-type draft-dflash -md dflash-gemma-4-26B-A4B-it-Q8_0.gguf
-```
-
-## 关于代码
-
-本文档描述每项改动，但不逐行解释源码；代码在 `LXD-8/llama.cpp` 的 `metal-m5` 分支，基于上游 `master` 的 `785322d17f`（b12033），每项改动一个提交，各自可以单独关闭。如果你考虑采用其中的某项优化，我很乐意提交 PR 或以你方便的其他形式提供代码。英语不是我的母语，像本文这样的长文，我以中文为原文，再由 AI 翻译成英文。
-
----
-
 # llama.cpp Metal optimizations for Apple M5 (NAX): for every model and weight format
+
+[English](#llamacpp-metal-optimizations-for-apple-m5-nax-for-every-model-and-weight-format) | [中文](#apple-m5nax上的-llamacpp-metal-优化面向各种模型与量化格式)
 
 This project optimizes the Metal backend of llama.cpp on Apple M5, with the goal that every kind of model (dense, MoE, different attention structures) and every weight format runs close to the hardware limit of the machine. It covers prompt processing (prefill), decode, speculative decoding (MTP / DFlash), concurrency, short prompts, start-up and the multi-turn conversation cache. All changes are based on upstream `master` at `785322d17f` (b12033): 24 optimizations, one commit each, each can be switched off on its own.
 
@@ -975,3 +486,494 @@ build/bin/llama-server -m gemma-4-26B-A4B-it-Q4_0.gguf -fa on -np 4 -kvu --spec-
 ## About the code
 
 This document describes every change but does not explain the source line by line; the code is on the `metal-m5` branch of `LXD-8/llama.cpp`, based on upstream `master` at `785322d17f` (b12033), one commit per change, each of which can be switched off on its own. If you are considering adopting any of these optimizations, I am happy to submit a PR or to provide the code in any other form that suits you. English is not my native language; for a long text like this one, the Chinese version is the original and AI translated it into English.
+
+---
+
+# Apple M5（NAX）上的 llama.cpp Metal 优化：面向各种模型与量化格式
+
+[English](#llamacpp-metal-optimizations-for-apple-m5-nax-for-every-model-and-weight-format) | [中文](#apple-m5nax上的-llamacpp-metal-优化面向各种模型与量化格式)
+
+中文为原文，英文版由 AI 基于中文版翻译。/ The Chinese version is the original; the English version is an AI translation of it.
+
+本项目优化 llama.cpp 的 Metal 后端在 Apple M5 上的性能，目标是让各种模型（稠密、MoE、不同注意力结构）和各种量化格式都基本达到这台机器的硬件上限。范围包括提示处理（预填充）、解码、投机解码（MTP / DFlash）、并发、短提示、启动和多轮对话缓存。全部改动基于上游 `master` 的 `785322d17f`（b12033）：24 项优化，每项一个提交，每项都可以单独关闭。
+
+下表是全部改动开启时、与上游和 oMLX 的对比（M5 Max，满功率，服务器端到端，流式客户端，temperature 0；oMLX 开启其 INT8 预填充，两边都关闭 KV 量化）：
+
+| 模型 | 8k 预填充 t/s：本分支 / 上游 / oMLX | 对上游 | 30k 解码 t/s：本 / 上 / oMLX | 对上游 | 30k 投机解码 t/s：本 / 上 / oMLX |
+|---|---|---|---|---|---|
+| Qwen3.8-27B Q5_K_M | 1086 / 642 / 1128 | 1.69x | 22.5 / 21.7 / 25.0 | 1.04x | 41.2 / 34.5 / 47.1 |
+| gemma-4-26B-A4B Q4_0 | 4054 / 3313 / 4456 | 1.22x | 106.2 / 89.7 / 67.8 | 1.18x | 117.2 / 83.9 / 97.0 |
+
+"投机解码"一列：Qwen 用模型内置的 MTP 头（`--spec-type draft-mtp --spec-draft-n-max 3`），gemma 用 ggml-org 同一仓库提供的 DFlash 草稿模型（`--spec-type draft-dflash`）；oMLX 两者都用模型自带的 MTP 头。
+
+范围：24 个代码提交，26 个文件，+3374 / -121。23 个在引擎（以 `ggml/src/ggml-metal/` 为主，`common/` 一行，`tests/test-backend-ops.cpp` 增加测试用例），1 个在内置 Web UI（`tools/ui`，即 Llama.app 的界面）。NAX 内核只在支持 Metal tensor API 的设备上生效（默认为 M5 / A19 及更新的芯片），其他设备保持上游路径。除 NVFP4 / TQ1_0 这类格式本身没有单独开关外，每项引擎改动都可以用环境变量关闭，便于 A/B 测试。
+
+测过的模型：Qwen3.8-27B Q5_K_M（稠密，GDN + 全注意力，q5_K / q6_K）、gemma-4-26B-A4B Q4_0（MoE，128 专家选 8，含 head size 512 的全局注意力层）。其余量化格式用 `test-backend-ops` 做了数值校验，并在合成权重上做了内核级计时（第 7 节）。
+
+测试设备：MacBook Pro（Mac17,6），Apple M5 Max：18 核 CPU（6 个超大核 + 12 个性能核）、40 核 GPU、128 GB 统一内存；系统为 macOS 27.2。本文所有数据均在这台机器上测得。
+
+### 关于本项目与 AI 的使用
+
+本项目源于日常使用中的发现：在我的设备上，llama.cpp（Llama.app 的引擎）的预填充和解码明显慢于基于 MLX 的 oMLX。项目目标、调研思路、测试方法以及依据测试结果对方案的取舍，均由我本人决定。调研、编写代码、测试和撰写本文档的过程中使用了 AI 工具，其产出都经过我人工检查。本文档的中文版为原文，英文版由 AI 基于中文版翻译。
+
+目录：
+
+- [1. 为什么做](#1-为什么做)
+- [2. 改动一览](#2-改动一览)
+- [3. 效果](#3-效果)
+- [4. 方法](#4-方法)
+- [5. 调研到的候选方案](#5-调研到的候选方案)
+- [6. 各项结果与取舍](#6-各项结果与取舍)
+- [7. 量化格式](#7-量化格式)
+- [8. 保留项的实现](#8-保留项的实现)
+- [9. 数值精度](#9-数值精度)
+- [10. 剩余差距](#10-剩余差距)
+- [11. 复现](#11-复现)
+- [关于代码](#关于代码)
+
+## 1. 为什么做
+
+在 M5 Max 上，原版 llama.cpp 的 Metal 后端处理提示的速度只有 oMLX 的约 55-70%（例如 Qwen3.8-27B 8k 提示 653 对 1187 t/s），MoE 模型和长上下文下差距更大。实际使用中还有几处明显的损失：投机解码每一步要验证几个 token，这一步比单 token 慢很多；App 默认的 4 路并发，合计吞吐远低于单路的 4 倍；追问、新一轮对话这类短提示落在一段很慢的批次大小上；App 启动后要 3 秒多才出第一个 token，并占用约 21 GB 内存；在界面里关闭思考会让整段对话被重新处理。
+
+M5 这一代在每个 GPU 核心里加入了矩阵单元（NAX，通过 Metal tensor API / MetalPerformancePrimitives 的 `matmul2d` 调用）。MLX 用寄存器常驻的内核驱动它；上游 llama.cpp 只通过一个用 threadgroup 内存分块、以 f32 激活为输入的内核来用它，大部分新增算力没有用上。
+
+目标：
+- 尽可能接近 M5 Max 的硬件上限，在可公平对比的项目上追平或超过 oMLX；
+- 合适的地方借鉴 MLX、oMLX 等 Apple Silicon 引擎的做法，也做出它们都没有的优化；
+- 讲究性价比：单项最终增幅低于 1.5%（噪声级）、却需要复杂验证或大量改动的方案不做；保留的方案用必要最小的改动实现；收益大时允许较大的重构；
+- 只改 Metal 后端（以及外面必要的最少几处），每项改动都可开关、都经过数值验证；
+- 覆盖 Metal 矩阵乘内核支持的全部权重格式，以及稠密、MoE 和各种注意力结构，而不只是测试模型用到的情形。
+
+在本机实测的硬件上限（M5 Max，40 核 GPU，128 GB）：
+
+| | 数值 |
+|---|---|
+| 内存带宽（Apple 规格） | 614 GB/s |
+| 实测可持续带宽 | 530-580 GB/s（随测试内核、传输大小和运行状态浮动） |
+| NAX f16 mat-mat，可达 | ~60 TFLOP/s（MLX 稠密 f16 gemm 59-60；下文 A3 为 59.7） |
+| NAX int8 mat-mat | ~2.1x f16（同样的寄存器常驻内核结构） |
+
+解码受带宽限制：例如 Qwen3.8-27B Q5_K_M 每个 token 读 18.34 GB 权重；本分支单 token 解码中矩阵乘部分的读取速度为 517-540 GB/s，已在可持续带宽范围内，剩下的是注意力和小算子（第 10 节）。
+
+## 2. 改动一览
+
+按分支中的顺序，每项一个提交。"格式"一栏说明矩阵乘类改动作用于哪些权重格式；其余改动与权重格式无关。
+
+| # | 提交 | 改动 | 行数 | 格式 | 开关 |
+|---|---|---|---|---|---|
+| A1 | `a7f094140` | 寄存器常驻的 NAX flash attention（预填充，head size 128 / 256 / 512） | +461 / -9 | -（F16 K/V） | `GGML_METAL_FA_NAX_DISABLE` |
+| A2 | `0a39acbcd` | tensor mul_mm 前的 f32 -> f16 激活转换 | +136 / -7 | F16 与量化格式 | `GGML_METAL_MM_F16_ACT_DISABLE` |
+| A3 | `d42a64b1b` | 反量化到 f16 + 寄存器常驻的 NAX mat-mat，长 K 用 split-K（>= 1024 行） | +397 / -4 | F16 + 23 种量化格式 | `GGML_METAL_MM_NAX_DISABLE` |
+| A4 | `d5346f1aa` | gated delta net 每状态行 4 个 lane | +157 / -2 | - | `GGML_METAL_GDN_R8_DISABLE` |
+| I8 | `87b8d9db5` | int8 NAX mat-mat（每 128 列一个 scale，量化前做 Walsh-Hadamard 变换） | +276 / -7 | 23 种量化格式 | `GGML_METAL_MM_I8_DISABLE` |
+| A5 | `eb3b224e3` | SWIGLU 融合进使用它的 NAX mat-mat | +213 / -7 | 同 A3 | `GGML_METAL_GLU_MM_DISABLE` |
+| S1 | `866581197` | 关闭思考时保留对话缓存（Web UI） | +12 / -1 | - | 界面设置 |
+| S2-a | `9510455c9` | 加载时不对新分配的 KV / 递推状态缓冲区清零 | +44 / -1 | - | `GGML_METAL_CLEAR_SKIP_DISABLE` |
+| K3 | `8d0c74072` | 2-3 行的跨行 mat-vec | +316 / -1 | q4_K（2-3 行）、q5_K（2 行） | `GGML_METAL_MV_XR_DISABLE` |
+| S2-c | `c1506b989` | 新缓冲区的首次驻留请求放到后台 | +44 / -5 | - | `GGML_METAL_RSET_ASYNC_DISABLE` |
+| A2 门槛 | `2ff0114a8` | 128 行且 4 GFLOP 起才做 f16 激活转换 | +9 / -2 | 同 A2 | `GGML_METAL_MM_F16_ACT_ROWS_128_DISABLE` |
+| H3 | `9849c6771` | 共享 KV 头的 query 头打包进一个 NAX 注意力 tile（解码、投机解码验证；head size 128-512） | +411 / -4 | -（F16 K/V） | `GGML_METAL_FA_GQA_DISABLE` |
+| H4 | `9c50c4081` | 2-64 行的 NAX few-row mat-mat | +321 / -10 | few-row 内核支持的全部格式，行数范围见第 7 节 | `GGML_METAL_MV_NAX_DISABLE` |
+| M1 | `be6587734` | MoE mat-mat（MUL_MAT_ID）从 16 个 token 起使用（原为 32） | +9 / -8 | 全部格式 | `GGML_METAL_MM_ID_MIN16_DISABLE` |
+| M2 | `a03983a37` | MoE mat-mat 每块 64 个条目（专家平均 >= 128 个条目时） | +90 / -25 | 全部格式 | `GGML_METAL_MM_ID_WIDE_DISABLE` |
+| A6 | `8768dad0f` | BF16 K/V 缓存的 NAX flash attention（预填充与 GQA，寄存器内转 f16） | +64 / -42 | BF16 | `GGML_METAL_FA_NAX_BF16_DISABLE` |
+| A8 | `9d2cb5214` | BF16 权重的 NAX mat-mat（1024 行起） | +20 / -6 | BF16 | `GGML_METAL_MM_NAX_BF16_DISABLE` |
+| A7 | `7479b2600` | MLA 头尺寸 192/128、576/512 的 NAX flash attention | +34 / -20 | MLA | `GGML_METAL_FA_NAX_MLA_DISABLE` |
+| A9 | `ca8a15013` | NVFP4 / TQ1_0 权重 | +308 / -7 | NVFP4、TQ1_0 | -（格式本身无开关） |
+| H5 | `b70bdbe19` | 量化 K/V 缓存的 NAX GQA 注意力 | +112 / -9 | q4_0 / q4_1 / q5_0 / q5_1 / q8_0 / iq4_nl | `GGML_METAL_FA_GQA_Q_DISABLE` |
+| H3b | `13d9243e1` | GQA 内核：最多 8 个 16 行 tile、行块、运行期 KV 份数 | +105 / -162 | F16 与量化缓存 | `GGML_METAL_FA_GQA_DISABLE` |
+| A3b | `e11f1820d` | int8 的 NAX mat-mat 门槛降到 448 行 | +13 / -9 | int8 路径的量化格式 | `GGML_METAL_MM_NAX_MIN_ROWS` |
+| A5b | `971b41a44` | 融合 GLU 把激活写进 mat-mat 自己的结果（修内存竞争） | +16 / -24 | 同 A3 | `GGML_METAL_GLU_MM_DISABLE` |
+| A10 | `e46a6c395` | BF16 + head size 512 的大 batch 预填充让回 tensor 内核 | +5 / -0 | BF16 | `GGML_METAL_FA_NAX_BF16_DISABLE` |
+| | | **合计** | **+3374 / -121** | | |
+
+## 3. 效果
+
+对 oMLX 的公平原则：凡是本分支的改动在 oMLX 里有同类选项的，oMLX 也打开：其 INT8 激活预填充（与 I8 对应）开启。其余改动（NAX 注意力、NAX mat-mat、GDN 内核、激活融合）对应的是 MLX/oMLX 一直在用、没有开关的路径。KV 缓存量化两边都关闭；不开投机解码的对比两边都关，开的对比两边都开（oMLX 的 MTP 可在模型设置里关闭，测量前切换、测量后恢复并核对）。oMLX 的设置在测量前读出、测量后恢复并核对。oMLX 在单独的时间段测量，所以对 oMLX 的比值是跨时间段的。
+
+端到端：本轮 8k / 30k 提示实测 8,020 / 29,686 token（oMLX 分词不同，token 数略有出入），生成 128 / 256 / 256 token；2k / 16k 与并发、启动的旧数字保留并标注未复测。本分支与上游正序、反序各一轮取均值。llama-bench：`-fa 1`，本轮 8k 预填充用 `-p 8192 -d 8192 -ub 2048`（llama-bench 默认的 512 低于 NAX mat-mat 1024 行的门槛），正反序各一轮。
+
+### 3.1 Qwen3.8-27B Q5_K_M
+
+`Qwen3.8-27B-Q5_K_M.gguf`（19.5 GB；64 层：48 层 gated-delta-net + 16 层全注意力，24 个 query 头共享 4 个 KV 头，head size 256；权重 q5_K 与 q6_K；MTP 头内置在同一文件中）。oMLX 对照 `Qwen3.8-27B-oQ5e-mtp`。
+
+端到端（t/s）：
+
+| t/s | 2k 预填充 | 8k 预填充 | 30k 预填充 | 2k 解码 | 8k 解码 | 30k 解码 |
+|---|---|---|---|---|---|---|
+| 本分支 | 1062* | 1086 | 951* | 26.0* | 24.6* | 22.5 |
+| 上游 | 692* | 642 | 554* | 25.7* | 24.3* | 21.7 |
+| oMLX（关 MTP） | 1018* | 1128 | 974* | 26.5* | 25.8* | 25.0 |
+| 本分支，投机解码 | - | 1069* | 916* | - | 42.7* | 41.2 |
+| 上游，投机解码 | - | 650* | 533* | - | 38.3* | 34.5 |
+| oMLX，MTP | - | 1098 | 915* | - | 57.5* | 47.1 |
+
+\* 本轮只复测 8k 预填充、30k 解码与 30k 投机解码，带 * 的单元格保留上一轮数字。llama-bench `pp8192 @8k`：本分支 1008、上游 569 t/s（1.77 倍）。
+
+预填充与解码（llama-bench，t/s）：
+
+| t/s | pp2048 @0 | pp2048 @8k | pp2048 @32k | pp512 @0 | pp512 @8k | pp512 @32k | tg64 @0 | tg64 @8k | tg64 @32k |
+|---|---|---|---|---|---|---|---|---|---|
+| 本分支 | 1134 | 1018 | 790 | 809 | 723 | 613 | 25.9 | 24.6 | 23.0 |
+| 上游 | 650 | 585 | 451 | 719 | 608 | 469 | 25.9 | 24.3 | 22.0 |
+| 本分支 / 上游 | 1.75x | 1.74x | 1.75x | 1.12x | 1.19x | 1.31x | 1.00x | 1.01x | 1.05x |
+
+每步耗时（llama-bench，深度 0，ms/步；一步 2-64 个 token 对应投机解码验证、几路并发和短提示）：
+
+| 每步 token | 1 | 2 | 4 | 8 | 16 | 24 | 32 | 48 | 64 | 96 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 本分支 | 38.9 | 42.5 | 51.2 | 51.0 | 56.0 | 74.4 | 82.1 | 132.2 | 145.2 | 220.9 |
+| 上游 | 38.8 | 55.8 | 56.8 | 56.2 | 90.4 | 195.9 | 195.6 | 201.7 | 207.3 | 223.9 |
+| 上游 / 本分支 | 1.00x | 1.31x | 1.11x | 1.10x | 1.61x | 2.63x | 2.38x | 1.53x | 1.43x | 1.01x |
+
+并发（合计解码 t/s）：
+
+| 并发路数 | 1 | 2 | 3 | 4 | 1，投机解码 | 4，投机解码 |
+|---|---|---|---|---|---|---|
+| 本分支 | 26.1 | 42.6 | 54.1 | 67.7 | 37.6 | 101.6 |
+| 上游 | 26.0 | 34.9 | 48.8 | 61.1 | 35.0 | 74.6 |
+| 本分支 / 上游 | 1.00x | 1.22x | 1.11x | 1.11x | 1.08x | 1.36x |
+
+App 启动（App 的参数：262k 上下文、mmproj、MTP、`--fit-target 1024`）：本分支就绪 1.9 s、首个请求 TTFT 0.24 s，上游 2.7 s / 0.33 s；两个请求后的常驻内存（不含 mmap 的权重文件）本分支 3.3 GB，上游约 21 GB。两边的贪心输出逐字节相同。
+
+### 3.2 gemma-4-26B-A4B Q4_0
+
+`gemma-4-26B-A4B-it-Q4_0.gguf`（ggml-org，14.6 GB；30 层 MoE，128 个专家每 token 选 8 个，另有共享的稠密 FFN；滑动窗口层 head size 256，全局层 head size 512）。投机解码用同一仓库的 `dflash-gemma-4-26B-A4B-it-Q8_0.gguf`。oMLX 对照 `gemma-4-26B-A4B-it-oQ4e-mtp`。
+
+| t/s | 2k 预填充 | 8k 预填充 | 30k 预填充 | 2k 解码 | 8k 解码 | 30k 解码 |
+|---|---|---|---|---|---|---|
+| 本分支 | 3869* | 4054 | 3354* | 121.4* | 114.9* | 106.2 |
+| 上游 | 3521* | 3313 | 2703* | 120.0* | 108.1* | 89.7 |
+| oMLX（关 MTP） | 3588* | 4456 | 3522* | 113.4* | 109.0* | 67.8 |
+| 本分支，投机解码 | - | 3893* | 3151* | - | 117.4* | 117.2 |
+| 上游，投机解码 | - | 3439* | 2564* | - | 109.3* | 83.9 |
+| oMLX，MTP | - | 4412 | 3534* | - | 107.0* | 97.0 |
+
+\* 本轮只复测 8k 预填充、30k 解码与 30k 投机解码，带 * 的单元格保留上一轮数字。llama-bench `pp8192 @8k`：本分支 3820、上游 3144 t/s（1.21 倍）。oMLX 的 `gemma-4-26B-A4B-it-oQ4e-mtp` 关闭 MTP 后 30k 解码为 67.8，开启 MTP 为 97.0。
+
+| t/s | pp2048 @0 | pp2048 @8k | pp2048 @32k | pp512 @0 | pp512 @8k | pp512 @32k | tg64 @0 | tg64 @8k | tg64 @32k |
+|---|---|---|---|---|---|---|---|---|---|
+| 本分支 | 5218 | 4204 | 2613 | 4274 | 3359 | 2161 | 127.6 | 113.5 | 102.0 |
+| 上游 | 4567 | 3548 | 1958 | 4164 | 3220 | 1913 | 126.9 | 108.5 | 86.3 |
+| 本分支 / 上游 | 1.14x | 1.18x | 1.33x | 1.03x | 1.04x | 1.13x | 1.01x | 1.05x | 1.18x |
+
+| 每步 token | 1 | 2 | 4 | 8 | 16 | 24 | 32 | 48 | 64 | 96 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 本分支 | 8.1 | 10.1 | 12.2 | 15.7 | 22.4 | 24.1 | 26.2 | 33.7 | 35.5 | 54.9 |
+| 上游 | 8.2 | 10.1 | 12.2 | 15.5 | 24.9 | 45.6 | 41.9 | 46.0 | 48.2 | 53.9 |
+| 上游 / 本分支 | 1.00x | 1.00x | 1.00x | 0.99x | 1.11x | 1.89x | 1.60x | 1.36x | 1.36x | 0.98x |
+
+| 并发路数 | 1 | 2 | 3 | 4 | 1，投机解码 | 4，投机解码 |
+|---|---|---|---|---|---|---|
+| 本分支 | 122.9 | 190.7 | 261.9 | 321.2 | 98.9 | 202.6 |
+| 上游 | 122.4 | 189.9 | 262.3 | 311.3 | 102.3 | 171.0 |
+| 本分支 / 上游 | 1.00x | 1.00x | 1.00x | 1.03x | 0.97x | 1.18x |
+
+App 启动：本分支就绪 2.2 s，上游 2.3 s。
+
+### 3.3 小结
+
+- 预填充：本轮 8k 预填充服务器端到端 Qwen 1.69 倍、gemma 1.22 倍；llama-bench `pp8192 @8k` 为 1.77 / 1.21 倍（上一轮 `pp2048` 为 1.5-2.0 倍）。
+- 解码：短上下文与上游持平（0.99-1.01 倍），长上下文更快：30k 时 Qwen +4%、gemma +18%（H3 的 GQA 打包注意力）。
+- 投机解码与小批量：一步 16-64 个 token 是上游的 1.0-2.7 倍（H4 / M1）；30k 上 Qwen 的 MTP 41.2 对 34.5 t/s，gemma 的 DFlash 117.2 对 83.9 t/s。
+- 并发（App 的 4 路布局）：2-4 路合计 1.0-1.22 倍，4 路投机解码 Qwen 1.36 倍、gemma 1.18 倍。gemma 单路投机解码 0.97 倍是这一个提示上的接受率差异（0.206 对关闭 A2 门槛时 0.227，提示的数值略有不同导致生成的文本不同），不是内核变慢：这一步里被门槛影响的只有 342 token 的提示预填充。
+- 与 oMLX：8k 预填充 Qwen 慢 4%、gemma 慢 10%；30k 解码（oMLX 关 MTP）Qwen 慢 10%、gemma 快 57%；投机解码 MTP 对 MTP：Qwen 慢 13%（41.2 对 47.1）、gemma 快 21%（117.2 对 97.0）。
+- 启动与内存（上一轮）：Qwen 就绪 1.9 对 2.7 s，常驻内存 3.3 对约 21 GB；关闭思考后不再重新处理整段对话。
+- 精度：除 I8 外的改动与上游一致到参照量级；I8 在 gemma 上有可见代价，可单独关闭（第 9 节）。
+
+## 4. 方法
+
+- **先算差距账。** 动手之前，先用调试开关逐类跳过算子，测出每类算子的耗时并与硬件上限比较；只处理上限明显高于 1.5% 的部分。例如 gemma 的 MoE 预填充大部分时间在专家矩阵乘（MUL_MAT_ID）上，这一部分只跑到稠密路径一半的算力，M1 / M2 由此而来。
+- **先筛选，再确认。** 受算力限制的候选先在合成权重上做内核级 A/B（同一进程内交错），增幅超过 1.5% 且多轮方向一致才进入真实模型测量。保留的方案全部在满功率（`powermode 0`）下确认，本文所有数字都是满功率数据。
+- **交错测量。** 不同场次之间绝对数值会随发热状态漂移 5-15%。每次对比都在同一场次里按正序再反序运行各配置，只比较同一场次内的比值。测试之间间隔 2 分钟；漂移过大的测试段作废重测。
+- **按留一法取舍。** 一项改动看的是它在最终组合中的贡献（全部开启减去这一项），而不只是单独开启时的效果。
+- **按格式、按形状逐一验证。** 矩阵乘类改动对每一种权重格式分别在合成权重上做内核级 A/B（稠密：17408x5120 与 5120x17408；MoE：gemma-4 的专家形状），只对确实更快的格式和行数范围开启；同时比对两条路径的输出校验和。
+- **按模型结构验证。** 注意力类改动在 Qwen 与 gemma 的结构上测：每个 KV 头对应 6 / 8 个 query 头，head size 128 / 256 / 512。某个结构上变慢的情形用门槛排除（例如 H3 对每 KV 头 4 个 query 头的单 token 解码）。
+- **精度把关。** 每个模型都以上游的完整 logits 为基准测 KL 散度（逐 token 配对比较，比困惑度灵敏得多），并以上游自身 `-fa on` 与 `-fa off` 之间的差作为"正常数值差异"的参照；有损的改动要么改进到参照量级附近，要么写明代价并可单独关闭（见第 9 节）。
+- **固定提示。** 投机解码的速度取决于生成文本接受了多少草稿；对单项改动的端到端对比使用固定提示，并确认输出文本相同后再比较耗时。
+- **上游核查。** 每次都在上游 `master` 上重建并重新测量；本文基于 `785322d17f`（b12033）。
+
+## 5. 调研到的候选方案
+
+调研来源：MLX（steel attention / gemm NAX 内核、`gated_delta` 内核、`gather_qmm`）、oMLX 0.7.1、uzu、BaseRT、MTPLX、dflash-mlx、mlx-dspark、vllm-mlx、mlx-vlm、FastVLM、llama.cpp 自己的 CUDA 后端（MMQ），以及 llama.cpp 的服务器和 Web UI 代码。
+
+| 方面 | 候选方案 | 来源 | 结局 |
+|---|---|---|---|
+| 预填充注意力 | 寄存器常驻的 NAX flash attention | MLX `steel_attention_nax` | 保留（A1） |
+| 预填充矩阵乘 | tensor mat-mat 使用 half 激活 | 自研 | 保留（A2） |
+| 预填充矩阵乘 | 寄存器常驻的 NAX mat-mat，长 K 用 split-K | MLX `steel_gemm_fused_nax` / split-K | 保留（A3） |
+| 预填充 GDN | 递推每状态行用更少的 lane | oMLX `gated_delta_pipelined` | 保留（A4） |
+| 预填充矩阵乘 | INT8 激活 mat-mat | CUDA MMQ、uzu、oMLX oq_a8 | 保留（I8） |
+| 预填充 | 激活直接写成下一个 mat-mat 的输入格式 | 自研 | 保留（A5） |
+| 多轮缓存 | 关闭思考时不改变渲染出的提示 | 自研 | 保留（S1） |
+| 启动 | 加载时不清零新分配的 KV / 递推状态 | 自研 | 保留（S2-a） |
+| 启动 | 首次驻留请求放到后台 | 自研 | 保留（S2-c） |
+| 并发 / 投机解码 | 2-3 行的跨行 mat-vec | 自研 | 保留（K3） |
+| 短提示 | 小批次不做 f16 激活转换 | A2 的后续 | 保留（A2 门槛） |
+| 投机解码 / 长上下文 | 共享 KV 头的 query 头打包进一个 NAX 注意力 tile | MLX 多行注意力的思路，自研 | 保留（H3） |
+| 并发 / 投机解码 / 短提示 | 2-64 行在 NAX 上做矩阵乘，所有格式共用一个内核 | 自研，基于上游 few-row MMA | 保留（H4） |
+| MoE 短批次 | MoE mat-mat 的使用门槛 | 自研 | 保留（M1） |
+| MoE 预填充 | 每块更多条目，减少专家权重的反量化次数 | MLX `gather_qmm` 按专家分段的思路 | 保留（M2） |
+
+不在本项目范围内：KV 量化（turboquant）、GPU 采样、MTL4 命令编码、媒体缓存。
+
+## 6. 各项结果与取舍
+
+取舍规则：单项增幅在多轮中方向一致且超过 1.5%；作为其他显著优化前提的改动除外。
+
+### 6.1 预填充，稠密模型（Qwen3.8-27B Q5_K_M，llama-bench `-fa 1 -ub 2048`，8k 上下文下 pp2048）
+
+"单独" = 只开这一项、其余全关（A3 依赖 A2；I8 依赖 A2 和 A3；A5 依赖 A3）。"留一法" = 全部开启、只关这一项。正反序两轮，按每轮内的比值取均值。
+
+| # | 单独（相对全关） | 留一法 |
+|---|---|---|
+| A1 | +4.5% | +3.5% |
+| A2 | +12.1% | （A3/I8 的前提） |
+| A3 | 相对 A2 +10.9% | （I8 的前提） |
+| A4 | +1.8% | +3.4% |
+| I8 | 相对 A2+A3 +26.2% | +32.2% |
+| A5 | 相对 A2+A3 +0.4% | +2.7% |
+| **全部开启** | **上游的 1.73 倍** | |
+
+A4 单独开启只有 +1.8%，在完整组合中为 +3.4%：其他部分变快后，GDN 在总时间中的占比变大。A5 同理。
+
+内核级（同进程交错 A/B，2048 行）：
+- A1：flash attention q2048 x kv8192 21.6 -> 11.8 ms，kv32768 100 -> 55 ms（对比上游 tensor-API 内核）。
+- A3：f16 GEMM 17408x5120 7.1 -> 6.1 ms（59.7 TFLOP/s，与 MLX 稠密 f16 NAX gemm 持平）；量化格式 gate/up 形状 +8-17%，down 形状（K = 17408，split-K）+15-22%。
+- A4：GDN 每 2048 token 192 -> 97 ms。
+- I8：每个 mat-mat 上 int8 路径是 f16 NAX 路径的 1.3 倍（纯 int8 NAX 吞吐为 f16 的 2.1 倍）。
+
+### 6.2 注意力结构与 MoE（A1 / H3 的扩展，M1，M2）
+
+| 项 | 模型 | 效果（开 vs 关） |
+|---|---|---|
+| A1 扩展到 head size 512 | gemma-4-26B-A4B | pp2048 @0 / @8k / @32k：+0.4% / +3.4% / +12% |
+| H3（解码，2k / 8k / 16k / 32k） | Qwen3.8-27B（每 KV 头 6 个 query 头） | +5% / +3% / +6% / +8% |
+| | gemma-4-26B-A4B（8 个） | +1.5% / +6% / +9% / +18% |
+| H3（4 token 的一步，即投机解码验证） | Qwen / gemma | +6% 至 +55%（2k-32k），32k 时 1.2-2.0 倍 |
+| M1（一步 16 / 20 / 24 / 28 token） | gemma-4-26B-A4B | +6% / +14% / +23% / +30% |
+| | gemma-4-26B-A4B | 0 / +4.5% / +5~9% / +3~4% |
+
+- M1：上游在 32 个 token 以下对每个（token, 专家）条目各读一遍专家权重；改用 mat-mat 后每块最多 32 个条目共用一次读取。12 token 时两个模型方向相反（-3% / +7%），所以门槛定在 16。
+- M2：上游的 MoE mat-mat 每块最多 32 个条目，每块都要把专家权重反量化一次。每专家平均 128 个条目及以上时，64 条目的块对全部 25 种格式、三种专家形状都更快（+5~35%，第 7.3 节）；条目更少时半空的块得不偿失，所以只在此时启用。gemma 的 pp1024（每专家 64 个条目）低于门槛，保持原样。
+
+### 6.3 解码与服务路径（Qwen3.8-27B Q5_K_M）
+
+| # | 效果（开 vs 关） | 测法 |
+|---|---|---|
+| S1 | 7k token 对话关闭思考后需要重新处理的 token：7330 -> 4（预填充 38.3 s -> 0.37 s） | Qwen3.8 的聊天模板，功能性改动 |
+| S2-a | 就绪 2.96 -> 2.03 s（-31%）；常驻内存 21 GB -> 3.3 GB | App 参数，各 2 次 |
+| S2-c | 就绪 2.24 -> 2.01 s（-10%） | 同上 |
+| K3 | 每步耗时：2 行 57.7 -> 42.5 ms（+36%），3-32 行 +3-5% | llama-bench，正反序 |
+| H4 | 每步耗时：12 / 16 / 24 / 32 / 48 / 64 行 90.9 / 93.5 / 200.3 / 199.3 / 201 / 207 -> 52.8 / 56.0 / 74.3 / 82.0 / 132 / 145 ms；2-8 行 +5-16% | 同上 |
+| H3 | 开 MTP 解码：30k 27.9 -> 31.2 t/s（+11.9%），8k 26.3 -> 27.5（+4.8%）；输出文本逐字节相同 | 固定提示，正反序各 2 轮 |
+| A2 门槛 | 128 行以下保持 f32 激活，避免额外的转换派发；每步耗时 12-96 行快 2-6% | llama-bench |
+| 并发（K3：2 路；H4：4 路开 MTP） | 2 路 +18%（K3），4 路开 MTP +42%（H4 与 H3） | 同一轮次内的比值 |
+
+S2-c 依赖 S2-a：清零会触碰页面，缓冲区就不再是"新的"，所以只关 S2-a 时 S2-c 不起作用。K3 与 H4 按格式和行数分工（第 7 节）：q5_K 在 2 行走 K3，3 行起走 H4。
+
+### 6.4 其余改动的数据
+
+以下改动的效果数据来自各自的测量（提交说明），测于同一台机器。
+
+- **A6 BF16 K/V 的 NAX 注意力**：预填充和 GQA 内核直接读 BF16 缓存、在寄存器里转成 f16（钳到 f16 范围）；与 F16 缓存 logits 的 KL 为 Qwen 0.00054、gemma 0.056，与同一 BF16 缓存上的 tensor 内核同量级。
+- **A8 BF16 权重的 NAX mat-mat**：1024 行起把权重转一次 f16 后走 NAX，不使用 int8 变体。
+- **A7 MLA 形状 192/128、576/512 的 NAX 注意力**：K、V 头维分别拆分；GQA 内核仍只做等头尺寸。
+- **A9 NVFP4 / TQ1_0 权重**：这两种格式原先在 Metal 上回退到 CPU；现在覆盖 mat-vec、few-row MMA、mat-mat、MoE mat-mat 和 NAX 路径，test-backend-ops 新增 58 / 78 个用例。
+- **H5 量化 K/V 缓存的 GQA 注意力**：q4_0 / q4_1 / q5_0 / q5_1 / q8_0 / iq4_nl 缓存按原格式读、在寄存器内反量化；q8_0 缓存 tg64 @32k：gemma 93.3 对 vec 内核 73.0。
+- **H3b GQA 内核重写**：每个 threadgroup 最多 8 个 16 行 tile（head size 512 为 4），沿网格分块，KV 份数在运行期取 min(32, 1024/ne01)；16 token 一步 @32k：gemma 188 -> 427 t/s。
+- **A3b int8 门槛降到 448 行**：448-896 行每个 mat-mul +12-47%。
+- **A5b 融合 GLU 写回原位**：激活写进 mat-mat 自己的 f32 结果，消除与 gate/up 释放后的内存竞争。
+- **A10 BF16 + head size 512 + 超过 32 个 query 的预填充**让回 tensor 内核：gemma pp2048 在 8k / 32k 上下文下上游快 6% / 16%。
+
+## 7. 量化格式
+
+### 7.1 各改动覆盖的格式
+
+- **与权重格式无关**：A1、H3（注意力，只看 F16 K/V）、A4（GDN）、A2 与 A2 门槛（激活转换）、S1、S2-a、S2-c。
+- **A3 / I8 / A5（>= 1024 行的预填充）**：F16 与 23 种量化格式：q4_0、q4_1、q5_0、q5_1、q8_0、q1_0、q2_0、mxfp4、q2_K、q3_K、q4_K、q5_K、q6_K、iq1_s、iq1_m、iq2_xxs、iq2_xs、iq2_s、iq3_xxs、iq3_s、iq4_nl、iq4_xs、tq2_0（I8 不含 F16）。权重先经各格式的反量化函数转成 f16，所以每种格式只需要一个反量化实例。
+- **M1 / M2（MoE）**：上游 MoE mat-mat 支持的全部格式；M2 在 25 种格式上逐一测过（第 7.3 节）。
+- **H4（2-64 行）**：few-row 内核支持的全部 26 种格式（上面 23 种加 f32、f16、bf16），按格式和行数开启：
+
+| 行数 | 开启的格式 |
+|---|---|
+| 33-64 | 按格式的上限：64（q4_0、q4_1、q5_0、q5_1、q8_0、q2_K、q4_K、q5_K、q6_K、f16、bf16、tq2_0、q1_0、q2_0），56（mxfp4、iq4_nl、iq4_xs、iq2_xxs、iq2_s），48（q3_K、iq3_xxs、iq3_s、iq1_s），40（iq2_xs、iq1_m）；f32 不开 |
+| 17-32 | 全部 26 种 |
+| 9-16 | 全部量化格式（f32 / f16 / bf16 不更快，保持原路径） |
+| 2-8 | iq 系列、q1_0、q2_0（2 行起）；q2_K、tq2_0、q5_K（3 行起）；q6_K（2-4 行） |
+
+- **K3（2-3 行）**：q4_K（2-3 行）、q5_K（2 行）。
+
+### 7.2 稠密矩阵乘的内核级数据（合成权重，M5 Max，满功率，相对原路径的速度比）
+
+| 格式 | 2-8 行：H4 / 原路径 | 9-16 行：H4 / MMA | 17-32 行：H4 / mat-mat | 33-64 行：H4 / mat-mat | 2048 行：A3+I8 / mat-mat |
+|---|---|---|---|---|---|
+| f32 | 0.99-1.01x | 1.01-1.02x | 1.10-1.14x | - | - |
+| f16 | 0.97-0.99x | 0.98x | 1.60-1.62x | 1.11-1.38x | 原有覆盖 |
+| bf16 | 0.99-1.00x | 0.97-0.99x | 1.63-1.68x | 1.19-1.50x | - |
+| q1_0 | 1.01-1.56x | 2.13-2.41x | 2.67-3.32x | 1.42-1.96x | 1.42x |
+| q2_0 | 1.16-1.49x | 2.17-2.28x | 2.65-3.06x | 1.43-1.79x | 1.44x |
+| q4_0 | 1.00-1.17x | 1.64-1.74x | 2.35-3.11x | 1.35-1.74x | 原有覆盖 |
+| q4_1 | 0.99-1.22x | 1.58-1.62x | 2.27-2.89x | 1.27-1.77x | 原有覆盖 |
+| q5_0 | 0.92-1.00x | 1.71-1.72x | 2.27-2.56x | 1.23-1.48x | 原有覆盖 |
+| q5_1 | 0.94-1.02x | 1.62-1.66x | 2.17-2.44x | 1.17-1.42x | 原有覆盖 |
+| q8_0 | 0.92-0.93x | 1.09-1.13x | 1.90-2.16x | 1.21-1.46x | 原有覆盖 |
+| mxfp4 | 0.94-1.02x | 1.56-1.58x | 1.88-2.23x | 1.07-1.26x | 1.41x |
+| q2_K | 0.93-1.40x | 1.77-2.04x | 2.38-2.91x | 1.35-1.63x | 1.46x |
+| q3_K | 0.91-1.12x | 1.69-1.73x | 1.63-1.93x | 1.01-1.09x | 1.49x |
+| q4_K | 0.80-1.04x | 1.48-1.49x | 2.13-2.52x | 1.23-1.45x | 原有覆盖 |
+| q5_K | 0.88-1.22x | 1.62-1.74x | 1.92-2.37x | 1.14-1.37x | 原有覆盖 |
+| q6_K | 0.99-1.68x | 1.55-1.56x | 1.73-2.08x | 1.11-1.20x | 原有覆盖 |
+| iq1_s | 1.10-1.44x | 1.94x | 1.75-2.13x | 1.00-1.23x | 1.45x |
+| iq1_m | 1.00-1.31x | 1.92-2.00x | 1.71-2.07x | 1.01-1.16x | 1.43x |
+| iq2_xxs | 0.96-1.25x | 1.86x | 1.65-2.24x | 1.11-1.23x | 1.41x |
+| iq2_xs | 1.02-1.42x | 1.93-2.06x | 1.65-1.98x | 0.99-1.14x | 1.41x |
+| iq2_s | 1.08-1.32x | 1.71-1.94x | 1.97-2.29x | 1.04-1.27x | 1.42x |
+| iq3_xxs | 1.05-1.25x | 1.83-1.87x | 1.75-2.21x | 1.00-1.19x | 1.45x |
+| iq3_s | 1.06-1.23x | 1.87-1.91x | 1.63-2.10x | 1.01-1.18x | 1.43x |
+| iq4_nl | 0.98-1.15x | 1.57-1.65x | 1.84-2.34x | 1.06-1.27x | 1.45x |
+| iq4_xs | 0.99-1.17x | 1.68-1.71x | 1.83-2.23x | 1.07-1.16x | 1.44x |
+| tq2_0 | 0.65-1.25x | 2.06-2.09x | 2.51-2.95x | 1.41-1.71x | 1.43x |
+
+- 形状 17408x5120 与 5120x17408，两轮取均值；范围是各行数中的最小与最大。2-8 行一栏是对所有格式测得的结果，只有第 7.1 节列出的格式和行数实际开启；33-64 行一栏是开启范围内的结果。
+- "原有覆盖"表示该格式在 A3/I8 最初就已支持，其效果见第 6.1 节。
+- 2-3 行跨行 mat-vec（K3）：q5_K 在 2 行比原路径快 21%，3 行快 6%（3 行 H4 更快，所以 3 行用 H4）。
+
+### 7.3 MoE 矩阵乘的内核级数据（M2：64 条目的块 vs 32 条目，合成权重，随机路由）
+
+形状：gemma-4 的 gate_up（128 专家选 8，K = 2816，N = 1408）与 down（K = 704，N = 2816）。K 不是 256 倍数的形状无法存放 K-quant 与 IQ 格式，这些格式只测 gemma gate_up。T = 128 / 512 / 2048 个 token，相当于每专家 8 / 32 / 128 个条目。两轮中位数。
+
+| 格式 | gemma gate_up（T = 128 / 512 / 2048） | gemma down |
+|---|---|---|
+| mxfp4 | +2%/+22%/+32% | -8%/-11%/+24% |
+| q4_0 | -7%/+14%/+14% | -25%/-3%/+10% |
+| q4_1 | -8%/-12%/+12% | -3%/+28%/+9% |
+| q5_0 | -5%/+11%/+31% | -7%/+35%/+5% |
+| q5_1 | -4%/+13%/+29% | -6%/-18%/+24% |
+| q8_0 | +3%/-0%/+20% | -1%/+9%/+13% |
+| f16 | +1%/+3%/+16% | -0%/+4%/+6% |
+| bf16 | +1%/+3%/+9% | +2%/+4%/+8% |
+| q2_K | -3%/+28%/+20% | - |
+| q3_K | +202%/+13%/+33% | - |
+| q4_K | -5%/-8%/+24% | - |
+| q5_K | -3%/+18%/+32% | - |
+| q6_K | +12%/+11%/+20% | - |
+| iq2_xxs | -9%/+18%/+21% | - |
+| iq2_xs | -4%/+15%/+19% | - |
+| iq2_s | +10%/+12%/+19% | - |
+| iq3_xxs | -26%/+23%/+21% | - |
+| iq3_s | +12%/-16%/+24% | - |
+| iq1_s | -5%/+19%/+19% | - |
+| iq1_m | +15%/+27%/+21% | - |
+| iq4_nl | -15%/+9%/+29% | -9%/-6%/+21% |
+| iq4_xs | -13%/+14%/+28% | - |
+| tq2_0 | +48%/+20%/+21% | - |
+| q1_0 | -3%/+20%/+8% | - |
+| q2_0 | +4%/-27%/+12% | -5%/-22%/+10% |
+
+### 7.4 解码 mat-vec 的带宽（单 token）
+
+单 token 解码的矩阵乘受带宽限制，原有的 mat-vec 内核在各格式上已接近可持续带宽：f16 约 545 GB/s，q4_K 528，q8_0 524，q5_K 501-531，q6_K 507-520（同一场次，合成权重）。q5_K / q6_K 的内核参数调优最多只有 +0.9%，所以单 token 路径没有改动。
+
+## 8. 保留项的实现
+
+**A1：NAX flash attention**（`kernels/fa_tensor.metal`，派发在 `ggml-metal-ops.cpp`）。F16 K/V 的预填充注意力把分数、概率和 O 都留在寄存器里（16x32x16 的 `matmul2d` 片段，BQ = 64，BK = 32），结构参照 MLX 的 `steel_attention_nax`；head dim 分给 WN 个 simdgroup（head size 128 为 1 个，256 为 2 个，512 为 4 个），各自的部分分数按固定顺序经 threadgroup 内存相加。每个块的掩码标志提前一块预取：否则跳过全掩码块的那个分支每次迭代都要等设备内存读取（单这一点端到端 +4-8%）。遇到 ALiBi 和 softcap 时回退到原有的 tensor 内核。
+
+**A2：f16 激活**（`kernels/mul_mm.metal`、`ggml-metal-ops.cpp`、`ggml-metal.cpp`）。tensor `mul_mm` 内核用 half 激活比用 f32 快约 1.25 倍，所以先把 f32 激活转换（饱和到 +/-65504）到一个额外的缓冲区。只用于稠密 mat-mat（MoE 的版本单独评估）。
+
+**A3：NAX mat-mat**（`kernels/mul_mm.metal`、`ggml-metal-impl.h`、`ggml-metal-ops.cpp`）。批次至少 1024 行时（`GGML_METAL_MM_NAX_MIN_ROWS`，测试用参数），每个 mat-mat 先把权重经该格式的反量化函数转成 f16 一次，然后在一个不用 threadgroup 内存的内核上做乘法：操作数直接载入片段，每个 64x128 tile 由 2x4 个 simdgroup 计算，threadgroup 做 swizzle，每 256 K 一次 barrier。禁止 K 循环展开是它变快的关键（0% -> 15%）。当 K >= 3*max(M, N) 时，K 被切成 4096 宽的分段依次派发、累加到 dst，使操作数切片留在缓存里（MLX 对长 K 也这样做）。
+
+**A4：GDN 每行 4 个 lane**（`kernels/gated_delta_net.metal`、`ggml-metal-ops.cpp`）。原来每个状态行 32 个 lane，递推受指令数限制（每个 token 两次 5 步归约）。改为每行 4 个 lane（状态大小 256 时为 8 个，否则每个 lane 需要 64 个寄存器）后，每个 lane 保存 32 个状态值，归约只需 2 步（8 lane：1.87 倍，4 lane：1.98 倍）。其他形状、非标量 gate 和未对齐的输入仍走原有内核。
+
+**I8：int8 mat-mat**（`kernels/mul_mm.metal`：`kernel_mul_mm_q8a_f32`、`kernel_mul_mm_dq_<type>_i8`、`kernel_mul_mm_nax_i8`）。激活和反量化后的权重都量化为对称 int8，每（行，128 列）一个 scale；量化前对每组 128 个值做一次不归一化的 Walsh-Hadamard 变换（`i8_wht128`，32 个 lane 各持 4 个值，组内 2 级加减 + 5 级 `simd_shuffle_xor`），两边用同一个变换，点积不变（1/128 折进激活的 scale），而离群值被摊到整组，scale 不再被少数大值撑大。`matmul2d<int8, int8, int32>` 累加 128 宽的一组 K，然后折回到 f32 累加器（`c += s_a*s_w*ci`）。tile 结构和 split-K 与 A3 相同；它复用 A3 预留的缓冲区，不需要额外内存。每 32 列一个 scale 精度也更好，但折回次数多 4 倍，Qwen pp2048 慢 25%，所以保持 128 列、用变换补精度：KL 散度 Qwen 0.0023 -> 0.0007、Llama 0.0009 -> 0.0004、gemma 0.112 -> 0.067，速度代价 0-2%。这与 CUDA MMQ 路径的 q8_1 激活以及 oMLX 的 oq_a8 属于同一类有损捷径（精度见第 9 节）。
+
+**A5：SWIGLU -> down 投影**（`ggml-metal-fusion.cpp`、`kernels/unary.metal`）。当 SWIGLU 的输出送入一个 NAX mat-mat 时，GLU 内核直接写出该 mat-mat 所需的 f16 或 int8 激活（含 scale）；f32 的 GLU 输出和单独的转换那一遍都省掉了。结果与不融合的路径逐位相同。
+
+**S1：关闭思考时保留对话缓存**（`tools/ui`）。界面的思考档位 低 / 中 / 高 原本就以 `thinking_budget_tokens` 发送，切换不会打断缓存；只有"关闭"发送 `chat_template_kwargs.enable_thinking=false`，Qwen3.8 的模板会因此去掉系统部分开头的一段说明，整段对话从第 5 个 token 左右起被重新处理。现在"关闭"改为发送 `thinking_budget_tokens: 0`，输出与模板的空思考块相同，提示前缀不变。新增设置"关闭思考时保留对话缓存"（设置 -> 开发者，默认开启）。
+
+**S2-a：加载时不清零**（`ggml-metal-device.cpp`、`common/common.cpp`）。Metal 的共享缓冲区来自 `vm_allocate`，本来就是零，但 KV 缓存在分配后清零一次、预热后又清零一次，触碰并提交了每个页面（262k 上下文时 KV 约 16 GiB、递推状态 2.4 GiB）。Metal 端记录缓冲区自分配以来是否被触碰过，未触碰时跳过清零；`common` 端在预热后只重置 KV 单元，不擦除数据。
+
+**K3：2-3 行的跨行 mat-vec**（`kernels/mul_mv.metal`）。与单行 mat-vec 相同的 lane 布局，但一个块的量化值和 scale 只解包一次，与 2-3 行激活分别做点积；解包后的值用 half 保存以限制寄存器用量。q4_K 用于 2-3 行，q5_K 用于 2 行。
+
+**S2-c：首次驻留请求放到后台**（`ggml-metal-device.cpp`）。驻留集的第一次 `requestResidency` 会为 GPU 映射每个页面，262k 上下文的 KV 约需 0.4 s。对自分配以来未被触碰的共享缓冲区，这个请求放到后台队列执行，完成后驻留集再加入保活集合；释放缓冲区时会等待它。
+
+**A2 门槛**（`ggml-metal-ops.cpp`）。A2 在 tensor mul_mm 之前把 f32 激活转为 f16，每次 mul_mm 多一次派发和前后两个 barrier，是固定成本；128 行以下这部分成本大于 half 激活省下的时间；128-512 行时，计算量小的矩阵乘（K/V 投影、递推状态的小投影）也是如此。现在 128 行且单次矩阵乘 4 GFLOP 起才转换（NAX mat-mat 只吃 f16，照旧转换），额外缓冲区也按同一条件预留。门槛扫过 2 / 4 / 8 / 16 GFLOP：4 是 Qwen 与 gemma 的 pp128 / 256 / 512 上都不变慢的取值。
+
+**H3 / H3b：GQA 打包的 NAX 注意力**（`kernels/fa_tensor.metal`：`kernel_flash_attn_ext_nax_gqa`；`ggml-metal-ops.cpp`）。解码和投机解码验证时，vec 内核对每个 query 头读一遍 K/V。新内核把共享一个 KV 头的 G 个 query 头和 ne01 个 token 打包成一个 NAX tile 的行（p = g*ne01 + i），每个 K/V 块只读一次；每个 threadgroup 打包最多 8 个 16 行 tile（head size 512 为 4），沿网格按行块派发，KV 范围按 min(32, 1024/ne01) 切分交给这些 threadgroup；结果写成 vec 内核的临时缓冲区格式，由现有的 `kernel_flash_attn_ext_vec_reduce` 合并。条件：head size 128-512、F16 K/V、有掩码、没有 ALiBi / softcap、每个 KV 头至少 2 个 query 头；打包后只有不到 5 行（每 KV 头 4 个 query 头的单 token 解码）且 KV 短于 16k 时，tile 的大部分是空行，保持 vec 内核。
+
+**H4：2-64 行的 NAX few-row mat-mat**（`kernels/mul_mm.metal`：`kernel_mul_mv_nax_f32`；`ggml-metal-common.cpp`、`ggml-metal-ops.cpp`）。src1 的行是 16x32x16 matmul2d 的 M = 16 行（一次一个或两个 16 行 tile，更多的行沿网格的第二维分成多遍），32 个权重行是它的 N；每个 lane 通过该格式的反量化函数把 16 个权重直接解到 half 片段里，不用 threadgroup 内存；4 个 simdgroup 切分 K，最后在 threadgroup 内存里求和。为了让每个 lane 一次解出一个完整的 16 权重组（反量化函数的单位），K 在每个 64 权重的块内做了排列，src0 与 src1 用同一个排列。q5_K 另有一个用 16 字节加载和位运算代替逐权重分支的反量化函数。各格式在哪些行数开启由一个函数集中决定（第 7.1 节）。支持与 MUL_MAT + ADD（残差加）融合。
+
+**M1：MoE mat-mat 从 16 个 token 起**（`ggml-metal-common.cpp`）。`ggml_metal_op_mul_mat_id_use_mm` 在有 tensor 单元的设备上把门槛从 32 改为 16；其他设备保持 32。
+
+**M2：MoE mat-mat 每块 64 个条目**（`kernels/mul_mm.metal`：`kernel_mul_mm_id_map0`、`kernel_mul_mm_id`；`ggml-metal-device.cpp`、`ggml-metal-ops.cpp`）。路由预处理把每个专家的条目切成块，主内核对每块把 64 行权重反量化一次并与块内的条目相乘。一个函数常量把块大小从 32 切换到 64（预处理与主内核同时切换）：64 条目的块按 16 行的四分之一块做 `matmul2d`，没有条目的四分之一块跳过；每个线程多装载一行激活；threadgroup 内存从 8 KB 增加到 16 KB。只在有 tensor 单元的设备上、专家平均至少 128 个条目时使用。
+
+**A6 / A7 / A8 / A10：BF16 与 MLA**（`kernels/fa_tensor.metal`、`kernels/mul_mm.metal`、`ggml-metal-ops.cpp`）。BF16 缓存按原格式读入、在寄存器里钳到 f16 再做 MMA；MLA 的 192/128 与 576/512 把 K、V 头维分开拆（576/512 的 K 用 1 个 simdgroup、V 用 4 个）；BF16 权重 1024 行起转一次 f16 后走 NAX。BF16 + head size 512 + 超过 32 个 query 的预填充仍让回 tensor 内核。
+
+**A9 / A3b：更多权重格式**（`kernels/mul_mv.metal`、`kernels/dequantize.h`、`ggml-metal-ops.cpp`）。NVFP4 的 UE4M3 子块 scale 与 TQ1_0 的三进制位在核心里解码，两种格式接入全部 Metal 路径；int8 的 NAX 门槛从 1024 行降到 448 行。
+
+**H3b / H5：GQA 内核**（`kernels/fa_tensor.metal`、`ggml-metal-ops.cpp`）。每个 threadgroup 打包最多 8 个 16 行 tile（head size 512 为 4），沿网格分块；量化缓存按原格式读、每次载入解 4 个值；KV 份数取 min(32, 1024/ne01)。
+
+**A5b：融合 GLU 写回原位**（`ggml-metal-fusion.cpp`）。激活写进 mat-mat 自己的 f32 结果，消除与 gate/up 释放后的内存竞争。每项改动的环境变量见第 2 节的开关一列。
+
+## 9. 数值精度
+
+- `test-backend-ops -b MTL0`：MUL_MAT 3892/3892（few-row 用例覆盖全部格式的 2-64 行；在 `GGML_METAL_MM_NAX_MIN_ROWS=1` 下也通过，该设置让所有符合条件的用例都走 NAX / int8 内核），MUL_MAT_ADD 384/384，MUL_MAT_ID 867/867（M2 的 32 / 64 条目两种块都通过），FLASH_ATTN_EXT 4973/4973（含 head size 128 / 256 / 512 与 MLA 的 NAX 路径），GATED_DELTA_NET 30/30。每个提交单独编译并通过与它相关的测试。
+- KL 散度（主要指标）：以上游的完整 logits 为基准（`llama-perplexity --kl-divergence-base`，8 x 2048 token，`-c 2048 -b 2048 -ub 2048 -fa on`，文本为 llama.cpp 仓库文档），逐 token 比较本分支的输出分布。每格为平均 KL 散度 / top-1 一致率。参照列是上游自己换一种等价设置（`-fa off`，或 `-ub 512`）时与它本身的差，代表"正常的数值差异"：
+
+| 模型 | 本分支，全部开启 | 本分支，关 I8 | 参照：上游 -fa off | 参照：上游 -ub 512 |
+|---|---|---|---|---|
+| Qwen3.8-27B Q5_K_M | 0.0007 / 99.00% | <0.0001 / 99.96% | <0.0001 / 99.96% | <0.0001 / 100.00% |
+| gemma-4-26B-A4B Q4_0 | 0.0670 / 90.20% | 0.0236 / 94.89% | 0.0244 / 94.92% | 0.0042 / 98.90% |
+
+  - 除 I8 以外的改动在 Qwen 上与上游几乎逐位一致（KL 散度 < 0.0001）；在 gemma 上与参照同一量级。gemma 对任何数值差异都更敏感：上游自己 `-fa on` 与 `-fa off` 之间就差 0.024。逐项开关定位（全部关闭再单独打开一项）显示这部分来自 A1（NAX 注意力）与 A2/A3（f16 路径），各约 0.02；其余改动（H3、H4、K3、M1、M2、A5）与上游逐位相同。结果是确定的：重复运行、关闭并发都得到完全相同的数值。
+  - I8 是唯一有实质代价的改动：int8 激活在 Qwen 上增加约 0.0007，在 gemma 上约 +0.043（top-1 一致率 94.9% -> 90.2%），是参照的约 3 倍。量化前的 Walsh-Hadamard 变换已把这部分误差降到原来的 1/3（Qwen）到 3/5（gemma），见第 8 节。I8 默认开启，因为它是稠密模型预填充最大的单项收益（Qwen 留一法 +32%，gemma +7%）；在意精度的场景可以用 `GGML_METAL_MM_I8_DISABLE=1` 单独关闭，其余改动不受影响。
+- 困惑度（同样的文本与设置），全部改动开启 vs 上游，作为补充：
+
+| 模型 | 本分支 | 上游 | 差 | 统计误差 |
+|---|---|---|---|---|
+| Qwen3.8-27B Q5_K_M | 3.4648 | 3.4652 | -0.01% | +/-0.08 |
+| gemma-4-26B-A4B Q4_0 | 65.5324 | 64.6739 | +1.33% | +/-3.42 |
+
+  困惑度的统计误差远大于上面的 KL 散度差，只能排除大的错误。注意 gemma 的 `--kl-divergence-base` 那一轮报告的困惑度（62.71）与同一个上游二进制普通运行的结果（64.67）不同，而两轮 logits 完全相同（KL 散度为 0），所以 gemma 的困惑度比值不可信，以 KL 散度为准。
+- 贪心输出：启动测试中本分支与上游的输出逐字节相同；H3 开与关的输出逐字节相同；A5 与不融合的路径 KL 散度相同（Qwen 0.00070 vs 0.00073，差在误差内；融合后编译器对乘加的合并不同，不再逐位相同）；M1、M2 与上游的 MoE 路径逐位相同。
+
+## 10. 剩余差距
+
+1. **MoE 预填充。** gemma 的 8k 提示比 oMLX 慢 9%（30k 预填充本轮未复测）。M2 之前，gemma 的预填充大部分时间在 MUL_MAT_ID 上，只跑到稠密路径约一半的算力；M2 之后快了 24-37%，但按专家分块的 mat-mat 仍明显低于稠密路径。下一步是把 A3 那样寄存器常驻的 NAX 内核用到按专家分块的 mat-mat 上（按专家分块的 few-row 方案在大批量下更慢）。
+2. **Qwen 的 MTP。** 8k 时 oMLX 的 MTP 解码 57.5 t/s，本分支 42.7（上一轮，本轮未复测 8k 投机）；30k 时 47.1 对 41.2。不用投机解码时两者差 10%（25.0 对 22.5），所以差距主要在投机解码这一层（草稿长度、接受率、草稿头本身的开销），本项目只改了 Metal 后端，没有拆分这部分。
+3. **解码带宽。** 短上下文的解码已和上游持平，但离带宽上限还有距离：Qwen 2k 解码 26.0 t/s x 19.5 GB ≈ 507 GB/s，即 614 GB/s 标称带宽的 83%。oMLX 在 Qwen 上快 10%。
+4. **I8 的精度。** 在 gemma 上，I8 使 KL 散度约为上游 `-fa on`/`-fa off` 参照的 3 倍（第 9 节）。更细的分组太慢（每 32 列：Qwen -25%），Walsh-Hadamard 变换已收回一部分；彻底解决需要能逐矩阵判断激活分布的办法，目前只能整体关闭。
+
+## 11. 复现
+
+```sh
+# 构建（macOS，Metal）
+cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j --target llama-bench llama-server llama-perplexity test-backend-ops
+
+# 数值校验
+build/bin/test-backend-ops -o MUL_MAT -b MTL0
+GGML_METAL_MM_NAX_MIN_ROWS=1 build/bin/test-backend-ops -o MUL_MAT -b MTL0
+build/bin/test-backend-ops -o MUL_MAT_ADD -b MTL0
+build/bin/test-backend-ops -o MUL_MAT_ID -b MTL0
+build/bin/test-backend-ops -o FLASH_ATTN_EXT -b MTL0
+build/bin/test-backend-ops -o GATED_DELTA_NET -b MTL0
+
+# 预填充 A/B：llama-bench 默认 -ub 512，NAX mat-mat 需要至少 1024 行
+build/bin/llama-bench -m model.gguf -fa 1 -ub 2048 -p 2048 -n 0 -d 8192
+GGML_METAL_MM_I8_DISABLE=1 build/bin/llama-bench -m model.gguf -fa 1 -ub 2048 -p 2048 -n 0 -d 8192
+GGML_METAL_MM_ID_WIDE_DISABLE=1 build/bin/llama-bench -m moe-model.gguf -fa 1 -ub 2048 -p 2048 -n 0
+
+# 每步耗时（2-64 token：K3、H4、M1）与长上下文解码（H3）
+build/bin/llama-bench -m model.gguf -fa 1 -ub 2048 -p 1,2,4,16,24,32,48,64 -n 0
+GGML_METAL_MV_NAX_DISABLE=1 GGML_METAL_MV_XR_DISABLE=1 GGML_METAL_MM_ID_MIN16_DISABLE=1 build/bin/llama-bench -m model.gguf -fa 1 -ub 2048 -p 1,2,4,16,24,32,48,64 -n 0
+build/bin/llama-bench -m model.gguf -fa 1 -p 4 -n 64 -d 32768
+GGML_METAL_FA_GQA_DISABLE=1 build/bin/llama-bench -m model.gguf -fa 1 -p 4 -n 64 -d 32768
+
+# 投机解码的服务器（模型文件内置 MTP 头时不需要单独的草稿模型）
+build/bin/llama-server -m model.gguf -fa on -np 4 -kvu --spec-type draft-mtp --spec-draft-n-max 3
+build/bin/llama-server -m gemma-4-26B-A4B-it-Q4_0.gguf -fa on -np 4 -kvu --spec-type draft-dflash -md dflash-gemma-4-26B-A4B-it-Q8_0.gguf
+```
+
+## 关于代码
+
+本文档描述每项改动，但不逐行解释源码；代码在 `LXD-8/llama.cpp` 的 `metal-m5` 分支，基于上游 `master` 的 `785322d17f`（b12033），每项改动一个提交，各自可以单独关闭。如果你考虑采用其中的某项优化，我很乐意提交 PR 或以你方便的其他形式提供代码。英语不是我的母语，像本文这样的长文，我以中文为原文，再由 AI 翻译成英文。
