@@ -1990,7 +1990,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_t
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_nax(
         ggml_metal_library_t lib,
         const ggml_tensor * op,
-        bool has_mask) {
+        bool has_mask,
+        int  wm) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
     char base[256];
@@ -1999,17 +2000,26 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_n
     const int32_t dk = (int32_t) op->src[1]->ne[0];
     const int32_t dv = (int32_t) op->src[2]->ne[0];
 
-    // the K/V element type as stored (a quantized cache has been converted to f16 beforehand)
-    const char * kv = op->src[1]->type == GGML_TYPE_BF16 ? "bf16" : "f16";
+    // the K/V element type: the GQA kernel reads a quantized cache as stored, the others get an F16 copy of it
+    const char * kv = op->src[1]->type == GGML_TYPE_BF16 ? "bf16" : wm > 0 ? ggml_type_name(op->src[1]->type) : "f16";
 
-    snprintf(base, 256, "kernel_flash_attn_ext_nax_%s_dk%d_dv%d", kv, dk, dv);
-    snprintf(name, 256, "%s_mask=%d", base, has_mask);
+    // wm > 0: the GQA variant with wm tiles of 16 query rows
+    if (wm > 0) {
+        snprintf(base, 256, "kernel_flash_attn_ext_nax_gqa_%s_dk%d_dv%d_wm%d", kv, dk, dv, wm);
+    } else {
+        snprintf(base, 256, "kernel_flash_attn_ext_nax_%s_dk%d_dv%d", kv, dk, dv);
+    }
+    // the GQA kernel reads K/V through the kv_rows lists, the other NAX kernel gets a gathered copy
+    const bool has_rows = wm > 0 && op->src[5] != nullptr;
+
+    snprintf(name, 256, "%s_mask=%d_rows=%d", base, has_mask, has_rows);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
         ggml_metal_cv_t cv = ggml_metal_cv_init();
 
         ggml_metal_cv_set_bool(cv, has_mask, FC_FLASH_ATTN_EXT_NAX + 0);
+        ggml_metal_cv_set_bool(cv, has_rows, FC_FLASH_ATTN_EXT_NAX + 1);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 
