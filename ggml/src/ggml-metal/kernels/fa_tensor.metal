@@ -1,4 +1,5 @@
 #include "common.h"
+#include "dequantize.h"
 
 #ifdef GGML_METAL_HAS_TENSOR
 
@@ -296,6 +297,7 @@ template [[host_name("kernel_flash_attn_ext_tensor_bf16_dk512_dv512")]] kernel f
 template [[host_name("kernel_flash_attn_ext_tensor_bf16_dk576_dv512")]] kernel flash_attn_ext_tensor_t kernel_flash_attn_ext_tensor<bfloat, bfloat4, 576, 512, OP_FLASH_ATTN_EXT_TENSOR_NQPSG_LARGE>;
 
 constant bool FC_flash_attn_ext_nax_has_mask  [[function_constant(FC_FLASH_ATTN_EXT_NAX + 0)]];
+constant bool FC_flash_attn_ext_nax_has_rows  [[function_constant(FC_FLASH_ATTN_EXT_NAX + 1)]];
 
 // K/V elements of the NAX attention kernels: bf16 is converted to f16 in registers and clamped to the f16 range
 static inline half4 fa_nax_kv4(device const half * p) {
@@ -304,6 +306,23 @@ static inline half4 fa_nax_kv4(device const half * p) {
 
 static inline half4 fa_nax_kv4(device const bfloat * p) {
     return (half4) clamp(float4(*((device const bfloat4 *) p)), -65504.0f, 65504.0f);
+}
+
+// a quantized cache is read as stored by the GQA kernel: 4 values at column col of a row
+template<typename T> constexpr bool fa_nax_kv_is_q() { return !(is_same<T, half>::value || is_same<T, bfloat>::value); }
+
+static inline void fa_nax_dq4(device const block_q4_0   * b, short il, thread float4 & r) { dequantize_q4_0_t4  (b, il, r); }
+static inline void fa_nax_dq4(device const block_q4_1   * b, short il, thread float4 & r) { dequantize_q4_1_t4  (b, il, r); }
+static inline void fa_nax_dq4(device const block_q5_0   * b, short il, thread float4 & r) { dequantize_q5_0_t4  (b, il, r); }
+static inline void fa_nax_dq4(device const block_q5_1   * b, short il, thread float4 & r) { dequantize_q5_1_t4  (b, il, r); }
+static inline void fa_nax_dq4(device const block_q8_0   * b, short il, thread float4 & r) { dequantize_q8_0_t4  (b, il, r); }
+static inline void fa_nax_dq4(device const block_iq4_nl * b, short il, thread float4 & r) { dequantize_iq4_nl_t4(b, il, r); }
+
+template<typename B>
+static inline half4 fa_nax_kvq4(device const char * row, int col) {
+    float4 r;
+    fa_nax_dq4((device const B *) row + col/32, (col%32)/4, r);
+    return (half4) r;
 }
 
 // flash attention with the scores, the probabilities and O kept in registers; no ALiBi or softcap
@@ -591,8 +610,328 @@ template [[host_name("kernel_flash_attn_ext_nax_bf16_dk128_dv128")]] kernel flas
 template [[host_name("kernel_flash_attn_ext_nax_f16_dk256_dv256")]] kernel flash_attn_ext_nax_t kernel_flash_attn_ext_nax<half, 256, 256, 2>;
 template [[host_name("kernel_flash_attn_ext_nax_bf16_dk256_dv256")]] kernel flash_attn_ext_nax_t kernel_flash_attn_ext_nax<bfloat, 256, 256, 2>;
 template [[host_name("kernel_flash_attn_ext_nax_f16_dk512_dv512")]] kernel flash_attn_ext_nax_t kernel_flash_attn_ext_nax<half, 512, 512, 4>;
+template [[host_name("kernel_flash_attn_ext_nax_bf16_dk512_dv512")]] kernel flash_attn_ext_nax_t kernel_flash_attn_ext_nax<bfloat, 512, 512, 4>;
 template [[host_name("kernel_flash_attn_ext_nax_f16_dk192_dv128")]]  kernel flash_attn_ext_nax_t kernel_flash_attn_ext_nax<half,   192, 128, 1>;
 template [[host_name("kernel_flash_attn_ext_nax_bf16_dk192_dv128")]] kernel flash_attn_ext_nax_t kernel_flash_attn_ext_nax<bfloat, 192, 128, 1>;
 template [[host_name("kernel_flash_attn_ext_nax_f16_dk576_dv512")]]  kernel flash_attn_ext_nax_t kernel_flash_attn_ext_nax<half,   576, 512, 4>;
+template [[host_name("kernel_flash_attn_ext_nax_bf16_dk576_dv512")]] kernel flash_attn_ext_nax_t kernel_flash_attn_ext_nax<bfloat, 576, 512, 4>;
 
+// small batches: the queries of the G heads that share a KV head are packed into rows p = g*ne01 + i, so each K/V block is loaded once
+// the KV range is split over NWG threadgroups, combined by kernel_flash_attn_ext_vec_reduce; no ALiBi or softcap
+template<
+    typename KV,                                // K/V element type: half or bfloat
+    short DK,
+    short DV,
+    short WN,
+    short WM,
+    short BK  = OP_FLASH_ATTN_EXT_NAX_NCPSG>
+kernel void kernel_flash_attn_ext_nax_gqa(
+        constant ggml_metal_kargs_flash_attn_ext & args,
+        device const char * q,
+        device const char * k,
+        device const char * v,
+        device const char * mask,
+        device       char * tmp,
+        device const int32_t * kv_rows,             // has_rows: cache row of each mask column, one list per q slice
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        uint3  tgpg  [[threadgroups_per_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    constexpr short kU  = 16;
+    constexpr short TK  = BK/kU;
+    constexpr short TDh = DK/kU/WN;
+    constexpr short BDh = DK/WN;
+
+    static_assert(DK == DV,     "DK must equal DV");
+    static_assert(TK % 2 == 0,  "scores are computed in pairs of fragments");
+    static_assert(TDh % 2 == 0, "O is accumulated in pairs of fragments");
+
+    const int G = args.ne02/args.ne_12_2; // query heads per KV head
+    const int R = G*args.ne01;            // packed rows
+
+    // grid x: NWG splits of the KV range for each block of WM*16 packed rows
+    const int NWG = tgpg[0]/((R + WM*kU - 1)/(WM*kU));
+
+    const int iwg = tgpig[0]%NWG;
+    const int irb = tgpig[0]/NWG;
+    const int hk  = tgpig[1];
+    const int iq3 = tgpig[2];
+
+    const short row_group = sgitg/WN;
+    const short d_group   = sgitg%WN;
+
+    const short2 sc = nax_coord(tiisg);
+    const short fn = sc.x;
+    const short fm = sc.y;
+
+    // the two packed rows of this lane: query i, head h
+    int  ri[2];
+    int  rh[2];
+    bool rok[2];
+
+    FOR_UNROLL (short i = 0; i < 2; ++i) {
+        const int p = (irb*WM + row_group)*kU + fm + 8*i;
+        rok[i] = p < R;
+        const int pp = rok[i] ? p : 0;
+        ri[i] = pp % args.ne01;
+        rh[i] = hk*G + pp/args.ne01;
+    }
+
+    vec<half, 8> qf[TDh];
+    {
+        const float qs = args.scale*M_LOG2E_F;
+
+        FOR_UNROLL (short i = 0; i < 2; ++i) {
+            device const char * q0 = q + ri[i]*args.nb01 + rh[i]*args.nb02 + iq3*args.nb03;
+
+            FOR_UNROLL (short id = 0; id < TDh; ++id) {
+                float4 x = 0.0f;
+                if (rok[i]) {
+                    x = *((device const float4 *) q0 + (d_group*BDh + id*kU + fn)/4);
+                }
+
+                const half4 h = (half4) (x*qs);
+
+                FOR_UNROLL (short j = 0; j < 4; ++j) {
+                    qf[id][4*i + j] = h[j];
+                }
+            }
+        }
+    }
+
+    {
+        // with kv_rows all q slices share one K/V stream
+        const int ikv3 = FC_flash_attn_ext_nax_has_rows ? 0 : iq3/(args.ne03/args.ne_12_3);
+
+        k += hk*args.nb12 + ikv3*args.nb13;
+        v += hk*args.nb22 + ikv3*args.nb23;
+    }
+
+    kv_rows += FC_flash_attn_ext_nax_has_rows ? iq3*args.ne11 : 0;
+
+    device const half * pm[2];
+    FOR_UNROLL (short i = 0; i < 2; ++i) {
+        pm[i] = (device const half *) (mask + ri[i]*args.nb31 + (rh[i]%args.ne32)*args.nb32 + (iq3%args.ne33)*args.nb33) + fn;
+    }
+
+    vec<float, 8> of[TDh];
+    FOR_UNROLL (short id = 0; id < TDh; ++id) {
+        of[id] = 0.0f;
+    }
+
+    float M[2] = { -FLT_MAX/2, -FLT_MAX/2 };
+    float S[2] = { 0.0f, 0.0f };
+
+    threadgroup float * sx     = (threadgroup float *) shmem;
+    threadgroup float * sx_own = sx + (row_group*WN + d_group)*(TK*8*32) + tiisg*(TK*8);
+    threadgroup float * sx_row = sx + (row_group*WN          )*(TK*8*32) + tiisg*(TK*8);
+
+    // the host guarantees ne11 % BK == 0
+    const int nblk_k  = args.ne11/BK;
+    const int nblk_wg = (nblk_k + NWG - 1)/NWG;
+    const int ib0 = iwg*nblk_wg;
+    const int ib1 = min(nblk_k, ib0 + nblk_wg);
+
+    for (int ib = ib0; ib < ib1; ++ib) {
+        const int ic = ib*BK;
+
+        // the cache rows of this lane's K/V columns in the block; padding entries (< 0) are masked
+        int kr[TK][2];
+        FOR_UNROLL (short ik = 0; ik < TK; ++ik) {
+            FOR_UNROLL (short i = 0; i < 2; ++i) {
+                const int r = ic + ik*kU + fm + 8*i;
+                kr[ik][i] = FC_flash_attn_ext_nax_has_rows ? max(kv_rows[r], 0) : r;
+            }
+        }
+
+        vec<float, 8> sf[TK];
+        FOR_UNROLL (short ik = 0; ik < TK; ++ik) {
+            sf[ik] = 0.0f;
+        }
+
+        FOR_UNROLL (short ik = 0; ik < TK; ik += 2) {
+            FOR_UNROLL (short id = 0; id < TDh; ++id) {
+                vec<half, 8> k0;
+                vec<half, 8> k1;
+
+                const int c = d_group*BDh + id*kU + fn;
+
+                FOR_UNROLL (short i = 0; i < 2; ++i) {
+                    device const char * r0 = k + (uint64_t) kr[ik    ][i]*args.nb11;
+                    device const char * r1 = k + (uint64_t) kr[ik + 1][i]*args.nb11;
+
+                    half4 a;
+                    half4 b;
+                    if constexpr (fa_nax_kv_is_q<KV>()) {
+                        a = fa_nax_kvq4<KV>(r0, c);
+                        b = fa_nax_kvq4<KV>(r1, c);
+                    } else {
+                        a = fa_nax_kv4((device const KV *) r0 + c);
+                        b = fa_nax_kv4((device const KV *) r1 + c);
+                    }
+
+                    FOR_UNROLL (short j = 0; j < 4; ++j) {
+                        k0[4*i + j] = a[j];
+                        k1[4*i + j] = b[j];
+                    }
+                }
+
+                nax_mma<float, half, half, true>(sf[ik], sf[ik + 1], qf[id], k0, k1);
+            }
+        }
+
+        if (WN > 1) {
+            FOR_UNROLL (short ik = 0; ik < TK; ++ik) {
+                FOR_UNROLL (short i = 0; i < 8; ++i) {
+                    sx_own[ik*8 + i] = sf[ik][i];
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            FOR_UNROLL (short ik = 0; ik < TK; ++ik) {
+                FOR_UNROLL (short i = 0; i < 8; ++i) {
+                    float s = sx_row[ik*8 + i];
+                    FOR_UNROLL (short g = 1; g < WN; ++g) {
+                        s += sx_row[g*(TK*8*32) + ik*8 + i];
+                    }
+                    sf[ik][i] = s;
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (FC_flash_attn_ext_nax_has_mask) {
+            FOR_UNROLL (short i = 0; i < 2; ++i) {
+                FOR_UNROLL (short ik = 0; ik < TK; ++ik) {
+                    device const half * pmi = pm[i] + ic + ik*kU;
+
+                    FOR_UNROLL (short j = 0; j < 4; ++j) {
+                        sf[ik][4*i + j] += M_LOG2E_F*(float) pmi[j];
+                    }
+                }
+            }
+        }
+
+        FOR_UNROLL (short i = 0; i < 2; ++i) {
+            float m = M[i];
+
+            FOR_UNROLL (short ik = 0; ik < TK; ++ik) {
+                m = max(m, max(max(sf[ik][4*i + 0], sf[ik][4*i + 1]), max(sf[ik][4*i + 2], sf[ik][4*i + 3])));
+            }
+
+            m = max(m, simd_shuffle_xor(m, 1));
+            m = max(m, simd_shuffle_xor(m, 8));
+
+            const float ms = fast::exp2(M[i] - m);
+            M[i] = m;
+
+            float sum = 0.0f;
+
+            FOR_UNROLL (short ik = 0; ik < TK; ++ik) {
+                FOR_UNROLL (short j = 0; j < 4; ++j) {
+                    const float p = fast::exp2(sf[ik][4*i + j] - m);
+                    sf[ik][4*i + j] = p;
+                    sum += p;
+                }
+            }
+
+            sum += simd_shuffle_xor(sum, 1);
+            sum += simd_shuffle_xor(sum, 8);
+
+            S[i] = S[i]*ms + sum;
+
+            FOR_UNROLL (short id = 0; id < TDh; ++id) {
+                FOR_UNROLL (short j = 0; j < 4; ++j) {
+                    of[id][4*i + j] *= ms;
+                }
+            }
+        }
+
+        FOR_UNROLL (short id = 0; id < TDh; id += 2) {
+            FOR_UNROLL (short ik = 0; ik < TK; ++ik) {
+                vec<half, 8> v0;
+                vec<half, 8> v1;
+
+                const int c = d_group*BDh + id*kU + fn;
+
+                FOR_UNROLL (short i = 0; i < 2; ++i) {
+                    device const char * row = v + (uint64_t) kr[ik][i]*args.nb21;
+
+                    half4 a;
+                    half4 b;
+                    if constexpr (fa_nax_kv_is_q<KV>()) {
+                        a = fa_nax_kvq4<KV>(row, c);
+                        b = fa_nax_kvq4<KV>(row, c + kU);
+                    } else {
+                        a = fa_nax_kv4((device const KV *) row + c);
+                        b = fa_nax_kv4((device const KV *) row + c + kU);
+                    }
+
+                    FOR_UNROLL (short j = 0; j < 4; ++j) {
+                        v0[4*i + j] = a[j];
+                        v1[4*i + j] = b[j];
+                    }
+                }
+
+                nax_mma<float, float, half, false>(of[id], of[id + 1], sf[ik], v0, v1);
+            }
+        }
+    }
+
+    // partial results in the layout of kernel_flash_attn_ext_vec_reduce: O, then S and M (natural log)
+    const int nrows = args.ne1*args.ne2*args.ne3;
+
+    device float4 * o4 = (device float4 *) tmp;
+    device float  * ss = (device float  *) tmp + (uint64_t) nrows*DV*NWG;
+
+    FOR_UNROLL (short i = 0; i < 2; ++i) {
+        if (!rok[i]) {
+            continue;
+        }
+
+        const uint64_t rid = ((uint64_t) iq3*args.ne2 + ri[i])*args.ne1 + rh[i];
+
+        FOR_UNROLL (short id = 0; id < TDh; ++id) {
+            const int c4 = (d_group*BDh + id*kU + fn)/4;
+            o4[(rid*(DV/4) + c4)*NWG + iwg] = float4(of[id][4*i + 0], of[id][4*i + 1], of[id][4*i + 2], of[id][4*i + 3]);
+        }
+
+        if (fn == 0 && d_group == 0) {
+            ss[rid*(2*NWG) + 2*iwg + 0] = S[i];
+            ss[rid*(2*NWG) + 2*iwg + 1] = M[i]*M_LN2_F;
+        }
+    }
+}
+
+typedef decltype(kernel_flash_attn_ext_nax_gqa<half, 256, 256, 2, 1>) flash_attn_ext_nax_gqa_t;
+
+#define FA_NAX_GQA_WM(name, T, dk, wn, wm) \
+template [[host_name("kernel_flash_attn_ext_nax_gqa_" #name "_dk" #dk "_dv" #dk "_wm" #wm)]] \
+kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<T, dk, dk, wn, wm>;
+
+#define FA_NAX_GQA_DK(name, T, dk, wn) \
+    FA_NAX_GQA_WM(name, T, dk, wn, 1) \
+    FA_NAX_GQA_WM(name, T, dk, wn, 2) \
+    FA_NAX_GQA_WM(name, T, dk, wn, 4)
+
+#define FA_NAX_GQA(name, T) \
+    FA_NAX_GQA_DK(name, T, 128, 1) \
+    FA_NAX_GQA_DK(name, T, 256, 2) \
+    FA_NAX_GQA_DK(name, T, 512, 4) \
+    FA_NAX_GQA_WM(name, T, 128, 1, 8) \
+    FA_NAX_GQA_WM(name, T, 256, 2, 8)
+
+FA_NAX_GQA(f16,  half)
+FA_NAX_GQA(bf16, bfloat)
+
+// quantized caches (decode and small batches; larger batches convert the cache to f16 first)
+FA_NAX_GQA(q4_0,   block_q4_0)
+FA_NAX_GQA(q4_1,   block_q4_1)
+FA_NAX_GQA(q5_0,   block_q5_0)
+FA_NAX_GQA(q5_1,   block_q5_1)
+FA_NAX_GQA(q8_0,   block_q8_0)
+FA_NAX_GQA(iq4_nl, block_iq4_nl)
 #endif // GGML_METAL_HAS_TENSOR
