@@ -45,24 +45,24 @@ All changes on, compared with upstream and oMLX (full power, server end to end; 
 | A3b | int8 NAX threshold lowered to 448 rows | 448-896 rows, +12-47% per mat-mul |
 | A5b | fused GLU writes in place | fixes the race with the released gate/up buffers |
 | A10 | BF16 large-batch prefill yields to the tensor kernel | gemma pp2048 8k/32k: upstream 6%/16% faster |
-| H3 | GQA-packed NAX attention (decode, speculative verify) | decode @32k +8-19%, step of 4 tokens @32k 1.2-2.0x |
+| H3 | GQA-packed NAX attention (decode, speculative verify) | decode @32k +8-18%, step of 4 tokens @32k 1.2-2.0x |
 | H5 | GQA attention for quantized K/V caches | q8_0 cache at tg64 @32k: gemma 93.3 vs 73.0 |
-| H3b | GQA kernel: 8 tiles / row blocks / runtime split count | 16-token step at 32k: Llama 94 -> 360 t/s |
+| H3b | GQA kernel: 8 tiles / row blocks / runtime split count | 16-token step at 32k: gemma 188 -> 427 t/s |
 
-H3, H5 and H3b are now one commit, and the kernel also reads K/V through the `kv_rows` lists that upstream #29510 uses for the unified KV cache (the default of llama-server). Their numbers above were measured before #29510. Through `kv_rows` (Qwen, `llama-batched-bench -kvu`, noisy): depth 8k +7% (1 sequence) / +18% (4), depth 32k +27% / +14%. See [section 6.5](metal-m5.md#65-gqa-attention-after-upstream-kv_rows).
+H3, H5 and H3b are one commit, and the kernel also reads K/V through the `kv_rows` lists that upstream #29510 uses for the unified KV cache (the default of llama-server). Their numbers above were measured before #29510. Through `kv_rows` (Qwen, `llama-batched-bench -kvu`, noisy): depth 8k +7% (1 sequence) / +18% (4), depth 32k +27% / +14%. See [section 6.5](metal-m5.md#65-gqa-attention-after-upstream-kv_rows).
 
 Of the prefill numbers, A2 and A3 are alone (they are prerequisites of later changes), the others leave-one-out, so they do not add up. See [section 6](metal-m5.md#6-per-change-results-and-selection).
 
 ## Weight formats
 
-- Prefill (A3 / I8 / A5): F16 and 23 quantized formats; the newly covered formats are 41-49% faster per mat-mul on synthetic weights.
-- 2-64 rows (H4): 26 formats enabled per format and row count; 1.1-3.3x at 17-32 rows, 1.0-2.0x at 33-64 rows.
+- Prefill (A3 / I8 / A5): F16, BF16 and 25 quantized formats; the newly covered formats are 41-49% faster per mat-mul on synthetic weights.
+- 2-64 rows (H4): 28 formats enabled per format and row count; 1.1-3.3x at 17-32 rows, 1.0-2.0x at 33-64 rows.
 - MoE (M1 / M2): every format; M2 measured on 25 formats one by one, 1-26% faster from 32 entries per expert.
 - Real models: q5_K / q6_K (Qwen3.8-27B), q4_K (Qwen3.6-35B-A3B), iq3_xxs / iq4_xs / q5_0 / iq4_nl (Qwen3.8-Flash-Next), q4_0 (gemma). See [section 7](metal-m5.md#7-weight-formats).
 
 ## Method and accuracy
 
-Account for the gap first, then screen candidates; keep only changes with a gain above 1.5% in a consistent direction over several rounds (except prerequisites of other optimizations), implemented with the minimum necessary code. Interleaved forward/reverse measurements within a session, 2 minutes between tests; mat-mul changes A/B tested at kernel level per format and per shape, attention changes verified on the Qwen and gemma structures. `test-backend-ops` passes (MUL_MAT 3892, MUL_MAT_ADD 384, MUL_MAT_ID 1109, FLASH_ATTN_EXT 5100, GATED_DELTA_NET 30). Accuracy is measured as the KL divergence to the full upstream logits: the changes other than I8 are practically bit-identical to upstream on Qwen and of the same order as upstream's own `-fa on`/`-fa off` difference on gemma; I8 (int8 prefill) is the only change with a real cost, about 0.0007 on Qwen and about 3x the reference on gemma, and `GGML_METAL_MM_I8_DISABLE=1` turns it off alone ([section 9](metal-m5.md#9-accuracy)).
+Account for the gap first, then screen candidates; keep only changes with a gain above 1.5% in a consistent direction over several rounds (except prerequisites of other optimizations), implemented with the minimum necessary code. Interleaved forward/reverse measurements within a session, 2 minutes between tests; mat-mul changes A/B tested at kernel level per format and per shape, attention changes verified on the Qwen and gemma structures. `test-backend-ops` passes (MUL_MAT 4099, MUL_MAT_ADD 384, MUL_MAT_ID 1109, FLASH_ATTN_EXT 5100, GATED_DELTA_NET 37). Accuracy is measured as the KL divergence to the full upstream logits: the changes other than I8 are practically bit-identical to upstream on Qwen and of the same order as upstream's own `-fa on`/`-fa off` difference on gemma; I8 (int8 prefill) is the only change with a real cost, about 0.0007 on Qwen and about 3x the reference on gemma, and `GGML_METAL_MM_I8_DISABLE=1` turns it off alone ([section 9](metal-m5.md#9-accuracy)).
 
 ## Remaining gaps
 
@@ -121,24 +121,24 @@ The code is on the `metal-m5` branch of `LXD-8/llama.cpp`, based on upstream `ma
 | A3b | int8 的 NAX 门槛降到 448 行 | 448-896 行每 mat-mul +12~47% |
 | A5b | 融合 GLU 写回原位 | 修 gate/up 释放后的内存竞争 |
 | A10 | BF16 大 batch 预填充让回 tensor 内核 | gemma pp2048 8k/32k 上游快 6%/16% |
-| H3 | GQA 打包的 NAX 注意力（解码、投机解码验证） | 解码 @32k +8~19%，4 token 一步 @32k 1.2-2.0 倍 |
+| H3 | GQA 打包的 NAX 注意力（解码、投机解码验证） | 解码 @32k +8~18%，4 token 一步 @32k 1.2-2.0 倍 |
 | H5 | 量化 K/V 缓存的 GQA 注意力 | q8_0 缓存 tg64 @32k：gemma 93.3 对 73.0 |
-| H3b | GQA 内核 8 tile / 行块 / 运行期份数 | 16 token 一步 @32k：Llama 94 -> 360 t/s |
+| H3b | GQA 内核 8 tile / 行块 / 运行期份数 | 16 token 一步 @32k：gemma 188 -> 427 t/s |
 
-H3、H5 与 H3b 现在是一个提交，内核也能通过上游 #29510 为统一 KV 缓存（llama-server 的默认设置）使用的 `kv_rows` 列表读 K/V。上表中它们的数字测于 #29510 之前。通过 `kv_rows`（Qwen，`llama-batched-bench -kvu`，噪声大）：深度 8k 时 +7%（1 个序列）/ +18%（4 个），深度 32k 时 +27% / +14%。详见[第 6.5 节](metal-m5.md#65-上游-kv_rows-之后的-gqa-注意力)。
+H3、H5 与 H3b 是一个提交，内核也能通过上游 #29510 为统一 KV 缓存（llama-server 的默认设置）使用的 `kv_rows` 列表读 K/V。上表中它们的数字测于 #29510 之前。通过 `kv_rows`（Qwen，`llama-batched-bench -kvu`，噪声大）：深度 8k 时 +7%（1 个序列）/ +18%（4 个），深度 32k 时 +27% / +14%。详见[第 6.5 节](metal-m5.md#65-上游-kv_rows-之后的-gqa-注意力)。
 
 预填充的单项数字中，A2、A3 是单独开启（它们是后面改动的前提），其余是留一法，所以不能相加。详见[第 6 节](metal-m5.md#6-各项结果与取舍)。
 
 ## 量化格式
 
-- 预填充（A3 / I8 / A5）：F16 与 23 种量化格式；新增的格式在合成权重上每个 mat-mul 快 41-49%。
-- 2-64 行（H4）：26 种格式按格式和行数开启；17-32 行快 1.1-3.3 倍，33-64 行快 1.0-2.0 倍。
+- 预填充（A3 / I8 / A5）：F16、BF16 与 25 种量化格式；新增的格式在合成权重上每个 mat-mul 快 41-49%。
+- 2-64 行（H4）：28 种格式按格式和行数开启；17-32 行快 1.1-3.3 倍，33-64 行快 1.0-2.0 倍。
 - MoE（M1 / M2）：全部格式；M2 在 25 种格式上逐一测过，每专家 32 个条目起快 1-26%。
 - 真实模型：q5_K / q6_K（Qwen3.8-27B）、q4_K（Qwen3.6-35B-A3B）、iq3_xxs / iq4_xs / q5_0 / iq4_nl（Qwen3.8-Flash-Next）、q4_0（gemma）。详见[第 7 节](metal-m5.md#7-量化格式)。
 
 ## 方法与精度
 
-先算差距账，再筛选候选；只保留多轮方向一致、增幅超过 1.5% 的方案（作为其他优化前提的除外），保留项用必要最小的改动实现。同一场次正反序交错测量，测试间隔 2 分钟；矩阵乘类改动按格式、按形状做内核级 A/B，注意力类改动在 Qwen 与 gemma 的结构上验证。`test-backend-ops` 全部通过（MUL_MAT 3892、MUL_MAT_ADD 384、MUL_MAT_ID 1109、FLASH_ATTN_EXT 5100、GATED_DELTA_NET 30）。精度以对上游完整 logits 的 KL 散度衡量：除 I8 外的改动在 Qwen 上与上游几乎逐位一致，在 gemma 上与上游自身 `-fa on`/`-fa off` 的差同一量级；I8（int8 预填充）是唯一有实质代价的一项，Qwen 约 0.0007，gemma 约为参照的 3 倍，可用 `GGML_METAL_MM_I8_DISABLE=1` 单独关闭（[第 9 节](metal-m5.md#9-数值精度)）。
+先算差距账，再筛选候选；只保留多轮方向一致、增幅超过 1.5% 的方案（作为其他优化前提的除外），保留项用必要最小的改动实现。同一场次正反序交错测量，测试间隔 2 分钟；矩阵乘类改动按格式、按形状做内核级 A/B，注意力类改动在 Qwen 与 gemma 的结构上验证。`test-backend-ops` 全部通过（MUL_MAT 4099、MUL_MAT_ADD 384、MUL_MAT_ID 1109、FLASH_ATTN_EXT 5100、GATED_DELTA_NET 37）。精度以对上游完整 logits 的 KL 散度衡量：除 I8 外的改动在 Qwen 上与上游几乎逐位一致，在 gemma 上与上游自身 `-fa on`/`-fa off` 的差同一量级；I8（int8 预填充）是唯一有实质代价的一项，Qwen 约 0.0007，gemma 约为参照的 3 倍，可用 `GGML_METAL_MM_I8_DISABLE=1` 单独关闭（[第 9 节](metal-m5.md#9-数值精度)）。
 
 ## 剩余差距
 
