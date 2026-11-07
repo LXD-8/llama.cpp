@@ -68,25 +68,25 @@ In branch order, one commit per change (H3, H5 and H3b are one commit). The "For
 
 | # | Commit | Change | Lines | Formats | Switch |
 |---|---|---|---|---|---|
-| A1 | `bdef63ec0f` | Register-resident NAX flash attention (prefill, head size 128 / 256 / 512) | +461 / -9 | - (F16 K/V) | `GGML_METAL_FA_NAX_DISABLE` |
-| A2 | `73e2d6866a` | f32 -> f16 activation conversion before the tensor mul_mm | +136 / -7 | F16 and quantized | `GGML_METAL_MM_F16_ACT_DISABLE` |
-| A3 | `629d8363ce` | Dequant to f16 + register-resident NAX mat-mat, split-K for long K (>= 1024 rows) | +397 / -4 | F16 + 23 quantized formats | `GGML_METAL_MM_NAX_DISABLE` |
-| A4 | `951fd49d56` | Gated delta net with 4 lanes per state row | +157 / -2 | - | `GGML_METAL_GDN_R8_DISABLE` |
-| I8 | `4074513bcd` | int8 NAX mat-mat (one scale per 128 columns, Walsh-Hadamard transform before quantizing) | +276 / -7 | 23 quantized formats | `GGML_METAL_MM_I8_DISABLE` |
-| A5 | `d349d2b01c` | SWIGLU fused into the NAX mat-mat that consumes it | +213 / -7 | as A3 | `GGML_METAL_GLU_MM_DISABLE` |
+| A1 | `bdef63ec0f` | Register-resident NAX flash attention (prefill, head size 128 / 256 / 512) | +460 / -11 | - (F16 K/V) | `GGML_METAL_FA_NAX_DISABLE` |
+| A2 | `73e2d6866a` | f32 -> f16 activation conversion before the tensor mul_mm | +142 / -7 | F16 and quantized | `GGML_METAL_MM_F16_ACT_DISABLE` |
+| A3 | `629d8363ce` | Dequant to f16 + register-resident NAX mat-mat, split-K for long K (>= 1024 rows) | +412 / -4 | F16 + 25 quantized formats | `GGML_METAL_MM_NAX_DISABLE` |
+| A4 | `951fd49d56` | Gated delta net with 4 lanes per state row | +163 / -2 | - | `GGML_METAL_GDN_R8_DISABLE` |
+| I8 | `4074513bcd` | int8 NAX mat-mat (one scale per 128 columns, Walsh-Hadamard transform before quantizing) | +276 / -7 | 25 quantized formats | `GGML_METAL_MM_I8_DISABLE` |
+| A5 | `d349d2b01c` | SWIGLU fused into the NAX mat-mat that consumes it | +220 / -7 | as A3 | `GGML_METAL_GLU_MM_DISABLE` |
 | S1 | `f0320ec0e8` | Keep the conversation cache when thinking is turned off (Web UI) | +12 / -1 | - | UI setting |
-| S2-a | `63aaf072e4` | Do not zero-fill fresh KV / recurrent-state buffers at load | +44 / -1 | - | `GGML_METAL_CLEAR_SKIP_DISABLE` |
-| K3 | `0d8b15aa9a` | Cross-row mat-vec for 2-3 rows | +316 / -1 | q4_K (2-3 rows), q5_K (2 rows) | `GGML_METAL_MV_XR_DISABLE` |
-| S2-c | `ca7f887415` | First residency request of fresh buffers in the background | +44 / -5 | - | `GGML_METAL_RSET_ASYNC_DISABLE` |
-| A2 gate | `2f4029ab02` | f16 activation conversion only from 128 rows and 4 GFLOP | +9 / -2 | as A2 | `GGML_METAL_MM_F16_ACT_ROWS_128_DISABLE` |
-| H4 | `bc560a2962` | NAX few-row mat-mat for 2-64 rows | +321 / -10 | all formats of the few-row kernel, row ranges per format in section 7 | `GGML_METAL_MV_NAX_DISABLE` |
-| M1 | `d379ea300e` | MoE mat-mat (MUL_MAT_ID) from 16 tokens (was 32) | +9 / -8 | all formats | `GGML_METAL_MM_ID_MIN16_DISABLE` |
-| M2 | `08df2cc84c` | MoE mat-mat tiles of 64 entries (when the experts get >= 32 entries on average) | +90 / -25 | all formats | `GGML_METAL_MM_ID_WIDE_DISABLE` |
+| S2-a | `63aaf072e4` | Do not zero-fill fresh KV / recurrent-state buffers at load | +45 / -1 | - | `GGML_METAL_CLEAR_SKIP_DISABLE` |
+| K3 | `0d8b15aa9a` | Cross-row mat-vec for 2-3 rows | +322 / -1 | q4_K (2-3 rows), q5_K (2 rows) | `GGML_METAL_MV_XR_DISABLE` |
+| S2-c | `ca7f887415` | First residency request of fresh buffers in the background | +46 / -5 | - | `GGML_METAL_RSET_ASYNC_DISABLE` |
+| A2 gate | `2f4029ab02` | f16 activation conversion only from 128 rows and 4 GFLOP | +9 / -1 | as A2 | `GGML_METAL_MM_F16_ACT_ROWS_128_DISABLE` |
+| H4 | `bc560a2962` | NAX few-row mat-mat for 2-64 rows | +327 / -10 | all formats of the few-row kernel, row ranges per format in section 7 | `GGML_METAL_MV_NAX_DISABLE` |
+| M1 | `d379ea300e` | MoE mat-mat (MUL_MAT_ID) from 16 tokens (was 32) | +11 / -8 | all formats | `GGML_METAL_MM_ID_MIN16_DISABLE` |
+| M2 | `08df2cc84c` | MoE mat-mat tiles of 64 entries (when the experts get >= 32 entries on average) | +96 / -25 | all formats | `GGML_METAL_MM_ID_WIDE_DISABLE` |
 | A6 | `c5c666eada` | NAX flash attention for a BF16 K/V cache (prefill and GQA, converted to f16 in registers) | +36 / -21 | BF16 | `GGML_METAL_FA_NAX_BF16_DISABLE` |
-| A8 | `f35ca617af` | NAX mat-mat for BF16 weights (from 1024 rows) | +20 / -6 | BF16 | `GGML_METAL_MM_NAX_BF16_DISABLE` |
-| A7 | `a72e09794f` | NAX flash attention for the MLA head sizes 192/128 and 576/512 | +34 / -20 | MLA | `GGML_METAL_FA_NAX_MLA_DISABLE` |
+| A8 | `f35ca617af` | NAX mat-mat for BF16 weights (from 1024 rows) | +48 / -24 | BF16 | `GGML_METAL_MM_NAX_BF16_DISABLE` |
+| A7 | `a72e09794f` | NAX flash attention for the MLA head sizes 192/128 and 576/512 | +32 / -18 | MLA | `GGML_METAL_FA_NAX_MLA_DISABLE` |
 | A9 | `32bd81b983` | NVFP4 / TQ1_0 weights | +308 / -7 | NVFP4, TQ1_0 | - (no switch of its own) |
-| A3b | `89b8ebf568` | int8 NAX mat-mat from 448 rows | +13 / -9 | the quantized formats of the int8 path | `GGML_METAL_MM_NAX_MIN_ROWS` |
+| A3b | `89b8ebf568` | int8 NAX mat-mat from 448 rows | +12 / -8 | the quantized formats of the int8 path | `GGML_METAL_MM_NAX_MIN_ROWS` |
 | A5b | `d6f5b44417` | The fused GLU writes the activations into the mat-mat result (memory race fix) | +16 / -24 | as A3 | `GGML_METAL_GLU_MM_DISABLE` |
 | A10 | `7d8ec9dcfd` | BF16 prefill attention at head size 512 / 576 (more than 32 queries) yields to the tensor kernel | +5 / -2 | BF16 | `GGML_METAL_FA_NAX_BF16_DISABLE` |
 | H3 / H5 / H3b | `0c216f16d7` | One commit. H3: query heads that share a KV head packed into one NAX attention tile (decode, speculative verify; head size 128-512). H5: the same for quantized K/V caches. H3b: up to 8 tiles of 16 rows, row blocks, runtime KV split count. Also reads K/V through the `kv_rows` lists (section 6.5) | +526 / -56 | - (F16 / BF16 K/V); q4_0 / q4_1 / q5_0 / q5_1 / q8_0 / iq4_nl caches | `GGML_METAL_FA_GQA_DISABLE`, `GGML_METAL_FA_GQA_Q_DISABLE` |
@@ -248,7 +248,7 @@ Out of scope: KV quantization (turboquant), GPU sampling, MTL4 command encoding,
 
 ## 6. Per-change results and selection
 
-The per-change and kernel figures in section 6 come from the previous round; this round re-measured the 8k prefill, the 30k decode and the 30k speculative decode (see section 3).
+The per-change and kernel figures of sections 6.1-6.5 were measured on Qwen3.8-27B and gemma-4-26B-A4B before the end-to-end numbers of sections 3.1 / 3.2; the rows of the Qwen MoE models in section 6.2 were measured together with section 3.3.
 
 Selection rule: a single-change gain above 1.5% in a consistent direction over several rounds, except for changes that are a prerequisite of another significant optimization.
 
@@ -326,9 +326,9 @@ The numbers for the following changes come from their commit messages, measured 
 
 ### 6.5 GQA attention after upstream kv_rows
 
-Upstream #29510 (`1b6935b227`, "flash_attn_ext_rows", merged 2026-11-03) gives FLASH_ATTN_EXT a list of K/V rows (`kv_rows`) for every ubatch of a unified KV cache when flash attention is on. llama-server uses a unified KV cache by default, so this is the path of Llama.app and the server. The first version of the GQA kernel read the cache by position, so it could not run there. Upstream has no GQA kernel of its own (PRs #30645 and #30728 are still open).
+Upstream #29510 (`1b6935b227`, "flash_attn_ext_rows", merged 2026-11-03) gives FLASH_ATTN_EXT a list of K/V rows (`kv_rows`) for every ubatch of a unified KV cache when flash attention is on. llama-server uses a unified KV cache by default, so this is the path of Llama.app and the server. A kernel that reads the cache by position cannot run there. Upstream has no GQA kernel of its own (PRs #30645 and #30728 are still open).
 
-So the kernel learned the lists: each lane looks up the cache row of its K/V columns per block. It takes the small batches the vec kernel would take; larger batches keep upstream's gather to F16 and the dense kernel (A1 on the gathered rows). The decode numbers of section 3 and the H3 / H5 / H3b numbers of sections 6.2-6.4 were measured before #29510, on the dense cache path.
+So the kernel reads the lists: each lane looks up the cache row of its K/V columns per block. It takes the small batches the vec kernel would take; larger batches keep upstream's gather to F16 and the dense kernel (A1 on the gathered rows). The decode numbers of section 3 and the H3 / H5 / H3b numbers of sections 6.2-6.4 were measured before #29510, on the dense cache path.
 
 Through `kv_rows` (Qwen3.8-27B Q5_K_M, `llama-batched-bench -fa on -kvu -ntg 64`, M5 Max, Automatic power mode, GQA on vs `GGML_METAL_FA_GQA_DISABLE=1`, 4 runs each, on and off alternated, medians, decode t/s):
 
@@ -346,16 +346,16 @@ These runs are noisy: Spotlight indexing and another app ran in the background, 
 ### 7.1 Formats covered by each change
 
 - **Independent of the weight format**: A1, H3 (attention, F16 K/V; H5 adds q4_0 / q4_1 / q5_0 / q5_1 / q8_0 / iq4_nl caches, through `kv_rows` without iq4_nl and BF16), A4 (GDN), A2 and the A2 gate (activation conversion), S1, S2-a, S2-c.
-- **A3 / I8 / A5 (prefill, >= 1024 rows)**: F16 and 23 quantized formats: q4_0, q4_1, q5_0, q5_1, q8_0, q1_0, q2_0, mxfp4, q2_K, q3_K, q4_K, q5_K, q6_K, iq1_s, iq1_m, iq2_xxs, iq2_xs, iq2_s, iq3_xxs, iq3_s, iq4_nl, iq4_xs, tq2_0 (I8 without F16). The weights go through the dequantize function of each format into f16 first, so each format needs only one dequantize instance.
+- **A3 / I8 / A5 (prefill, >= 1024 rows)**: F16 and 25 quantized formats: q4_0, q4_1, q5_0, q5_1, q8_0, q1_0, q2_0, mxfp4, nvfp4, q2_K, q3_K, q4_K, q5_K, q6_K, iq1_s, iq1_m, iq2_xxs, iq2_xs, iq2_s, iq3_xxs, iq3_s, iq4_nl, iq4_xs, tq1_0, tq2_0 (nvfp4 and tq1_0 through A9; I8 without F16); BF16 through A8 (without I8). The weights go through the dequantize function of each format into f16 first, so each format needs only one dequantize instance.
 - **M1 / M2 (MoE)**: every format of the upstream MoE mat-mat; M2 was measured on 25 formats one by one (section 7.3).
-- **H4 (2-64 rows)**: all 26 formats of the few-row kernel (the 23 above plus f32, f16, bf16), enabled per format and row count:
+- **H4 (2-64 rows)**: all 28 formats of the few-row kernel (the 25 above plus f32, f16, bf16), enabled per format and row count:
 
 | Rows | Formats enabled |
 |---|---|
-| 33-64 | up to a per-format limit: 64 (q4_0, q4_1, q5_0, q5_1, q8_0, q2_K, q4_K, q5_K, q6_K, f16, bf16, tq2_0, q1_0, q2_0), 56 (mxfp4, iq4_nl, iq4_xs, iq2_xxs, iq2_s), 48 (q3_K, iq3_xxs, iq3_s, iq1_s), 40 (iq2_xs, iq1_m); not f32 |
-| 17-32 | all 26 |
+| 33-64 | up to a per-format limit: 64 (q4_0, q4_1, q5_0, q5_1, q8_0, q2_K, q4_K, q5_K, q6_K, f16, bf16, tq1_0, tq2_0, q1_0, q2_0), 56 (mxfp4, nvfp4, iq4_nl, iq4_xs, iq2_xxs, iq2_s), 48 (q3_K, iq3_xxs, iq3_s, iq1_s), 40 (iq2_xs, iq1_m); not f32 |
+| 17-32 | all 28 |
 | 9-16 | all quantized formats (f32 / f16 / bf16 are not faster and keep the old path) |
-| 2-8 | the iq formats, q1_0, q2_0 (from 2 rows); q2_K, tq2_0, q5_K (from 3 rows); q6_K (2-4 rows) |
+| 2-8 | the iq formats, q1_0, q2_0 (from 2 rows); q2_K, tq1_0, tq2_0, q5_K (from 3 rows); q6_K (2-4 rows) |
 
 - **K3 (2-3 rows)**: q4_K (2-3 rows), q5_K (2 rows).
 
@@ -391,7 +391,7 @@ These runs are noisy: Spotlight indexing and another app ran in the background, 
 | tq2_0 | 0.65-1.25x | 2.06-2.09x | 2.51-2.95x | 1.41-1.71x | 1.43x |
 
 - Shapes 17408x5120 and 5120x17408, mean of two rounds; ranges are the minimum and maximum over the row counts. The 2-8 rows column is measured for every format; only the formats and row counts listed in 7.1 are actually enabled. The 33-64 rows column covers the enabled range.
-- "Already covered" means the format was supported by A3/I8 from the start; see section 6.1.
+- "Already covered" means the format was supported by A3/I8 from the start; see section 6.1. nvfp4 and tq1_0 (A9) take the same kernels and are checked by `test-backend-ops` but not timed in this table.
 - Cross-row mat-vec (K3) for 2-3 rows: q5_K 21% faster than the old path at 2 rows, 6% at 3 rows (H4 is faster at 3 rows, so 3 rows use H4).
 
 ### 7.3 Kernel-level data, MoE mat-mul (M2: tiles of 64 entries vs 32, synthetic weights, uniform random routing)
@@ -454,7 +454,7 @@ The mat-muls of single-token decode are bandwidth bound, and the existing mat-ve
 
 **A2 gate** (`ggml-metal-ops.cpp`). A2 converts the f32 activations to f16 before the tensor mul_mm, one more dispatch with two barriers per mul_mm, a fixed cost; below 128 rows it costs more than half activations save, and so it does at 128-512 rows for small products (K/V projections, the small recurrent-state projections). The conversion now starts at 128 rows and 4 GFLOP per product (the NAX mat-mat takes f16 only and still converts), and the extra buffer is reserved under the same condition. Thresholds of 2 / 4 / 8 / 16 GFLOP were swept: 4 is the one that is not slower on Qwen and gemma at pp128 / 256 / 512.
 
-**H3 / H3b: GQA-packed NAX attention** (`kernels/fa_tensor.metal`: `kernel_flash_attn_ext_nax_gqa`; `ggml-metal-ops.cpp`). In decode and speculative verify the vec kernel reads K/V once per query head. The new kernel packs the G query heads that share a KV head and the ne01 tokens into the rows of one NAX tile (p = g*ne01 + i), so each K/V block is read once; each threadgroup packs up to 8 tiles of 16 rows (4 for head size 512), dispatched in blocks along the grid, and the KV range is split over them as min(32, 1024/ne01); the results are written in the temp-buffer layout of the vec kernels and combined by the existing `kernel_flash_attn_ext_vec_reduce`. Conditions: head size 128-512, F16 K/V, a mask, no ALiBi / softcap, at least 2 query heads per KV head; with fewer than 5 packed rows (single-token decode with 4 query heads per KV head) and KV shorter than 16k, most of the tile would be empty rows and the vec kernel stays. With `kv_rows` (section 6.5) each lane looks up the cache row of its K/V columns per block; padding rows (< 0) are clamped and masked, and all q slices share one K/V stream. Larger batches keep upstream's gather to F16 and the dense kernel.
+**H3 / H3b: GQA-packed NAX attention** (`kernels/fa_tensor.metal`: `kernel_flash_attn_ext_nax_gqa`; `ggml-metal-ops.cpp`). In decode and speculative verify the vec kernel reads K/V once per query head. The new kernel packs the G query heads that share a KV head and the ne01 tokens into the rows of one NAX tile (p = g*ne01 + i), so each K/V block is read once; each threadgroup packs up to 8 tiles of 16 rows (4 for head size 512), dispatched in blocks along the grid, and the KV range is split over them as min(32, 1024/ne01); the results are written in the temp-buffer layout of the vec kernels and combined by the existing `kernel_flash_attn_ext_vec_reduce`. Conditions: head size 128-512, F16 K/V, a mask, no ALiBi / softcap, at least 2 query heads per KV head; with fewer than 5 packed rows (single-token decode with 4 query heads per KV head) most of the tile would be empty rows, and the vec kernel stays: on an F16 cache below 16k of KV, on BF16 and quantized caches at any length. With `kv_rows` (section 6.5) each lane looks up the cache row of its K/V columns per block; padding rows (< 0) are clamped and masked, and all q slices share one K/V stream. Larger batches keep upstream's gather to F16 and the dense kernel.
 
 **H4: NAX few-row mat-mat for 2-64 rows** (`kernels/mul_mm.metal`: `kernel_mul_mv_nax_f32`; `ggml-metal-common.cpp`, `ggml-metal-ops.cpp`). The src1 rows are the M = 16 rows of a 16x32x16 matmul2d (one or two 16-row tiles per pass, more rows as further passes along the second grid dimension), the 32 weight rows its N; each lane dequantizes 16 weights straight into a half fragment through the dequantize function of the format, without threadgroup memory; 4 simdgroups split K and are summed in threadgroup memory at the end. So that each lane dequantizes a whole 16-weight group at once (the unit of the dequantize functions), K is permuted within each 64-weight chunk, identically for src0 and src1. q5_K has its own dequantize function with 16-byte loads and bit operations instead of per-weight branches. One function decides which row counts are enabled for each format (section 7.1). The residual ADD fuses into its store (MUL_MAT + ADD).
 
@@ -466,13 +466,13 @@ The mat-muls of single-token decode are bandwidth bound, and the existing mat-ve
 
 **A9 / A3b: more weight formats** (`kernels/mul_mv.metal`, `kernels/dequantize.h`, `ggml-metal-ops.cpp`). The UE4M3 sub-block scales of NVFP4 and the base-3 digits of TQ1_0 are decoded in the kernel, and both formats take every Metal path; the int8 NAX threshold drops from 1024 to 448 rows.
 
-**H3b / H5: the GQA kernel** (`kernels/fa_tensor.metal`, `ggml-metal-ops.cpp`). Up to 8 tiles of 16 rows per threadgroup (4 for head size 512), dispatched in blocks along the grid; a quantized cache is read as stored with 4 values dequantized per load; the number of KV splits is min(32, 1024/ne01). H3, H5 and H3b are now one commit. With `kv_rows` the q4_0 / q4_1 / q5_0 / q5_1 / q8_0 caches go through it too; upstream does not accept iq4_nl or BF16 with `kv_rows`.
+**H3b / H5: the GQA kernel** (`kernels/fa_tensor.metal`, `ggml-metal-ops.cpp`). Up to 8 tiles of 16 rows per threadgroup (4 for head size 512), dispatched in blocks along the grid; a quantized cache is read as stored with 4 values dequantized per load; the number of KV splits is min(32, 1024/ne01). H3, H5 and H3b are one commit. With `kv_rows` the q4_0 / q4_1 / q5_0 / q5_1 / q8_0 caches go through it too; upstream does not accept iq4_nl or BF16 with `kv_rows`.
 
 **A5b: the fused GLU writes in place** (`ggml-metal-fusion.cpp`). The activations go into the mat-mat's own f32 result, which removes the race with the released gate/up buffers. The environment variable of every change is listed in the switch column of section 2.
 
 ## 9. Accuracy
 
-- `test-backend-ops -b MTL0`: MUL_MAT 3892/3892 (the few-row cases cover 2-64 rows for every format; also passes with `GGML_METAL_MM_NAX_MIN_ROWS=1`, which sends every eligible case through the NAX / int8 kernels), MUL_MAT_ADD 384/384, MUL_MAT_ID 1109/1109 (with tiles of 32 and of 64 entries), FLASH_ATTN_EXT 5100/5100 (including the NAX paths for head sizes 128 / 256 / 512 and MLA, and two `kv_rows` cases that run the GQA kernel), GATED_DELTA_NET 30/30. Every commit builds on its own and passes the tests relevant to it.
+- `test-backend-ops -b MTL0`: MUL_MAT 4099/4099 (the few-row cases cover 2-64 rows for every format; also passes with `GGML_METAL_MM_NAX_MIN_ROWS=1`, which sends every eligible case through the NAX / int8 kernels), MUL_MAT_ADD 384/384, MUL_MAT_ID 1109/1109 (with tiles of 32 and of 64 entries), FLASH_ATTN_EXT 5100/5100 (including the NAX paths for head sizes 128 / 256 / 512 and MLA, and two `kv_rows` cases that run the GQA kernel), GATED_DELTA_NET 37/37. Every commit builds on its own and passes the tests relevant to it.
 - KL divergence (the main measure): against the full upstream logits (`llama-perplexity --kl-divergence-base`, 8 x 2048 tokens, `-c 2048 -b 2048 -ub 2048 -fa on`, the llama.cpp repository docs as text), comparing this branch's output distribution token by token. Each cell is mean KL divergence / top-1 agreement. The reference columns are upstream against itself with an equivalent setting (`-fa off`, or `-ub 512`), i.e. an ordinary numerical difference:
 
 | Model | this branch, all on | this branch, I8 off | reference: upstream -fa off | reference: upstream -ub 512 |
@@ -610,25 +610,25 @@ M5 这一代在每个 GPU 核心里加入了矩阵单元（NAX，通过 Metal te
 
 | # | 提交 | 改动 | 行数 | 格式 | 开关 |
 |---|---|---|---|---|---|
-| A1 | `bdef63ec0f` | 寄存器常驻的 NAX flash attention（预填充，head size 128 / 256 / 512） | +461 / -9 | -（F16 K/V） | `GGML_METAL_FA_NAX_DISABLE` |
-| A2 | `73e2d6866a` | tensor mul_mm 前的 f32 -> f16 激活转换 | +136 / -7 | F16 与量化格式 | `GGML_METAL_MM_F16_ACT_DISABLE` |
-| A3 | `629d8363ce` | 反量化到 f16 + 寄存器常驻的 NAX mat-mat，长 K 用 split-K（>= 1024 行） | +397 / -4 | F16 + 23 种量化格式 | `GGML_METAL_MM_NAX_DISABLE` |
-| A4 | `951fd49d56` | gated delta net 每状态行 4 个 lane | +157 / -2 | - | `GGML_METAL_GDN_R8_DISABLE` |
-| I8 | `4074513bcd` | int8 NAX mat-mat（每 128 列一个 scale，量化前做 Walsh-Hadamard 变换） | +276 / -7 | 23 种量化格式 | `GGML_METAL_MM_I8_DISABLE` |
-| A5 | `d349d2b01c` | SWIGLU 融合进使用它的 NAX mat-mat | +213 / -7 | 同 A3 | `GGML_METAL_GLU_MM_DISABLE` |
+| A1 | `bdef63ec0f` | 寄存器常驻的 NAX flash attention（预填充，head size 128 / 256 / 512） | +460 / -11 | -（F16 K/V） | `GGML_METAL_FA_NAX_DISABLE` |
+| A2 | `73e2d6866a` | tensor mul_mm 前的 f32 -> f16 激活转换 | +142 / -7 | F16 与量化格式 | `GGML_METAL_MM_F16_ACT_DISABLE` |
+| A3 | `629d8363ce` | 反量化到 f16 + 寄存器常驻的 NAX mat-mat，长 K 用 split-K（>= 1024 行） | +412 / -4 | F16 + 25 种量化格式 | `GGML_METAL_MM_NAX_DISABLE` |
+| A4 | `951fd49d56` | gated delta net 每状态行 4 个 lane | +163 / -2 | - | `GGML_METAL_GDN_R8_DISABLE` |
+| I8 | `4074513bcd` | int8 NAX mat-mat（每 128 列一个 scale，量化前做 Walsh-Hadamard 变换） | +276 / -7 | 25 种量化格式 | `GGML_METAL_MM_I8_DISABLE` |
+| A5 | `d349d2b01c` | SWIGLU 融合进使用它的 NAX mat-mat | +220 / -7 | 同 A3 | `GGML_METAL_GLU_MM_DISABLE` |
 | S1 | `f0320ec0e8` | 关闭思考时保留对话缓存（Web UI） | +12 / -1 | - | 界面设置 |
-| S2-a | `63aaf072e4` | 加载时不对新分配的 KV / 递推状态缓冲区清零 | +44 / -1 | - | `GGML_METAL_CLEAR_SKIP_DISABLE` |
-| K3 | `0d8b15aa9a` | 2-3 行的跨行 mat-vec | +316 / -1 | q4_K（2-3 行）、q5_K（2 行） | `GGML_METAL_MV_XR_DISABLE` |
-| S2-c | `ca7f887415` | 新缓冲区的首次驻留请求放到后台 | +44 / -5 | - | `GGML_METAL_RSET_ASYNC_DISABLE` |
-| A2 门槛 | `2f4029ab02` | 128 行且 4 GFLOP 起才做 f16 激活转换 | +9 / -2 | 同 A2 | `GGML_METAL_MM_F16_ACT_ROWS_128_DISABLE` |
-| H4 | `bc560a2962` | 2-64 行的 NAX few-row mat-mat | +321 / -10 | few-row 内核支持的全部格式，行数范围见第 7 节 | `GGML_METAL_MV_NAX_DISABLE` |
-| M1 | `d379ea300e` | MoE mat-mat（MUL_MAT_ID）从 16 个 token 起使用（原为 32） | +9 / -8 | 全部格式 | `GGML_METAL_MM_ID_MIN16_DISABLE` |
-| M2 | `08df2cc84c` | MoE mat-mat 每块 64 个条目（专家平均 >= 32 个条目时） | +90 / -25 | 全部格式 | `GGML_METAL_MM_ID_WIDE_DISABLE` |
+| S2-a | `63aaf072e4` | 加载时不对新分配的 KV / 递推状态缓冲区清零 | +45 / -1 | - | `GGML_METAL_CLEAR_SKIP_DISABLE` |
+| K3 | `0d8b15aa9a` | 2-3 行的跨行 mat-vec | +322 / -1 | q4_K（2-3 行）、q5_K（2 行） | `GGML_METAL_MV_XR_DISABLE` |
+| S2-c | `ca7f887415` | 新缓冲区的首次驻留请求放到后台 | +46 / -5 | - | `GGML_METAL_RSET_ASYNC_DISABLE` |
+| A2 门槛 | `2f4029ab02` | 128 行且 4 GFLOP 起才做 f16 激活转换 | +9 / -1 | 同 A2 | `GGML_METAL_MM_F16_ACT_ROWS_128_DISABLE` |
+| H4 | `bc560a2962` | 2-64 行的 NAX few-row mat-mat | +327 / -10 | few-row 内核支持的全部格式，行数范围见第 7 节 | `GGML_METAL_MV_NAX_DISABLE` |
+| M1 | `d379ea300e` | MoE mat-mat（MUL_MAT_ID）从 16 个 token 起使用（原为 32） | +11 / -8 | 全部格式 | `GGML_METAL_MM_ID_MIN16_DISABLE` |
+| M2 | `08df2cc84c` | MoE mat-mat 每块 64 个条目（专家平均 >= 32 个条目时） | +96 / -25 | 全部格式 | `GGML_METAL_MM_ID_WIDE_DISABLE` |
 | A6 | `c5c666eada` | BF16 K/V 缓存的 NAX flash attention（预填充与 GQA，寄存器内转 f16） | +36 / -21 | BF16 | `GGML_METAL_FA_NAX_BF16_DISABLE` |
-| A8 | `f35ca617af` | BF16 权重的 NAX mat-mat（1024 行起） | +20 / -6 | BF16 | `GGML_METAL_MM_NAX_BF16_DISABLE` |
-| A7 | `a72e09794f` | MLA 头尺寸 192/128、576/512 的 NAX flash attention | +34 / -20 | MLA | `GGML_METAL_FA_NAX_MLA_DISABLE` |
+| A8 | `f35ca617af` | BF16 权重的 NAX mat-mat（1024 行起） | +48 / -24 | BF16 | `GGML_METAL_MM_NAX_BF16_DISABLE` |
+| A7 | `a72e09794f` | MLA 头尺寸 192/128、576/512 的 NAX flash attention | +32 / -18 | MLA | `GGML_METAL_FA_NAX_MLA_DISABLE` |
 | A9 | `32bd81b983` | NVFP4 / TQ1_0 权重 | +308 / -7 | NVFP4、TQ1_0 | -（格式本身无开关） |
-| A3b | `89b8ebf568` | int8 的 NAX mat-mat 门槛降到 448 行 | +13 / -9 | int8 路径的量化格式 | `GGML_METAL_MM_NAX_MIN_ROWS` |
+| A3b | `89b8ebf568` | int8 的 NAX mat-mat 门槛降到 448 行 | +12 / -8 | int8 路径的量化格式 | `GGML_METAL_MM_NAX_MIN_ROWS` |
 | A5b | `d6f5b44417` | 融合 GLU 把激活写进 mat-mat 自己的结果（修内存竞争） | +16 / -24 | 同 A3 | `GGML_METAL_GLU_MM_DISABLE` |
 | A10 | `7d8ec9dcfd` | BF16 + head size 512 / 576 的大 batch 预填充让回 tensor 内核 | +5 / -2 | BF16 | `GGML_METAL_FA_NAX_BF16_DISABLE` |
 | H3 / H5 / H3b | `0c216f16d7` | 一个提交。H3：共享 KV 头的 query 头打包进一个 NAX 注意力 tile（解码、投机解码验证；head size 128-512）。H5：同样用于量化 K/V 缓存。H3b：最多 8 个 16 行 tile、行块、运行期 KV 份数。也能通过 `kv_rows` 列表读 K/V（第 6.5 节） | +526 / -56 | -（F16 / BF16 K/V）；q4_0 / q4_1 / q5_0 / q5_1 / q8_0 / iq4_nl 缓存 | `GGML_METAL_FA_GQA_DISABLE`、`GGML_METAL_FA_GQA_Q_DISABLE` |
@@ -790,6 +790,8 @@ pp16 / pp24 相当于一次投机解码验证或一段短提示的步长。解�
 
 ## 6. 各项结果与取舍
 
+第 6.1-6.5 节的单项与内核数据在 Qwen3.8-27B 与 gemma-4-26B-A4B 上测得，早于第 3.1 / 3.2 节的端到端数字；第 6.2 节中 Qwen MoE 模型的几行与第 3.3 节一起测得。
+
 取舍规则：单项增幅在多轮中方向一致且超过 1.5%；作为其他显著优化前提的改动除外。
 
 ### 6.1 预填充，稠密模型（Qwen3.8-27B Q5_K_M，llama-bench `-fa 1 -ub 2048`，8k 上下文下 pp2048）
@@ -866,9 +868,9 @@ S2-c 依赖 S2-a：清零会触碰页面，缓冲区就不再是"新的"，所�
 
 ### 6.5 上游 kv_rows 之后的 GQA 注意力
 
-上游 #29510（`1b6935b227`，"flash_attn_ext_rows"，2026-11-03 合入）在开启 flash attention 时，为统一 KV 缓存的每个 ubatch 给 FLASH_ATTN_EXT 传入一份 K/V 行列表（`kv_rows`）。llama-server 默认使用统一 KV 缓存，所以这就是 Llama.app 与服务器的路径。GQA 内核的第一版按位置读缓存，所以在那里无法运行。上游自己没有 GQA 内核（PR #30645 与 #30728 仍未合入）。
+上游 #29510（`1b6935b227`，"flash_attn_ext_rows"，2026-11-03 合入）在开启 flash attention 时，为统一 KV 缓存的每个 ubatch 给 FLASH_ATTN_EXT 传入一份 K/V 行列表（`kv_rows`）。llama-server 默认使用统一 KV 缓存，所以这就是 Llama.app 与服务器的路径。按位置读缓存的内核无法在那里运行。上游自己没有 GQA 内核（PR #30645 与 #30728 仍未合入）。
 
-所以内核学会了读列表：每个 lane 在每个块里查出自己那几列 K/V 对应的缓存行。它接手原本由 vec 内核处理的小批次；更大的批次仍走上游的"收集到 F16 + 稠密内核"（A1 在收集后的行上运行）。第 3 节的解码数字与第 6.2-6.4 节的 H3 / H5 / H3b 数字都测于 #29510 之前，走的是稠密缓存路径。
+所以内核会读这份列表：每个 lane 在每个块里查出自己那几列 K/V 对应的缓存行。它接手原本由 vec 内核处理的小批次；更大的批次仍走上游的"收集到 F16 + 稠密内核"（A1 在收集后的行上运行）。第 3 节的解码数字与第 6.2-6.4 节的 H3 / H5 / H3b 数字都测于 #29510 之前，走的是稠密缓存路径。
 
 通过 `kv_rows` 的测量（Qwen3.8-27B Q5_K_M，`llama-batched-bench -fa on -kvu -ntg 64`，M5 Max，自动电源模式，GQA 开 vs `GGML_METAL_FA_GQA_DISABLE=1`，各 4 次，开关交替，取中位数，解码 t/s）：
 
@@ -886,16 +888,16 @@ S2-c 依赖 S2-a：清零会触碰页面，缓冲区就不再是"新的"，所�
 ### 7.1 各改动覆盖的格式
 
 - **与权重格式无关**：A1、H3（注意力，只看 F16 K/V；H5 增加 q4_0 / q4_1 / q5_0 / q5_1 / q8_0 / iq4_nl 缓存，通过 `kv_rows` 时不含 iq4_nl 与 BF16）、A4（GDN）、A2 与 A2 门槛（激活转换）、S1、S2-a、S2-c。
-- **A3 / I8 / A5（>= 1024 行的预填充）**：F16 与 23 种量化格式：q4_0、q4_1、q5_0、q5_1、q8_0、q1_0、q2_0、mxfp4、q2_K、q3_K、q4_K、q5_K、q6_K、iq1_s、iq1_m、iq2_xxs、iq2_xs、iq2_s、iq3_xxs、iq3_s、iq4_nl、iq4_xs、tq2_0（I8 不含 F16）。权重先经各格式的反量化函数转成 f16，所以每种格式只需要一个反量化实例。
+- **A3 / I8 / A5（>= 1024 行的预填充）**：F16 与 25 种量化格式：q4_0、q4_1、q5_0、q5_1、q8_0、q1_0、q2_0、mxfp4、nvfp4、q2_K、q3_K、q4_K、q5_K、q6_K、iq1_s、iq1_m、iq2_xxs、iq2_xs、iq2_s、iq3_xxs、iq3_s、iq4_nl、iq4_xs、tq1_0、tq2_0（nvfp4 与 tq1_0 经 A9 接入；I8 不含 F16）；BF16 经 A8 接入（不走 I8）。权重先经各格式的反量化函数转成 f16，所以每种格式只需要一个反量化实例。
 - **M1 / M2（MoE）**：上游 MoE mat-mat 支持的全部格式；M2 在 25 种格式上逐一测过（第 7.3 节）。
-- **H4（2-64 行）**：few-row 内核支持的全部 26 种格式（上面 23 种加 f32、f16、bf16），按格式和行数开启：
+- **H4（2-64 行）**：few-row 内核支持的全部 28 种格式（上面 25 种加 f32、f16、bf16），按格式和行数开启：
 
 | 行数 | 开启的格式 |
 |---|---|
-| 33-64 | 按格式的上限：64（q4_0、q4_1、q5_0、q5_1、q8_0、q2_K、q4_K、q5_K、q6_K、f16、bf16、tq2_0、q1_0、q2_0），56（mxfp4、iq4_nl、iq4_xs、iq2_xxs、iq2_s），48（q3_K、iq3_xxs、iq3_s、iq1_s），40（iq2_xs、iq1_m）；f32 不开 |
-| 17-32 | 全部 26 种 |
+| 33-64 | 按格式的上限：64（q4_0、q4_1、q5_0、q5_1、q8_0、q2_K、q4_K、q5_K、q6_K、f16、bf16、tq1_0、tq2_0、q1_0、q2_0），56（mxfp4、nvfp4、iq4_nl、iq4_xs、iq2_xxs、iq2_s），48（q3_K、iq3_xxs、iq3_s、iq1_s），40（iq2_xs、iq1_m）；f32 不开 |
+| 17-32 | 全部 28 种 |
 | 9-16 | 全部量化格式（f32 / f16 / bf16 不更快，保持原路径） |
-| 2-8 | iq 系列、q1_0、q2_0（2 行起）；q2_K、tq2_0、q5_K（3 行起）；q6_K（2-4 行） |
+| 2-8 | iq 系列、q1_0、q2_0（2 行起）；q2_K、tq1_0、tq2_0、q5_K（3 行起）；q6_K（2-4 行） |
 
 - **K3（2-3 行）**：q4_K（2-3 行）、q5_K（2 行）。
 
@@ -931,7 +933,7 @@ S2-c 依赖 S2-a：清零会触碰页面，缓冲区就不再是"新的"，所�
 | tq2_0 | 0.65-1.25x | 2.06-2.09x | 2.51-2.95x | 1.41-1.71x | 1.43x |
 
 - 形状 17408x5120 与 5120x17408，两轮取均值；范围是各行数中的最小与最大。2-8 行一栏是对所有格式测得的结果，只有第 7.1 节列出的格式和行数实际开启；33-64 行一栏是开启范围内的结果。
-- "原有覆盖"表示该格式在 A3/I8 最初就已支持，其效果见第 6.1 节。
+- "原有覆盖"表示该格式在 A3/I8 最初就已支持，其效果见第 6.1 节。nvfp4 与 tq1_0（A9）走同样的内核，经 `test-backend-ops` 校验，但本表未计时。
 - 2-3 行跨行 mat-vec（K3）：q5_K 在 2 行比原路径快 21%，3 行快 6%（3 行 H4 更快，所以 3 行用 H4）。
 
 ### 7.3 MoE 矩阵乘的内核级数据（M2：64 条目的块 vs 32 条目，合成权重，均匀随机路由）
@@ -994,7 +996,7 @@ S2-c 依赖 S2-a：清零会触碰页面，缓冲区就不再是"新的"，所�
 
 **A2 门槛**（`ggml-metal-ops.cpp`）。A2 在 tensor mul_mm 之前把 f32 激活转为 f16，每次 mul_mm 多一次派发和前后两个 barrier，是固定成本；128 行以下这部分成本大于 half 激活省下的时间；128-512 行时，计算量小的矩阵乘（K/V 投影、递推状态的小投影）也是如此。现在 128 行且单次矩阵乘 4 GFLOP 起才转换（NAX mat-mat 只吃 f16，照旧转换），额外缓冲区也按同一条件预留。门槛扫过 2 / 4 / 8 / 16 GFLOP：4 是 Qwen 与 gemma 的 pp128 / 256 / 512 上都不变慢的取值。
 
-**H3 / H3b：GQA 打包的 NAX 注意力**（`kernels/fa_tensor.metal`：`kernel_flash_attn_ext_nax_gqa`；`ggml-metal-ops.cpp`）。解码和投机解码验证时，vec 内核对每个 query 头读一遍 K/V。新内核把共享一个 KV 头的 G 个 query 头和 ne01 个 token 打包成一个 NAX tile 的行（p = g*ne01 + i），每个 K/V 块只读一次；每个 threadgroup 打包最多 8 个 16 行 tile（head size 512 为 4），沿网格按行块派发，KV 范围按 min(32, 1024/ne01) 切分交给这些 threadgroup；结果写成 vec 内核的临时缓冲区格式，由现有的 `kernel_flash_attn_ext_vec_reduce` 合并。条件：head size 128-512、F16 K/V、有掩码、没有 ALiBi / softcap、每个 KV 头至少 2 个 query 头；打包后只有不到 5 行（每 KV 头 4 个 query 头的单 token 解码）且 KV 短于 16k 时，tile 的大部分是空行，保持 vec 内核。有 `kv_rows` 时（第 6.5 节），每个 lane 在每个块里查出自己那几列 K/V 对应的缓存行；填充行（< 0）被钳位并屏蔽，所有 q 分片共用一条 K/V 读取流。更大的批次仍走上游的收集到 F16 + 稠密内核。
+**H3 / H3b：GQA 打包的 NAX 注意力**（`kernels/fa_tensor.metal`：`kernel_flash_attn_ext_nax_gqa`；`ggml-metal-ops.cpp`）。解码和投机解码验证时，vec 内核对每个 query 头读一遍 K/V。新内核把共享一个 KV 头的 G 个 query 头和 ne01 个 token 打包成一个 NAX tile 的行（p = g*ne01 + i），每个 K/V 块只读一次；每个 threadgroup 打包最多 8 个 16 行 tile（head size 512 为 4），沿网格按行块派发，KV 范围按 min(32, 1024/ne01) 切分交给这些 threadgroup；结果写成 vec 内核的临时缓冲区格式，由现有的 `kernel_flash_attn_ext_vec_reduce` 合并。条件：head size 128-512、F16 K/V、有掩码、没有 ALiBi / softcap、每个 KV 头至少 2 个 query 头；打包后只有不到 5 行（每 KV 头 4 个 query 头的单 token 解码）时 tile 的大部分是空行，保持 vec 内核：F16 缓存在 KV 短于 16k 时如此，BF16 与量化缓存在任何长度都如此。有 `kv_rows` 时（第 6.5 节），每个 lane 在每个块里查出自己那几列 K/V 对应的缓存行；填充行（< 0）被钳位并屏蔽，所有 q 分片共用一条 K/V 读取流。更大的批次仍走上游的收集到 F16 + 稠密内核。
 
 **H4：2-64 行的 NAX few-row mat-mat**（`kernels/mul_mm.metal`：`kernel_mul_mv_nax_f32`；`ggml-metal-common.cpp`、`ggml-metal-ops.cpp`）。src1 的行是 16x32x16 matmul2d 的 M = 16 行（一次一个或两个 16 行 tile，更多的行沿网格的第二维分成多遍），32 个权重行是它的 N；每个 lane 通过该格式的反量化函数把 16 个权重直接解到 half 片段里，不用 threadgroup 内存；4 个 simdgroup 切分 K，最后在 threadgroup 内存里求和。为了让每个 lane 一次解出一个完整的 16 权重组（反量化函数的单位），K 在每个 64 权重的块内做了排列，src0 与 src1 用同一个排列。q5_K 另有一个用 16 字节加载和位运算代替逐权重分支的反量化函数。各格式在哪些行数开启由一个函数集中决定（第 7.1 节）。支持与 MUL_MAT + ADD（残差加）融合。
 
@@ -1006,13 +1008,13 @@ S2-c 依赖 S2-a：清零会触碰页面，缓冲区就不再是"新的"，所�
 
 **A9 / A3b：更多权重格式**（`kernels/mul_mv.metal`、`kernels/dequantize.h`、`ggml-metal-ops.cpp`）。NVFP4 的 UE4M3 子块 scale 与 TQ1_0 的三进制位在核心里解码，两种格式接入全部 Metal 路径；int8 的 NAX 门槛从 1024 行降到 448 行。
 
-**H3b / H5：GQA 内核**（`kernels/fa_tensor.metal`、`ggml-metal-ops.cpp`）。每个 threadgroup 打包最多 8 个 16 行 tile（head size 512 为 4），沿网格分块；量化缓存按原格式读、每次载入解 4 个值；KV 份数取 min(32, 1024/ne01)。H3、H5 与 H3b 现在是一个提交。有 `kv_rows` 时，q4_0 / q4_1 / q5_0 / q5_1 / q8_0 缓存也走它；上游在有 `kv_rows` 时不接受 iq4_nl 与 BF16。
+**H3b / H5：GQA 内核**（`kernels/fa_tensor.metal`、`ggml-metal-ops.cpp`）。每个 threadgroup 打包最多 8 个 16 行 tile（head size 512 为 4），沿网格分块；量化缓存按原格式读、每次载入解 4 个值；KV 份数取 min(32, 1024/ne01)。H3、H5 与 H3b 是一个提交。有 `kv_rows` 时，q4_0 / q4_1 / q5_0 / q5_1 / q8_0 缓存也走它；上游在有 `kv_rows` 时不接受 iq4_nl 与 BF16。
 
 **A5b：融合 GLU 写回原位**（`ggml-metal-fusion.cpp`）。激活写进 mat-mat 自己的 f32 结果，消除与 gate/up 释放后的内存竞争。每项改动的环境变量见第 2 节的开关一列。
 
 ## 9. 数值精度
 
-- `test-backend-ops -b MTL0`：MUL_MAT 3892/3892（few-row 用例覆盖全部格式的 2-64 行；在 `GGML_METAL_MM_NAX_MIN_ROWS=1` 下也通过，该设置让所有符合条件的用例都走 NAX / int8 内核），MUL_MAT_ADD 384/384，MUL_MAT_ID 1109/1109（M2 的 32 / 64 条目两种块都通过），FLASH_ATTN_EXT 5100/5100（含 head size 128 / 256 / 512 与 MLA 的 NAX 路径，以及两个走 GQA 内核的 `kv_rows` 用例），GATED_DELTA_NET 30/30。每个提交单独编译并通过与它相关的测试。
+- `test-backend-ops -b MTL0`：MUL_MAT 4099/4099（few-row 用例覆盖全部格式的 2-64 行；在 `GGML_METAL_MM_NAX_MIN_ROWS=1` 下也通过，该设置让所有符合条件的用例都走 NAX / int8 内核），MUL_MAT_ADD 384/384，MUL_MAT_ID 1109/1109（M2 的 32 / 64 条目两种块都通过），FLASH_ATTN_EXT 5100/5100（含 head size 128 / 256 / 512 与 MLA 的 NAX 路径，以及两个走 GQA 内核的 `kv_rows` 用例），GATED_DELTA_NET 37/37。每个提交单独编译并通过与它相关的测试。
 - KL 散度（主要指标）：以上游的完整 logits 为基准（`llama-perplexity --kl-divergence-base`，8 x 2048 token，`-c 2048 -b 2048 -ub 2048 -fa on`，文本为 llama.cpp 仓库文档），逐 token 比较本分支的输出分布。每格为平均 KL 散度 / top-1 一致率。参照列是上游自己换一种等价设置（`-fa off`，或 `-ub 512`）时与它本身的差，代表"正常的数值差异"：
 
 | 模型 | 本分支，全部开启 | 本分支，关 I8 | 参照：上游 -fa off | 参照：上游 -ub 512 |
