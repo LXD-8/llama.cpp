@@ -2,7 +2,7 @@
 
 [English](#llamacpp-metal-optimizations-for-apple-m5-nax-short-version) | [中文](#apple-m5nax上的-llamacpp-metal-优化简略版)
 
-This project optimizes the Metal backend of llama.cpp on Apple M5, with the goal that every kind of model (dense, MoE, different attention structures) and weight format runs close to the hardware limit, covering prefill, decode, speculative decoding, concurrency, short prompts, start-up and the multi-turn conversation cache. 22 code commits on upstream `master` at `67107ac34f` (b12164), one commit per change (H3, H5 and H3b are one commit), each can be switched off on its own. Test machine: MacBook Pro (Mac17,6), Apple M5 Max, 40-core GPU, 128 GB, macOS 27.2. See the [full report](metal-m5.md).
+This project optimizes the Metal backend of llama.cpp on Apple M5, with the goal that every kind of model (dense, MoE, different attention structures) and weight format runs close to the hardware limit, covering prefill, decode, speculative decoding, concurrency, short prompts, start-up and the multi-turn conversation cache. 22 code commits on upstream `master` at `80d2c0c2c5` (b12189), one commit per change (H3, H5 and H3b are one commit), each can be switched off on its own. Test machine: MacBook Pro (Mac17,6), Apple M5 Max, 40-core GPU, 128 GB, macOS 27.2. See the [full report](metal-m5.md).
 
 All changes on, compared with upstream and oMLX (full power, server end to end; oMLX with INT8 prefill on, KV quantization off on both sides; oMLX MTP is off for the decode column and on for the speculative column):
 
@@ -17,6 +17,7 @@ All changes on, compared with upstream and oMLX (full power, server end to end; 
 - Concurrency (the app's 4-slot layout): 2-4 streams 1.0-1.22x in total, 4 speculative streams Qwen 1.36x, gemma 1.18x. The 0.97x for a single speculative gemma stream is a difference in acceptance on this one prompt (0.206 vs 0.227 with the A2 gate off, slightly different prompt numerics lead to different generated text), not a slower kernel: the only work the gate touches there is the 342-token prompt prefill.
 - Against oMLX: 8k prefill Qwen 4% slower, gemma 10% slower; 30k decode (oMLX with MTP off) Qwen 10% slower, gemma 57% faster; speculative MTP vs MTP: Qwen 13% slower, gemma 21% faster.
 - Start-up and memory (previous round): Qwen ready in 1.9 vs 2.7 s, resident memory 3.3 vs about 21 GB; turning thinking off no longer reprocesses the whole conversation.
+- Three more models (llama-bench against upstream, [section 3.3](metal-m5.md#33-qwen36-35b-a3b-qwen38-flash-next-and-gemma-4-31b)): pp2048 Qwen3.6-35B-A3B Q4_K_M 1.20 / 1.41x (depth 0 / 8k), Qwen3.8-Flash-Next UD-IQ4_XS 1.24 / 1.25x, gemma-4-31B Q4_0 1.56 / 1.49x; steps of 16-24 tokens 1.0-2.7x; decode on par.
 - Accuracy: the changes other than I8 match upstream to the order of the reference; I8 has a visible cost on gemma and can be switched off alone (section 9).
 
 ## Changes
@@ -35,8 +36,8 @@ All changes on, compared with upstream and oMLX (full power, server end to end; 
 | S2-c | First residency request in the background | ready -10% |
 | A2 gate | f16 conversion only from 128 rows and 4 GFLOP | time per step +2-6% at 12-96 rows, pp128 +2-7% |
 | H4 | NAX few-row mat-mat for 2-64 rows, one kernel for every format | step of 16 / 32 / 64 tokens 1.6 / 2.4 / 1.4x (Qwen) |
-| M1 | MoE mat-mat from 16 tokens | steps of 16-28 tokens: gemma +6-30% |
-| M2 | MoE mat-mat tiles of 64 entries | gemma prefill +4.5-9% |
+| M1 | MoE mat-mat from 16 tokens | steps of 16-28 tokens: gemma +6-30%; 24 tokens: Qwen3.6-35B-A3B +10-14%, Qwen3.8-Flash-Next +26-28% |
+| M2 | MoE mat-mat tiles of 64 entries, from 32 entries per expert | gemma prefill +4.5-9%; the threshold of 32 (instead of 128): Qwen3.6-35B-A3B +5%, Qwen3.8-Flash-Next +3% |
 | A6 | NAX attention for a BF16 K/V cache | KL on the order of the tensor kernel; BF16 caches no longer fall back |
 | A8 | NAX mat-mat for BF16 weights | from 1024 rows, BF16 takes NAX |
 | A7 | NAX attention for the MLA shapes 192/128 and 576/512 | covers DeepSeek / GLM / Kimi style models |
@@ -56,12 +57,12 @@ Of the prefill numbers, A2 and A3 are alone (they are prerequisites of later cha
 
 - Prefill (A3 / I8 / A5): F16 and 23 quantized formats; the newly covered formats are 41-49% faster per mat-mul on synthetic weights.
 - 2-64 rows (H4): 26 formats enabled per format and row count; 1.1-3.3x at 17-32 rows, 1.0-2.0x at 33-64 rows.
-- MoE (M1 / M2): every format; M2 measured on 25 formats one by one, 5-35% faster from 128 entries per expert.
-- Real models: q5_K / q6_K (Qwen), q4_0 (gemma). See [section 7](metal-m5.md#7-weight-formats).
+- MoE (M1 / M2): every format; M2 measured on 25 formats one by one, 1-26% faster from 32 entries per expert.
+- Real models: q5_K / q6_K (Qwen3.8-27B), q4_K (Qwen3.6-35B-A3B), iq3_xxs / iq4_xs / q5_0 / iq4_nl (Qwen3.8-Flash-Next), q4_0 (gemma). See [section 7](metal-m5.md#7-weight-formats).
 
 ## Method and accuracy
 
-Account for the gap first, then screen candidates; keep only changes with a gain above 1.5% in a consistent direction over several rounds (except prerequisites of other optimizations), implemented with the minimum necessary code. Interleaved forward/reverse measurements within a session, 2 minutes between tests; mat-mul changes A/B tested at kernel level per format and per shape, attention changes verified on the Qwen and gemma structures. `test-backend-ops` passes (MUL_MAT 3892, MUL_MAT_ADD 384, MUL_MAT_ID 867, FLASH_ATTN_EXT 5100, GATED_DELTA_NET 30). Accuracy is measured as the KL divergence to the full upstream logits: the changes other than I8 are practically bit-identical to upstream on Qwen and of the same order as upstream's own `-fa on`/`-fa off` difference on gemma; I8 (int8 prefill) is the only change with a real cost, about 0.0007 on Qwen and about 3x the reference on gemma, and `GGML_METAL_MM_I8_DISABLE=1` turns it off alone ([section 9](metal-m5.md#9-accuracy)).
+Account for the gap first, then screen candidates; keep only changes with a gain above 1.5% in a consistent direction over several rounds (except prerequisites of other optimizations), implemented with the minimum necessary code. Interleaved forward/reverse measurements within a session, 2 minutes between tests; mat-mul changes A/B tested at kernel level per format and per shape, attention changes verified on the Qwen and gemma structures. `test-backend-ops` passes (MUL_MAT 3892, MUL_MAT_ADD 384, MUL_MAT_ID 1109, FLASH_ATTN_EXT 5100, GATED_DELTA_NET 30). Accuracy is measured as the KL divergence to the full upstream logits: the changes other than I8 are practically bit-identical to upstream on Qwen and of the same order as upstream's own `-fa on`/`-fa off` difference on gemma; I8 (int8 prefill) is the only change with a real cost, about 0.0007 on Qwen and about 3x the reference on gemma, and `GGML_METAL_MM_I8_DISABLE=1` turns it off alone ([section 9](metal-m5.md#9-accuracy)).
 
 ## Remaining gaps
 
@@ -69,7 +70,7 @@ MoE prefill is still 3-9% behind oMLX (the per-expert mat-mat is still clearly s
 
 ## Code and use of AI
 
-The code is on the `metal-m5` branch of `LXD-8/llama.cpp`, based on upstream `master` at `67107ac34f` (b12164), one commit per change (H3, H5 and H3b are one commit). The goals, test methodology and decisions are my own; AI tools were used for research, writing code, testing and writing the documents, and their output was reviewed by me. The Chinese version is the original; the English version was translated by AI.
+The code is on the `metal-m5` branch of `LXD-8/llama.cpp`, based on upstream `master` at `80d2c0c2c5` (b12189), one commit per change (H3, H5 and H3b are one commit). The goals, test methodology and decisions are my own; AI tools were used for research, writing code, testing and writing the documents, and their output was reviewed by me. The Chinese version is the original; the English version was translated by AI.
 
 ---
 
@@ -77,7 +78,7 @@ The code is on the `metal-m5` branch of `LXD-8/llama.cpp`, based on upstream `ma
 
 [English](#llamacpp-metal-optimizations-for-apple-m5-nax-short-version) | [中文](#apple-m5nax上的-llamacpp-metal-优化简略版)
 
-本项目优化 llama.cpp 的 Metal 后端在 Apple M5 上的性能，目标是让各种模型（稠密、MoE、不同注意力结构）和量化格式都基本达到硬件上限，范围包括预填充、解码、投机解码、并发、短提示、启动和多轮对话缓存。22 个代码提交，每项改动一个提交（H3、H5 与 H3b 合为一个）、可单独关闭，基于上游 `master` 的 `67107ac34f`（b12164）。测试设备：MacBook Pro（Mac17,6），Apple M5 Max，40 核 GPU，128 GB，macOS 27.2。详见[完整报告](metal-m5.md)。
+本项目优化 llama.cpp 的 Metal 后端在 Apple M5 上的性能，目标是让各种模型（稠密、MoE、不同注意力结构）和量化格式都基本达到硬件上限，范围包括预填充、解码、投机解码、并发、短提示、启动和多轮对话缓存。22 个代码提交，每项改动一个提交（H3、H5 与 H3b 合为一个）、可单独关闭，基于上游 `master` 的 `80d2c0c2c5`（b12189）。测试设备：MacBook Pro（Mac17,6），Apple M5 Max，40 核 GPU，128 GB，macOS 27.2。详见[完整报告](metal-m5.md)。
 
 全部改动开启，与上游、oMLX 对比（满功率，服务器端到端；oMLX 开启 INT8 预填充，两边都关 KV 量化；oMLX 的 MTP 在解码列关闭、投机解码列开启）：
 
@@ -92,6 +93,7 @@ The code is on the `metal-m5` branch of `LXD-8/llama.cpp`, based on upstream `ma
 - 并发（App 的 4 路布局）：2-4 路合计 1.0-1.22 倍，4 路投机解码 Qwen 1.36 倍、gemma 1.18 倍。gemma 单路投机解码 0.97 倍是这一个提示上的接受率差异（0.206 对关闭 A2 门槛时 0.227，提示的数值略有不同导致生成的文本不同），不是内核变慢：这一步里被门槛影响的只有 342 token 的提示预填充。
 - 与 oMLX：8k 预填充 Qwen 慢 4%、gemma 慢 10%；30k 解码（oMLX 关 MTP）Qwen 慢 10%、gemma 快 57%；投机解码 MTP 对 MTP：Qwen 慢 13%、gemma 快 21%。
 - 启动与内存（上一轮）：Qwen 就绪 1.9 对 2.7 s，常驻内存 3.3 对约 21 GB；关闭思考后不再重新处理整段对话。
+- 另外三个模型（llama-bench 对上游，[第 3.3 节](metal-m5.md#33-qwen36-35b-a3bqwen38-flash-next-与-gemma-4-31b)）：pp2048 Qwen3.6-35B-A3B Q4_K_M 1.20 / 1.41 倍（深度 0 / 8k）、Qwen3.8-Flash-Next UD-IQ4_XS 1.24 / 1.25 倍、gemma-4-31B Q4_0 1.56 / 1.49 倍；一步 16-24 token 1.0-2.7 倍；解码持平。
 - 精度：除 I8 外的改动与上游一致到参照量级；I8 在 gemma 上有可见代价，可单独关闭（第 9 节）。
 
 ## 改动
@@ -110,8 +112,8 @@ The code is on the `metal-m5` branch of `LXD-8/llama.cpp`, based on upstream `ma
 | S2-c | 首次驻留请求放到后台 | 就绪 -10% |
 | A2 门槛 | 128 行且 4 GFLOP 起才做 f16 转换 | 每步耗时 12-96 行 +2-6%，pp128 +2~7% |
 | H4 | 2-64 行的 NAX few-row mat-mat，所有格式共用一个内核 | 一步 16 / 32 / 64 token 1.6 / 2.4 / 1.4 倍（Qwen） |
-| M1 | MoE mat-mat 从 16 个 token 起使用 | 一步 16-28 token：gemma +6~30% |
-| M2 | MoE mat-mat 每块 64 个条目 | gemma 预填充 +4.5~9% |
+| M1 | MoE mat-mat 从 16 个 token 起使用 | 一步 16-28 token：gemma +6~30%；24 token：Qwen3.6-35B-A3B +10~14%、Qwen3.8-Flash-Next +26~28% |
+| M2 | MoE mat-mat 每块 64 个条目，每专家 32 个条目起 | gemma 预填充 +4.5~9%；门槛 32（原 128）：Qwen3.6-35B-A3B +5%、Qwen3.8-Flash-Next +3% |
 | A6 | BF16 K/V 缓存的 NAX 注意力 | KL 与 tensor 内核同量级，BF16 缓存不再回退 |
 | A8 | BF16 权重的 NAX mat-mat | 1024 行起，BF16 走 NAX |
 | A7 | MLA 形状 192/128、576/512 的 NAX 注意力 | 覆盖 DeepSeek / GLM / Kimi 类结构 |
@@ -131,12 +133,12 @@ H3、H5 与 H3b 现在是一个提交，内核也能通过上游 #29510 为统�
 
 - 预填充（A3 / I8 / A5）：F16 与 23 种量化格式；新增的格式在合成权重上每个 mat-mul 快 41-49%。
 - 2-64 行（H4）：26 种格式按格式和行数开启；17-32 行快 1.1-3.3 倍，33-64 行快 1.0-2.0 倍。
-- MoE（M1 / M2）：全部格式；M2 在 25 种格式上逐一测过，每专家 128 个条目以上时快 5-35%。
-- 真实模型：q5_K / q6_K（Qwen）、q4_0（gemma）。详见[第 7 节](metal-m5.md#7-量化格式)。
+- MoE（M1 / M2）：全部格式；M2 在 25 种格式上逐一测过，每专家 32 个条目起快 1-26%。
+- 真实模型：q5_K / q6_K（Qwen3.8-27B）、q4_K（Qwen3.6-35B-A3B）、iq3_xxs / iq4_xs / q5_0 / iq4_nl（Qwen3.8-Flash-Next）、q4_0（gemma）。详见[第 7 节](metal-m5.md#7-量化格式)。
 
 ## 方法与精度
 
-先算差距账，再筛选候选；只保留多轮方向一致、增幅超过 1.5% 的方案（作为其他优化前提的除外），保留项用必要最小的改动实现。同一场次正反序交错测量，测试间隔 2 分钟；矩阵乘类改动按格式、按形状做内核级 A/B，注意力类改动在 Qwen 与 gemma 的结构上验证。`test-backend-ops` 全部通过（MUL_MAT 3892、MUL_MAT_ADD 384、MUL_MAT_ID 867、FLASH_ATTN_EXT 5100、GATED_DELTA_NET 30）。精度以对上游完整 logits 的 KL 散度衡量：除 I8 外的改动在 Qwen 上与上游几乎逐位一致，在 gemma 上与上游自身 `-fa on`/`-fa off` 的差同一量级；I8（int8 预填充）是唯一有实质代价的一项，Qwen 约 0.0007，gemma 约为参照的 3 倍，可用 `GGML_METAL_MM_I8_DISABLE=1` 单独关闭（[第 9 节](metal-m5.md#9-数值精度)）。
+先算差距账，再筛选候选；只保留多轮方向一致、增幅超过 1.5% 的方案（作为其他优化前提的除外），保留项用必要最小的改动实现。同一场次正反序交错测量，测试间隔 2 分钟；矩阵乘类改动按格式、按形状做内核级 A/B，注意力类改动在 Qwen 与 gemma 的结构上验证。`test-backend-ops` 全部通过（MUL_MAT 3892、MUL_MAT_ADD 384、MUL_MAT_ID 1109、FLASH_ATTN_EXT 5100、GATED_DELTA_NET 30）。精度以对上游完整 logits 的 KL 散度衡量：除 I8 外的改动在 Qwen 上与上游几乎逐位一致，在 gemma 上与上游自身 `-fa on`/`-fa off` 的差同一量级；I8（int8 预填充）是唯一有实质代价的一项，Qwen 约 0.0007，gemma 约为参照的 3 倍，可用 `GGML_METAL_MM_I8_DISABLE=1` 单独关闭（[第 9 节](metal-m5.md#9-数值精度)）。
 
 ## 剩余差距
 
@@ -144,4 +146,4 @@ MoE 预填充仍比 oMLX 慢 3-9%（按专家分块的 mat-mat 仍明显慢于�
 
 ## 代码与 AI 使用说明
 
-代码在 `LXD-8/llama.cpp` 的 `metal-m5` 分支，基于上游 `master` 的 `67107ac34f`（b12164），每项改动一个提交（H3、H5 与 H3b 合为一个）。项目目标、测试方法和取舍由我决定；调研、编写代码、测试和撰写文档时使用了 AI 工具，产出经过我人工检查。中文为原文，英文版由 AI 翻译。
+代码在 `LXD-8/llama.cpp` 的 `metal-m5` 分支，基于上游 `master` 的 `80d2c0c2c5`（b12189），每项改动一个提交（H3、H5 与 H3b 合为一个）。项目目标、测试方法和取舍由我决定；调研、编写代码、测试和撰写文档时使用了 AI 工具，产出经过我人工检查。中文为原文，英文版由 AI 翻译。
