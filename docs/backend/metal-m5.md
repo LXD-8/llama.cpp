@@ -2,7 +2,7 @@
 
 [English](#llamacpp-metal-optimizations-for-apple-m5-nax-for-every-model-and-weight-format) | [中文](#apple-m5nax上的-llamacpp-metal-优化面向各种模型与量化格式)
 
-This project optimizes the Metal backend of llama.cpp on Apple M5, with the goal that every kind of model (dense, MoE, different attention structures) and every weight format runs close to the hardware limit of the machine. It covers prompt processing (prefill), decode, speculative decoding (MTP / DFlash), concurrency, short prompts, start-up and the multi-turn conversation cache. All changes are based on upstream `master` at `67107ac34f` (b12164): 22 code commits, one per change (H3, H5 and H3b are one commit), each can be switched off on its own.
+This project optimizes the Metal backend of llama.cpp on Apple M5, with the goal that every kind of model (dense, MoE, different attention structures) and every weight format runs close to the hardware limit of the machine. It covers prompt processing (prefill), decode, speculative decoding (MTP / DFlash), concurrency, short prompts, start-up and the multi-turn conversation cache. All changes are based on upstream `master` at `80d2c0c2c5` (b12189): 22 code commits, one per change (H3, H5 and H3b are one commit), each can be switched off on its own.
 
 The table compares all changes on with upstream and oMLX (M5 Max, full power, server end to end, streaming client, temperature 0; oMLX with its INT8 prefill on, KV quantization off on both sides):
 
@@ -15,7 +15,7 @@ The "speculative decode" column: Qwen uses the MTP head inside the model file (`
 
 Scope: 22 code commits, 26 files, +3396 / -122. 21 are in the engine (mostly `ggml/src/ggml-metal/`, one line in `common/`, test cases added to `tests/test-backend-ops.cpp`), 1 in the built-in Web UI (`tools/ui`, the interface of Llama.app). The NAX kernels are only used on devices with the Metal tensor API (by default M5 / A19 and newer); other devices keep the upstream paths. Except for formats that have no switch of their own (NVFP4 / TQ1_0), every engine change can be switched off with an environment variable for A/B testing.
 
-Models measured: Qwen3.8-27B Q5_K_M (dense, GDN + full attention, q5_K / q6_K) and gemma-4-26B-A4B Q4_0 (MoE, 8 of 128 experts, with head size 512 global attention layers). The other weight formats were checked numerically with `test-backend-ops` and timed at kernel level on synthetic weights (section 7).
+Models measured end to end against upstream and oMLX: Qwen3.8-27B Q5_K_M (dense, GDN + full attention, q5_K / q6_K) and gemma-4-26B-A4B Q4_0 (MoE, 8 of 128 experts, with head size 512 global attention layers). Measured against upstream with llama-bench (section 3.3): Qwen3.6-35B-A3B Q4_K_M (MoE, 8 of 256 experts, GDN + full attention), Qwen3.8-Flash-Next UD-IQ4_XS (MoE, 10 of 512 experts, GDN + full attention, 12 query heads per KV head; iq3_xxs / iq4_xs / q5_0 / iq4_nl experts) and gemma-4-31B Q4_0 (dense, with head size 512 global attention layers). The other weight formats were checked numerically with `test-backend-ops` and timed at kernel level on synthetic weights (section 7).
 
 Test machine: MacBook Pro (Mac17,6), Apple M5 Max: 18-core CPU (6 super + 12 performance cores), 40-core GPU, 128 GB unified memory; macOS 27.2. Every number in this document was measured on this machine.
 
@@ -68,28 +68,28 @@ In branch order, one commit per change (H3, H5 and H3b are one commit). The "For
 
 | # | Commit | Change | Lines | Formats | Switch |
 |---|---|---|---|---|---|
-| A1 | `a7f094140` | Register-resident NAX flash attention (prefill, head size 128 / 256 / 512) | +461 / -9 | - (F16 K/V) | `GGML_METAL_FA_NAX_DISABLE` |
-| A2 | `0a39acbcd` | f32 -> f16 activation conversion before the tensor mul_mm | +136 / -7 | F16 and quantized | `GGML_METAL_MM_F16_ACT_DISABLE` |
-| A3 | `d42a64b1b` | Dequant to f16 + register-resident NAX mat-mat, split-K for long K (>= 1024 rows) | +397 / -4 | F16 + 23 quantized formats | `GGML_METAL_MM_NAX_DISABLE` |
-| A4 | `d5346f1aa` | Gated delta net with 4 lanes per state row | +157 / -2 | - | `GGML_METAL_GDN_R8_DISABLE` |
-| I8 | `87b8d9db5` | int8 NAX mat-mat (one scale per 128 columns, Walsh-Hadamard transform before quantizing) | +276 / -7 | 23 quantized formats | `GGML_METAL_MM_I8_DISABLE` |
-| A5 | `eb3b224e3` | SWIGLU fused into the NAX mat-mat that consumes it | +213 / -7 | as A3 | `GGML_METAL_GLU_MM_DISABLE` |
-| S1 | `866581197` | Keep the conversation cache when thinking is turned off (Web UI) | +12 / -1 | - | UI setting |
-| S2-a | `9510455c9` | Do not zero-fill fresh KV / recurrent-state buffers at load | +44 / -1 | - | `GGML_METAL_CLEAR_SKIP_DISABLE` |
-| K3 | `8d0c74072` | Cross-row mat-vec for 2-3 rows | +316 / -1 | q4_K (2-3 rows), q5_K (2 rows) | `GGML_METAL_MV_XR_DISABLE` |
-| S2-c | `c1506b989` | First residency request of fresh buffers in the background | +44 / -5 | - | `GGML_METAL_RSET_ASYNC_DISABLE` |
-| A2 gate | `2ff0114a8` | f16 activation conversion only from 128 rows and 4 GFLOP | +9 / -2 | as A2 | `GGML_METAL_MM_F16_ACT_ROWS_128_DISABLE` |
-| H4 | `9c50c4081` | NAX few-row mat-mat for 2-64 rows | +321 / -10 | all formats of the few-row kernel, row ranges per format in section 7 | `GGML_METAL_MV_NAX_DISABLE` |
-| M1 | `be6587734` | MoE mat-mat (MUL_MAT_ID) from 16 tokens (was 32) | +9 / -8 | all formats | `GGML_METAL_MM_ID_MIN16_DISABLE` |
-| M2 | `a03983a37` | MoE mat-mat tiles of 64 entries (when the experts get >= 128 entries on average) | +90 / -25 | all formats | `GGML_METAL_MM_ID_WIDE_DISABLE` |
-| A6 | `8768dad0f` | NAX flash attention for a BF16 K/V cache (prefill and GQA, converted to f16 in registers) | +36 / -21 | BF16 | `GGML_METAL_FA_NAX_BF16_DISABLE` |
-| A8 | `9d2cb5214` | NAX mat-mat for BF16 weights (from 1024 rows) | +20 / -6 | BF16 | `GGML_METAL_MM_NAX_BF16_DISABLE` |
-| A7 | `7479b2600` | NAX flash attention for the MLA head sizes 192/128 and 576/512 | +34 / -20 | MLA | `GGML_METAL_FA_NAX_MLA_DISABLE` |
-| A9 | `ca8a15013` | NVFP4 / TQ1_0 weights | +308 / -7 | NVFP4, TQ1_0 | - (no switch of its own) |
-| A3b | `e11f1820d` | int8 NAX mat-mat from 448 rows | +13 / -9 | the quantized formats of the int8 path | `GGML_METAL_MM_NAX_MIN_ROWS` |
-| A5b | `971b41a44` | The fused GLU writes the activations into the mat-mat result (memory race fix) | +16 / -24 | as A3 | `GGML_METAL_GLU_MM_DISABLE` |
-| A10 | `e46a6c395` | BF16 prefill attention at head size 512 / 576 (more than 32 queries) yields to the tensor kernel | +5 / -2 | BF16 | `GGML_METAL_FA_NAX_BF16_DISABLE` |
-| H3 / H5 / H3b | `06d72db6c` | One commit. H3: query heads that share a KV head packed into one NAX attention tile (decode, speculative verify; head size 128-512). H5: the same for quantized K/V caches. H3b: up to 8 tiles of 16 rows, row blocks, runtime KV split count. Also reads K/V through the `kv_rows` lists (section 6.5) | +526 / -56 | - (F16 / BF16 K/V); q4_0 / q4_1 / q5_0 / q5_1 / q8_0 / iq4_nl caches | `GGML_METAL_FA_GQA_DISABLE`, `GGML_METAL_FA_GQA_Q_DISABLE` |
+| A1 | `bdef63ec0f` | Register-resident NAX flash attention (prefill, head size 128 / 256 / 512) | +461 / -9 | - (F16 K/V) | `GGML_METAL_FA_NAX_DISABLE` |
+| A2 | `73e2d6866a` | f32 -> f16 activation conversion before the tensor mul_mm | +136 / -7 | F16 and quantized | `GGML_METAL_MM_F16_ACT_DISABLE` |
+| A3 | `629d8363ce` | Dequant to f16 + register-resident NAX mat-mat, split-K for long K (>= 1024 rows) | +397 / -4 | F16 + 23 quantized formats | `GGML_METAL_MM_NAX_DISABLE` |
+| A4 | `951fd49d56` | Gated delta net with 4 lanes per state row | +157 / -2 | - | `GGML_METAL_GDN_R8_DISABLE` |
+| I8 | `4074513bcd` | int8 NAX mat-mat (one scale per 128 columns, Walsh-Hadamard transform before quantizing) | +276 / -7 | 23 quantized formats | `GGML_METAL_MM_I8_DISABLE` |
+| A5 | `d349d2b01c` | SWIGLU fused into the NAX mat-mat that consumes it | +213 / -7 | as A3 | `GGML_METAL_GLU_MM_DISABLE` |
+| S1 | `f0320ec0e8` | Keep the conversation cache when thinking is turned off (Web UI) | +12 / -1 | - | UI setting |
+| S2-a | `63aaf072e4` | Do not zero-fill fresh KV / recurrent-state buffers at load | +44 / -1 | - | `GGML_METAL_CLEAR_SKIP_DISABLE` |
+| K3 | `0d8b15aa9a` | Cross-row mat-vec for 2-3 rows | +316 / -1 | q4_K (2-3 rows), q5_K (2 rows) | `GGML_METAL_MV_XR_DISABLE` |
+| S2-c | `ca7f887415` | First residency request of fresh buffers in the background | +44 / -5 | - | `GGML_METAL_RSET_ASYNC_DISABLE` |
+| A2 gate | `2f4029ab02` | f16 activation conversion only from 128 rows and 4 GFLOP | +9 / -2 | as A2 | `GGML_METAL_MM_F16_ACT_ROWS_128_DISABLE` |
+| H4 | `bc560a2962` | NAX few-row mat-mat for 2-64 rows | +321 / -10 | all formats of the few-row kernel, row ranges per format in section 7 | `GGML_METAL_MV_NAX_DISABLE` |
+| M1 | `d379ea300e` | MoE mat-mat (MUL_MAT_ID) from 16 tokens (was 32) | +9 / -8 | all formats | `GGML_METAL_MM_ID_MIN16_DISABLE` |
+| M2 | `08df2cc84c` | MoE mat-mat tiles of 64 entries (when the experts get >= 32 entries on average) | +90 / -25 | all formats | `GGML_METAL_MM_ID_WIDE_DISABLE` |
+| A6 | `c5c666eada` | NAX flash attention for a BF16 K/V cache (prefill and GQA, converted to f16 in registers) | +36 / -21 | BF16 | `GGML_METAL_FA_NAX_BF16_DISABLE` |
+| A8 | `f35ca617af` | NAX mat-mat for BF16 weights (from 1024 rows) | +20 / -6 | BF16 | `GGML_METAL_MM_NAX_BF16_DISABLE` |
+| A7 | `a72e09794f` | NAX flash attention for the MLA head sizes 192/128 and 576/512 | +34 / -20 | MLA | `GGML_METAL_FA_NAX_MLA_DISABLE` |
+| A9 | `32bd81b983` | NVFP4 / TQ1_0 weights | +308 / -7 | NVFP4, TQ1_0 | - (no switch of its own) |
+| A3b | `89b8ebf568` | int8 NAX mat-mat from 448 rows | +13 / -9 | the quantized formats of the int8 path | `GGML_METAL_MM_NAX_MIN_ROWS` |
+| A5b | `d6f5b44417` | The fused GLU writes the activations into the mat-mat result (memory race fix) | +16 / -24 | as A3 | `GGML_METAL_GLU_MM_DISABLE` |
+| A10 | `7d8ec9dcfd` | BF16 prefill attention at head size 512 / 576 (more than 32 queries) yields to the tensor kernel | +5 / -2 | BF16 | `GGML_METAL_FA_NAX_BF16_DISABLE` |
+| H3 / H5 / H3b | `0c216f16d7` | One commit. H3: query heads that share a KV head packed into one NAX attention tile (decode, speculative verify; head size 128-512). H5: the same for quantized K/V caches. H3b: up to 8 tiles of 16 rows, row blocks, runtime KV split count. Also reads K/V through the `kv_rows` lists (section 6.5) | +526 / -56 | - (F16 / BF16 K/V); q4_0 / q4_1 / q5_0 / q5_1 / q8_0 / iq4_nl caches | `GGML_METAL_FA_GQA_DISABLE`, `GGML_METAL_FA_GQA_Q_DISABLE` |
 | | | **Total** | **+3396 / -122** | | |
 
 ## 3. Outcome
@@ -176,7 +176,29 @@ App start-up (the app's arguments: 262k context, mmproj, MTP, `--fit-target 1024
 
 App start-up: this branch ready in 2.2 s, upstream 2.3 s.
 
-### 3.3 Summary
+### 3.3 Qwen3.6-35B-A3B, Qwen3.8-Flash-Next and gemma-4-31B
+
+Three more models, measured against upstream with llama-bench only (`-fa 1 -ub 2048`, full power, two rounds forward and reverse, 2 minutes between tests, the median of 5 repetitions per test, mean over the rounds); there is no oMLX or server end-to-end comparison for them.
+
+- `Qwen3.6-35B-A3B-Q4_K_M.gguf` (ggml-org, 20.4 GB; 40 layers: 30 gated-delta-net + 10 full attention, 16 query heads sharing 2 KV heads, head size 256; 8 of 256 experts of width 512 plus a shared expert; q4_K experts, q8_0 attention).
+- `Qwen3.8-Flash-Next-UD-IQ4_XS` (unsloth, 4 files, 93.7 GB; 48 layers: 36 gated-delta-net + 12 full attention, 24 query heads sharing 2 KV heads, head size 256; 10 of 512 experts of width 640 plus a shared expert; gate / up experts iq3_xxs / iq4_xs / iq2_s, down experts q5_0 / iq4_nl / q2_0).
+- `gemma-4-31B-it-Q4_0.gguf` (ggml-org, 18.0 GB; 60 dense layers; sliding-window layers with head size 256 and 2 query heads per KV head, global layers with head size 512 and 8; q4_0 throughout).
+
+| t/s | pp16 @0 | pp24 @0 | pp2048 @0 | tg64 @0 | pp16 @8k | pp24 @8k | pp2048 @8k | tg64 @8k |
+|---|---|---|---|---|---|---|---|---|
+| Qwen3.6-35B-A3B, this branch | 616 | 741 | 4538 | 103.5 | 589 | 711 | 3892 | 99.0 |
+| Qwen3.6-35B-A3B, upstream | 613 | 504 | 3777 | 106.2 | 495 | 466 | 2769 | 100.5 |
+| ratio | 1.00x | 1.47x | 1.20x | 0.97x | 1.19x | 1.52x | 1.41x | 0.99x |
+| Qwen3.8-Flash-Next, this branch | 281 | 328 | 1544 | 51.2 | 278 | 319 | 1260 | 49.8 |
+| Qwen3.8-Flash-Next, upstream | 233 | 128 | 1244 | 48.1 | 221 | 134 | 1006 | 46.9 |
+| ratio | 1.21x | 2.57x | 1.24x | 1.06x | 1.26x | 2.38x | 1.25x | 1.06x |
+| gemma-4-31B, this branch | 285 | 338 | 1011 | 25.1 | 243 | 284 | 807 | 23.6 |
+| gemma-4-31B, upstream | 190 | 124 | 650 | 25.7 | 128 | 115 | 540 | 23.3 |
+| ratio | 1.50x | 2.73x | 1.56x | 0.98x | 1.91x | 2.47x | 1.49x | 1.01x |
+
+pp16 / pp24 are steps of the size of a speculative verify or a short prompt. Decode is on par with upstream: the 0.97-1.06x are within the spread of about +/-5% that the decode cells of this run showed between configurations that do not differ on the decode path.
+
+### 3.4 Summary
 
 - Prefill: at 8k end to end, Qwen 1.69x, gemma 1.22x; llama-bench `pp8192 @8k` 1.77 / 1.21x (the previous `pp2048` round was 1.5-2.0x).
 - Decode: on par with upstream at short context (0.99-1.01x), faster at long context: at 30k Qwen +4%, gemma +18% (H3, the GQA-packed attention). Measured before upstream #29510; the GQA gain through the `kv_rows` lists is in section 6.5.
@@ -184,6 +206,7 @@ App start-up: this branch ready in 2.2 s, upstream 2.3 s.
 - Concurrency (the app's 4-slot layout): 2-4 streams 1.0-1.22x in total, 4 speculative streams Qwen 1.36x, gemma 1.18x. The 0.97x for a single speculative gemma stream is a difference in acceptance on this one prompt (0.206 vs 0.227 with the A2 gate off, slightly different prompt numerics lead to different generated text), not a slower kernel: the only work the gate touches there is the 342-token prompt prefill.
 - Against oMLX: 8k prefill Qwen 4% slower, gemma 10% slower; 30k decode (oMLX with MTP off) Qwen 10% slower, gemma 57% faster; speculative MTP vs MTP: Qwen 13% slower (41.2 vs 47.1), gemma 21% faster (117.2 vs 97.0).
 - Start-up and memory (previous round): Qwen ready in 1.9 vs 2.7 s, resident memory 3.3 vs about 21 GB; turning thinking off no longer reprocesses the whole conversation.
+- Three more models (section 3.3, llama-bench against upstream): pp2048 Qwen3.6-35B-A3B 1.20 / 1.41x (depth 0 / 8k), Qwen3.8-Flash-Next 1.24 / 1.25x, gemma-4-31B 1.56 / 1.49x; steps of 16-24 tokens 1.0-2.7x; decode on par.
 - Accuracy: the changes other than I8 match upstream to the order of the reference; I8 has a visible cost on gemma and can be switched off alone (section 9).
 
 ## 4. Method
@@ -192,11 +215,12 @@ App start-up: this branch ready in 2.2 s, upstream 2.3 s.
 - **Screen, then confirm.** Compute-bound candidates were first A/B tested at kernel level on synthetic weights (interleaved in one process); only a gain above 1.5% in a consistent direction over several rounds went on to real-model measurements. Every kept change was confirmed at full power (`powermode 0`), and every number in this document is a full-power number.
 - **Interleaved measurements.** Absolute values drift 5-15% between sessions with the thermal state. Every comparison runs the configurations forward and then in reverse within one session, and only ratios within a session are compared. Tests are 2 minutes apart; test blocks with too much drift were discarded and repeated.
 - **Leave-one-out selection.** A change is judged by its contribution to the final combination (all on minus this one), not only by its effect alone.
-- **Per format and per shape.** Mat-mul changes were A/B tested at kernel level for every weight format separately on synthetic weights (dense: 17408x5120 and 5120x17408; MoE: the expert shapes of gemma-4), and enabled only for the formats and row ranges that are actually faster; the output checksums of both paths were compared.
+- **Per format and per shape.** Mat-mul changes were A/B tested at kernel level for every weight format separately on synthetic weights (dense: 17408x5120 and 5120x17408; MoE: the expert shapes of gemma-4, gpt-oss, Qwen3.6-35B-A3B and Qwen3.8-Flash-Next), and enabled only for the formats and row ranges that are actually faster; the output checksums of both paths were compared.
 - **Per model structure.** Attention changes were measured on the Qwen and gemma structures: 6 / 8 query heads per KV head, head sizes 128 / 256 / 512. Cases that get slower on some structure are excluded by a threshold (for example H3 for single-token decode with 4 query heads per KV head).
+- **MoE thresholds on real routing.** Synthetic MoE weights use uniform random routing, which spreads the entries evenly over the experts; real routing does not. The format coverage of M1 / M2 comes from the synthetic sweeps, but their thresholds are confirmed on real models: on the Qwen expert shapes M1 looks slower with uniform routing at 16-24 tokens, while on both Qwen MoE models it is faster (section 6.2).
 - **Accuracy gate.** For every model the KL divergence to the full upstream logits is measured (paired per token, far more sensitive than perplexity), with the difference between upstream's own `-fa on` and `-fa off` as the reference for an ordinary numerical difference; a lossy change is either brought close to that reference or its cost is stated and it can be switched off on its own (section 9).
 - **Fixed prompts.** Speculative decoding speed depends on how many drafts the generated text accepts; end-to-end comparisons of single changes use fixed prompts and compare times only after checking that the output text is identical.
-- **Upstream check.** Every round is rebuilt and re-measured on upstream `master`; this document is based on `67107ac34f` (b12164).
+- **Upstream check.** Every round is rebuilt and re-measured on upstream `master`; this document is based on `80d2c0c2c5` (b12189). Sections 3.1, 3.2 and 6.1-6.5 were measured on `67107ac34f`, section 3.3 and the M2 threshold data on `18ab62a8ec`; the upstream commits since then do not touch the measured paths (the only Metal change is a GROUP_NORM fix).
 
 ## 5. Candidates found by research
 
@@ -259,11 +283,17 @@ Kernel level (interleaved A/B in one process, 2048 rows):
 | | gemma-4-26B-A4B (8) | +1.5% / +6% / +9% / +18% |
 | H3 (a step of 4 tokens, i.e. speculative verify) | Qwen / gemma | +6% to +55% (2k-32k), 1.2-2.0x at 32k |
 | M1 (a step of 16 / 20 / 24 / 28 tokens) | gemma-4-26B-A4B | +6% / +14% / +23% / +30% |
-| | gemma-4-26B-A4B | 0 / +4.5% / +5-9% / +3-4% |
+| M2 (pp1024 / pp2048 / pp4096 / pp2048 @8k, `-ub 2048`, tiles of 64 vs 32) | gemma-4-26B-A4B | 0 / +4.5% / +5-9% / +3-4% |
+| | gpt-oss-20b MXFP4 | +24% / +29% / +37% / +18% |
+| M1 (a step of 16 / 24 tokens, depth 0 / 8k) | Qwen3.6-35B-A3B | 16: -1% / +1%; 24: +10% / +14% |
+| | Qwen3.8-Flash-Next | 16: +8% / +14%; 24: +26% / +28% |
+| M2 threshold of 32 instead of 128 entries per expert (pp2048 / pp4096, `-ub 2048`) | Qwen3.6-35B-A3B | +5.3% / +4.4% |
+| | Qwen3.8-Flash-Next | +3.3% / +3.0% |
+| | gemma-4-26B-A4B | pp2048 / pp4096 at `-ub 512`: +1.2% / +1.2%; pp512 at `-ub 2048`: +2.5%; pp2048 / pp4096 at `-ub 2048`: 0 (already >= 128 entries) |
 
 - H3: measured before upstream #29510, on the dense cache path (section 6.5).
-- M1: below 32 tokens upstream reads the weights of an expert once per (token, expert) entry; with the mat-mat, up to 32 entries of a tile share one read. At 12 tokens the two models disagree (-3% / +7%), so the threshold is 16.
-- M2: the upstream MoE mat-mat has tiles of up to 32 entries, and every tile dequantizes the expert weights once. From 128 entries per expert on average, tiles of 64 entries are faster for all 25 formats and all three expert shapes (+5-35%, section 7.3); with fewer entries the half-empty tiles cost more than they save, so they are used only from there. gemma's pp1024 (64 entries per expert) is below the threshold and stays unchanged.
+- M1: below 32 tokens upstream reads the weights of an expert once per (token, expert) entry; with the mat-mat, up to 32 entries of a tile share one read. At 12 tokens the two models disagree (-3% / +7%), so the threshold is 16. The M1 rows of the Qwen MoE models compare against M1 off at the same build; at 16-24 tokens no expert reaches 32 entries, so M2 is not involved.
+- M2: the upstream MoE mat-mat has tiles of up to 32 entries, and every tile dequantizes the expert weights once. From 32 entries per expert on average, tiles of 64 entries are faster for all 25 formats on all three expert shapes (+1-26%, section 7.3); at 16 entries the half-empty tiles cost more than they save (0-13% slower), so they are used from 32. The Qwen MoE models have many narrow experts (8 of 256, 10 of 512) and reach only 40-64 entries per expert at 2048 tokens, so a higher threshold left them out. With its real routing Qwen3.6-35B-A3B is +2.3% even at 16 entries, but uniform routing loses there, so the threshold stays at 32.
 
 ### 6.3 Decode and serving (Qwen3.8-27B Q5_K_M)
 
@@ -364,37 +394,37 @@ These runs are noisy: Spotlight indexing and another app ran in the background, 
 - "Already covered" means the format was supported by A3/I8 from the start; see section 6.1.
 - Cross-row mat-vec (K3) for 2-3 rows: q5_K 21% faster than the old path at 2 rows, 6% at 3 rows (H4 is faster at 3 rows, so 3 rows use H4).
 
-### 7.3 Kernel-level data, MoE mat-mul (M2: tiles of 64 entries vs 32, synthetic weights, random routing)
+### 7.3 Kernel-level data, MoE mat-mul (M2: tiles of 64 entries vs 32, synthetic weights, uniform random routing)
 
-Shapes: gemma-4 gate_up (8 of 128 experts, K = 2816, N = 1408) and down (K = 704, N = 2816). Shapes whose K is not a multiple of 256 cannot hold the K-quant and IQ formats, which are therefore measured on gemma gate_up only. T = 128 / 512 / 2048 tokens, i.e. 8 / 32 / 128 entries per expert. Median of two rounds.
+Shapes: gemma-4 gate_up (8 of 128 experts, K = 2816, N = 1408) and down (K = 704, N = 2816), gpt-oss (4 of 32 experts, K = N = 2880). Shapes whose K is not a multiple of 256 cannot hold the K-quant and most IQ formats, which are therefore measured on gemma gate_up only. Each cell is 16 / 32 / 64 / 125 entries per expert on average (gemma T = 256 / 512 / 1024 / 2000 tokens, gpt-oss T = 128 / 256 / 512 / 1000). Each process runs the mat-mul for 1 s before timing, so that the GPU clock has settled; median of 30 runs, median of two rounds (forward and reverse), full power. The output checksums of both tile sizes are identical.
 
-| Format | gemma gate_up (T = 128 / 512 / 2048) | gemma down |
-|---|---|---|
-| mxfp4 | +2%/+22%/+32% | -8%/-11%/+24% |
-| q4_0 | -7%/+14%/+14% | -25%/-3%/+10% |
-| q4_1 | -8%/-12%/+12% | -3%/+28%/+9% |
-| q5_0 | -5%/+11%/+31% | -7%/+35%/+5% |
-| q5_1 | -4%/+13%/+29% | -6%/-18%/+24% |
-| q8_0 | +3%/-0%/+20% | -1%/+9%/+13% |
-| f16 | +1%/+3%/+16% | -0%/+4%/+6% |
-| bf16 | +1%/+3%/+9% | +2%/+4%/+8% |
-| q2_K | -3%/+28%/+20% | - |
-| q3_K | +202%/+13%/+33% | - |
-| q4_K | -5%/-8%/+24% | - |
-| q5_K | -3%/+18%/+32% | - |
-| q6_K | +12%/+11%/+20% | - |
-| iq2_xxs | -9%/+18%/+21% | - |
-| iq2_xs | -4%/+15%/+19% | - |
-| iq2_s | +10%/+12%/+19% | - |
-| iq3_xxs | -26%/+23%/+21% | - |
-| iq3_s | +12%/-16%/+24% | - |
-| iq1_s | -5%/+19%/+19% | - |
-| iq1_m | +15%/+27%/+21% | - |
-| iq4_nl | -15%/+9%/+29% | -9%/-6%/+21% |
-| iq4_xs | -13%/+14%/+28% | - |
-| tq2_0 | +48%/+20%/+21% | - |
-| q1_0 | -3%/+20%/+8% | - |
-| q2_0 | +4%/-27%/+12% | -5%/-22%/+10% |
+| Format | gemma gate_up | gemma down | gpt-oss |
+|---|---|---|---|
+| q4_0 | -9%/+6%/+5%/+9% | -7%/+5%/+6%/+10% | -5%/+6%/+6%/+8% |
+| q4_1 | -7%/+5%/+9%/+9% | -4%/+4%/+7%/+9% | -6%/+5%/+7%/+8% |
+| q5_0 | -0%/+15%/+17%/+19% | -1%/+11%/+19%/+21% | -5%/+15%/+18%/+21% |
+| q5_1 | -1%/+13%/+13%/+19% | -2%/+13%/+20%/+21% | -2%/+12%/+15%/+21% |
+| q8_0 | -3%/+3%/+8%/+13% | -2%/+1%/+6%/+13% | -3%/+1%/+10%/+15% |
+| mxfp4 | -8%/+16%/+19%/+25% | -5%/+11%/+17%/+21% | -6%/+13%/+19%/+26% |
+| q2_K | -3%/+11%/+12%/+14% | - | - |
+| q3_K | -1%/+18%/+21%/+26% | - | - |
+| q4_K | -6%/+10%/+13%/+19% | - | - |
+| q5_K | -2%/+16%/+23%/+25% | - | - |
+| q6_K | -3%/+8%/+15%/+20% | - | - |
+| iq1_s | -6%/+11%/+13%/+16% | - | - |
+| iq1_m | -5%/+13%/+15%/+18% | - | - |
+| iq2_xxs | -7%/+7%/+15%/+17% | - | - |
+| iq2_xs | -2%/+12%/+14%/+17% | - | - |
+| iq2_s | -4%/+12%/+14%/+17% | - | - |
+| iq3_xxs | -5%/+12%/+14%/+17% | - | - |
+| iq3_s | -3%/+13%/+15%/+18% | - | - |
+| iq4_nl | -12%/+8%/+16%/+21% | -5%/+7%/+16%/+19% | -9%/+8%/+14%/+20% |
+| iq4_xs | -13%/+8%/+16%/+21% | - | - |
+| q1_0 | -5%/+5%/+3%/+5% | - | - |
+| q2_0 | -8%/+7%/+6%/+8% | -9%/+5%/+7%/+9% | -7%/+7%/+3%/+10% |
+| tq2_0 | -1%/+14%/+13%/+16% | - | - |
+| f16 | +0%/+4%/+8%/+15% | +1%/+1%/+6%/+10% | +1%/+5%/+8%/+16% |
+| bf16 | -0%/+3%/+5%/+11% | +0%/+1%/+4%/+9% | -0%/+4%/+3%/+11% |
 
 ### 7.4 Bandwidth of the decode mat-vec (single token)
 
@@ -430,7 +460,7 @@ The mat-muls of single-token decode are bandwidth bound, and the existing mat-ve
 
 **M1: MoE mat-mat from 16 tokens** (`ggml-metal-common.cpp`). `ggml_metal_op_mul_mat_id_use_mm` lowers the threshold from 32 to 16 on devices with tensor units; others keep 32.
 
-**M2: MoE mat-mat tiles of 64 entries** (`kernels/mul_mm.metal`: `kernel_mul_mm_id_map0`, `kernel_mul_mm_id`; `ggml-metal-device.cpp`, `ggml-metal-ops.cpp`). The routing prepass cuts the entries of each expert into tiles, and the main kernel dequantizes 64 weight rows once per tile and multiplies them with the entries of the tile. A function constant switches the tile size from 32 to 64 in the prepass and the kernel together: a tile of 64 entries is multiplied in quarters of 16 rows with `matmul2d`, and quarters without entries are skipped; each thread loads one more activation row; threadgroup memory grows from 8 KB to 16 KB. Used only on devices with tensor units and when the experts get at least 128 entries on average.
+**M2: MoE mat-mat tiles of 64 entries** (`kernels/mul_mm.metal`: `kernel_mul_mm_id_map0`, `kernel_mul_mm_id`; `ggml-metal-device.cpp`, `ggml-metal-ops.cpp`). The routing prepass cuts the entries of each expert into tiles, and the main kernel dequantizes 64 weight rows once per tile and multiplies them with the entries of the tile. A function constant switches the tile size from 32 to 64 in the prepass and the kernel together: a tile of 64 entries is multiplied in quarters of 16 rows with `matmul2d`, and quarters without entries are skipped; each thread loads one more activation row; threadgroup memory grows from 8 KB to 16 KB. Used only on devices with tensor units and when the experts get at least 32 entries on average.
 
 **A6 / A7 / A8 / A10: BF16 and MLA** (`kernels/fa_tensor.metal`, `kernels/mul_mm.metal`, `ggml-metal-ops.cpp`). A BF16 cache is read as stored, clamped to f16 in registers and fed to the MMA; the MLA shapes 192/128 and 576/512 split the K and V head dims separately (K over 1 simdgroup, V over 4 for 576/512); BF16 weights are converted to f16 once from 1024 rows and then take the NAX path. A BF16 prefill with head size 512 / 576 and more than 32 queries (the GQA batch limit) still yields to the tensor kernel.
 
@@ -442,7 +472,7 @@ The mat-muls of single-token decode are bandwidth bound, and the existing mat-ve
 
 ## 9. Accuracy
 
-- `test-backend-ops -b MTL0`: MUL_MAT 3892/3892 (the few-row cases cover 2-64 rows for every format; also passes with `GGML_METAL_MM_NAX_MIN_ROWS=1`, which sends every eligible case through the NAX / int8 kernels), MUL_MAT_ADD 384/384, MUL_MAT_ID 867/867 (with tiles of 32 and of 64 entries), FLASH_ATTN_EXT 5100/5100 (including the NAX paths for head sizes 128 / 256 / 512 and MLA, and two `kv_rows` cases that run the GQA kernel), GATED_DELTA_NET 30/30. Every commit builds on its own and passes the tests relevant to it.
+- `test-backend-ops -b MTL0`: MUL_MAT 3892/3892 (the few-row cases cover 2-64 rows for every format; also passes with `GGML_METAL_MM_NAX_MIN_ROWS=1`, which sends every eligible case through the NAX / int8 kernels), MUL_MAT_ADD 384/384, MUL_MAT_ID 1109/1109 (with tiles of 32 and of 64 entries), FLASH_ATTN_EXT 5100/5100 (including the NAX paths for head sizes 128 / 256 / 512 and MLA, and two `kv_rows` cases that run the GQA kernel), GATED_DELTA_NET 30/30. Every commit builds on its own and passes the tests relevant to it.
 - KL divergence (the main measure): against the full upstream logits (`llama-perplexity --kl-divergence-base`, 8 x 2048 tokens, `-c 2048 -b 2048 -ub 2048 -fa on`, the llama.cpp repository docs as text), comparing this branch's output distribution token by token. Each cell is mean KL divergence / top-1 agreement. The reference columns are upstream against itself with an equivalent setting (`-fa off`, or `-ub 512`), i.e. an ordinary numerical difference:
 
 | Model | this branch, all on | this branch, I8 off | reference: upstream -fa off | reference: upstream -ub 512 |
@@ -464,7 +494,7 @@ The mat-muls of single-token decode are bandwidth bound, and the existing mat-ve
 
 ## 10. Remaining gaps
 
-1. **MoE prefill.** gemma's 8k prompt is 9% slower than oMLX (the 30k prefill was not re-measured this round). Before M2, most of gemma prefill was MUL_MAT_ID at about half the throughput of the dense path; M2 made it 24-37% faster, but the per-expert mat-mat is still clearly below the dense path. The next step is a register-resident NAX kernel like A3 for the per-expert mat-mat (the per-expert few-row approach is slower at large batches).
+1. **MoE prefill.** gemma's 8k prompt is 9% slower than oMLX (the 30k prefill was not re-measured this round). Before M2, most of gemma prefill was MUL_MAT_ID at about half the throughput of the dense path; M2 made it 24-37% faster, but the per-expert mat-mat is still clearly below the dense path. The next step is a register-resident NAX kernel like A3 for the per-expert mat-mat (the per-expert few-row approach is slower at large batches). The Qwen MoE models of section 3.3 were not compared with oMLX.
 2. **Qwen MTP.** At 8k, oMLX decodes with MTP at 57.5 t/s against 42.7 here (previous round; the 8k speculative decode was not re-measured this round); at 30k it is 47.1 vs 41.2. Without speculative decoding the two are 10% apart (25.0 vs 22.5), so the gap is mostly in the speculative layer (draft length, acceptance, the cost of the draft head itself). This project changed only the Metal backend and did not break that down.
 3. **Decode bandwidth.** Short-context decode is on par with upstream but still short of the bandwidth limit: Qwen 2k decode 26.0 t/s x 19.5 GB ≈ 507 GB/s, i.e. 83% of the nominal 614 GB/s. oMLX is 10% faster on Qwen.
 4. **I8 accuracy.** On gemma, I8 brings the KL divergence to about 3x the reference of upstream's `-fa on`/`-fa off` (section 9). Finer groups are too slow (one scale per 32 columns: Qwen -25%), the Walsh-Hadamard transform recovered part of it; a full fix needs a way to tell per matrix how the activations are distributed, for now it can only be switched off as a whole.
@@ -504,7 +534,7 @@ build/bin/llama-server -m gemma-4-26B-A4B-it-Q4_0.gguf -fa on -np 4 -kvu --spec-
 
 ## About the code
 
-This document describes every change but does not explain the source line by line; the code is on the `metal-m5` branch of `LXD-8/llama.cpp`, based on upstream `master` at `67107ac34f` (b12164), one commit per change (H3, H5 and H3b are one commit), each of which can be switched off on its own. If you are considering adopting any of these optimizations, I am happy to submit a PR or to provide the code in any other form that suits you. English is not my native language; for a long text like this one, the Chinese version is the original and AI translated it into English.
+This document describes every change but does not explain the source line by line; the code is on the `metal-m5` branch of `LXD-8/llama.cpp`, based on upstream `master` at `80d2c0c2c5` (b12189), one commit per change (H3, H5 and H3b are one commit), each of which can be switched off on its own. If you are considering adopting any of these optimizations, I am happy to submit a PR or to provide the code in any other form that suits you. English is not my native language; for a long text like this one, the Chinese version is the original and AI translated it into English.
 
 ---
 
@@ -514,7 +544,7 @@ This document describes every change but does not explain the source line by lin
 
 中文为原文，英文版由 AI 基于中文版翻译。/ The Chinese version is the original; the English version is an AI translation of it.
 
-本项目优化 llama.cpp 的 Metal 后端在 Apple M5 上的性能，目标是让各种模型（稠密、MoE、不同注意力结构）和各种量化格式都基本达到这台机器的硬件上限。范围包括提示处理（预填充）、解码、投机解码（MTP / DFlash）、并发、短提示、启动和多轮对话缓存。全部改动基于上游 `master` 的 `67107ac34f`（b12164）：22 个代码提交，每项改动一个提交（H3、H5 与 H3b 合为一个提交），每项都可以单独关闭。
+本项目优化 llama.cpp 的 Metal 后端在 Apple M5 上的性能，目标是让各种模型（稠密、MoE、不同注意力结构）和各种量化格式都基本达到这台机器的硬件上限。范围包括提示处理（预填充）、解码、投机解码（MTP / DFlash）、并发、短提示、启动和多轮对话缓存。全部改动基于上游 `master` 的 `80d2c0c2c5`（b12189）：22 个代码提交，每项改动一个提交（H3、H5 与 H3b 合为一个提交），每项都可以单独关闭。
 
 下表是全部改动开启时、与上游和 oMLX 的对比（M5 Max，满功率，服务器端到端，流式客户端，temperature 0；oMLX 开启其 INT8 预填充，两边都关闭 KV 量化）：
 
@@ -527,7 +557,7 @@ This document describes every change but does not explain the source line by lin
 
 范围：22 个代码提交，26 个文件，+3396 / -122。21 个在引擎（以 `ggml/src/ggml-metal/` 为主，`common/` 一行，`tests/test-backend-ops.cpp` 增加测试用例），1 个在内置 Web UI（`tools/ui`，即 Llama.app 的界面）。NAX 内核只在支持 Metal tensor API 的设备上生效（默认为 M5 / A19 及更新的芯片），其他设备保持上游路径。除 NVFP4 / TQ1_0 这类格式本身没有单独开关外，每项引擎改动都可以用环境变量关闭，便于 A/B 测试。
 
-测过的模型：Qwen3.8-27B Q5_K_M（稠密，GDN + 全注意力，q5_K / q6_K）、gemma-4-26B-A4B Q4_0（MoE，128 专家选 8，含 head size 512 的全局注意力层）。其余量化格式用 `test-backend-ops` 做了数值校验，并在合成权重上做了内核级计时（第 7 节）。
+与上游及 oMLX 做了端到端对比的模型：Qwen3.8-27B Q5_K_M（稠密，GDN + 全注意力，q5_K / q6_K）、gemma-4-26B-A4B Q4_0（MoE，128 专家选 8，含 head size 512 的全局注意力层）。用 llama-bench 与上游对比的模型（第 3.3 节）：Qwen3.6-35B-A3B Q4_K_M（MoE，256 专家选 8，GDN + 全注意力）、Qwen3.8-Flash-Next UD-IQ4_XS（MoE，512 专家选 10，GDN + 全注意力，每 KV 头 12 个 query 头；专家为 iq3_xxs / iq4_xs / q5_0 / iq4_nl）、gemma-4-31B Q4_0（稠密，含 head size 512 的全局注意力层）。其余量化格式用 `test-backend-ops` 做了数值校验，并在合成权重上做了内核级计时（第 7 节）。
 
 测试设备：MacBook Pro（Mac17,6），Apple M5 Max：18 核 CPU（6 个超大核 + 12 个性能核）、40 核 GPU、128 GB 统一内存；系统为 macOS 27.2。本文所有数据均在这台机器上测得。
 
@@ -580,28 +610,28 @@ M5 这一代在每个 GPU 核心里加入了矩阵单元（NAX，通过 Metal te
 
 | # | 提交 | 改动 | 行数 | 格式 | 开关 |
 |---|---|---|---|---|---|
-| A1 | `a7f094140` | 寄存器常驻的 NAX flash attention（预填充，head size 128 / 256 / 512） | +461 / -9 | -（F16 K/V） | `GGML_METAL_FA_NAX_DISABLE` |
-| A2 | `0a39acbcd` | tensor mul_mm 前的 f32 -> f16 激活转换 | +136 / -7 | F16 与量化格式 | `GGML_METAL_MM_F16_ACT_DISABLE` |
-| A3 | `d42a64b1b` | 反量化到 f16 + 寄存器常驻的 NAX mat-mat，长 K 用 split-K（>= 1024 行） | +397 / -4 | F16 + 23 种量化格式 | `GGML_METAL_MM_NAX_DISABLE` |
-| A4 | `d5346f1aa` | gated delta net 每状态行 4 个 lane | +157 / -2 | - | `GGML_METAL_GDN_R8_DISABLE` |
-| I8 | `87b8d9db5` | int8 NAX mat-mat（每 128 列一个 scale，量化前做 Walsh-Hadamard 变换） | +276 / -7 | 23 种量化格式 | `GGML_METAL_MM_I8_DISABLE` |
-| A5 | `eb3b224e3` | SWIGLU 融合进使用它的 NAX mat-mat | +213 / -7 | 同 A3 | `GGML_METAL_GLU_MM_DISABLE` |
-| S1 | `866581197` | 关闭思考时保留对话缓存（Web UI） | +12 / -1 | - | 界面设置 |
-| S2-a | `9510455c9` | 加载时不对新分配的 KV / 递推状态缓冲区清零 | +44 / -1 | - | `GGML_METAL_CLEAR_SKIP_DISABLE` |
-| K3 | `8d0c74072` | 2-3 行的跨行 mat-vec | +316 / -1 | q4_K（2-3 行）、q5_K（2 行） | `GGML_METAL_MV_XR_DISABLE` |
-| S2-c | `c1506b989` | 新缓冲区的首次驻留请求放到后台 | +44 / -5 | - | `GGML_METAL_RSET_ASYNC_DISABLE` |
-| A2 门槛 | `2ff0114a8` | 128 行且 4 GFLOP 起才做 f16 激活转换 | +9 / -2 | 同 A2 | `GGML_METAL_MM_F16_ACT_ROWS_128_DISABLE` |
-| H4 | `9c50c4081` | 2-64 行的 NAX few-row mat-mat | +321 / -10 | few-row 内核支持的全部格式，行数范围见第 7 节 | `GGML_METAL_MV_NAX_DISABLE` |
-| M1 | `be6587734` | MoE mat-mat（MUL_MAT_ID）从 16 个 token 起使用（原为 32） | +9 / -8 | 全部格式 | `GGML_METAL_MM_ID_MIN16_DISABLE` |
-| M2 | `a03983a37` | MoE mat-mat 每块 64 个条目（专家平均 >= 128 个条目时） | +90 / -25 | 全部格式 | `GGML_METAL_MM_ID_WIDE_DISABLE` |
-| A6 | `8768dad0f` | BF16 K/V 缓存的 NAX flash attention（预填充与 GQA，寄存器内转 f16） | +36 / -21 | BF16 | `GGML_METAL_FA_NAX_BF16_DISABLE` |
-| A8 | `9d2cb5214` | BF16 权重的 NAX mat-mat（1024 行起） | +20 / -6 | BF16 | `GGML_METAL_MM_NAX_BF16_DISABLE` |
-| A7 | `7479b2600` | MLA 头尺寸 192/128、576/512 的 NAX flash attention | +34 / -20 | MLA | `GGML_METAL_FA_NAX_MLA_DISABLE` |
-| A9 | `ca8a15013` | NVFP4 / TQ1_0 权重 | +308 / -7 | NVFP4、TQ1_0 | -（格式本身无开关） |
-| A3b | `e11f1820d` | int8 的 NAX mat-mat 门槛降到 448 行 | +13 / -9 | int8 路径的量化格式 | `GGML_METAL_MM_NAX_MIN_ROWS` |
-| A5b | `971b41a44` | 融合 GLU 把激活写进 mat-mat 自己的结果（修内存竞争） | +16 / -24 | 同 A3 | `GGML_METAL_GLU_MM_DISABLE` |
-| A10 | `e46a6c395` | BF16 + head size 512 / 576 的大 batch 预填充让回 tensor 内核 | +5 / -2 | BF16 | `GGML_METAL_FA_NAX_BF16_DISABLE` |
-| H3 / H5 / H3b | `06d72db6c` | 一个提交。H3：共享 KV 头的 query 头打包进一个 NAX 注意力 tile（解码、投机解码验证；head size 128-512）。H5：同样用于量化 K/V 缓存。H3b：最多 8 个 16 行 tile、行块、运行期 KV 份数。也能通过 `kv_rows` 列表读 K/V（第 6.5 节） | +526 / -56 | -（F16 / BF16 K/V）；q4_0 / q4_1 / q5_0 / q5_1 / q8_0 / iq4_nl 缓存 | `GGML_METAL_FA_GQA_DISABLE`、`GGML_METAL_FA_GQA_Q_DISABLE` |
+| A1 | `bdef63ec0f` | 寄存器常驻的 NAX flash attention（预填充，head size 128 / 256 / 512） | +461 / -9 | -（F16 K/V） | `GGML_METAL_FA_NAX_DISABLE` |
+| A2 | `73e2d6866a` | tensor mul_mm 前的 f32 -> f16 激活转换 | +136 / -7 | F16 与量化格式 | `GGML_METAL_MM_F16_ACT_DISABLE` |
+| A3 | `629d8363ce` | 反量化到 f16 + 寄存器常驻的 NAX mat-mat，长 K 用 split-K（>= 1024 行） | +397 / -4 | F16 + 23 种量化格式 | `GGML_METAL_MM_NAX_DISABLE` |
+| A4 | `951fd49d56` | gated delta net 每状态行 4 个 lane | +157 / -2 | - | `GGML_METAL_GDN_R8_DISABLE` |
+| I8 | `4074513bcd` | int8 NAX mat-mat（每 128 列一个 scale，量化前做 Walsh-Hadamard 变换） | +276 / -7 | 23 种量化格式 | `GGML_METAL_MM_I8_DISABLE` |
+| A5 | `d349d2b01c` | SWIGLU 融合进使用它的 NAX mat-mat | +213 / -7 | 同 A3 | `GGML_METAL_GLU_MM_DISABLE` |
+| S1 | `f0320ec0e8` | 关闭思考时保留对话缓存（Web UI） | +12 / -1 | - | 界面设置 |
+| S2-a | `63aaf072e4` | 加载时不对新分配的 KV / 递推状态缓冲区清零 | +44 / -1 | - | `GGML_METAL_CLEAR_SKIP_DISABLE` |
+| K3 | `0d8b15aa9a` | 2-3 行的跨行 mat-vec | +316 / -1 | q4_K（2-3 行）、q5_K（2 行） | `GGML_METAL_MV_XR_DISABLE` |
+| S2-c | `ca7f887415` | 新缓冲区的首次驻留请求放到后台 | +44 / -5 | - | `GGML_METAL_RSET_ASYNC_DISABLE` |
+| A2 门槛 | `2f4029ab02` | 128 行且 4 GFLOP 起才做 f16 激活转换 | +9 / -2 | 同 A2 | `GGML_METAL_MM_F16_ACT_ROWS_128_DISABLE` |
+| H4 | `bc560a2962` | 2-64 行的 NAX few-row mat-mat | +321 / -10 | few-row 内核支持的全部格式，行数范围见第 7 节 | `GGML_METAL_MV_NAX_DISABLE` |
+| M1 | `d379ea300e` | MoE mat-mat（MUL_MAT_ID）从 16 个 token 起使用（原为 32） | +9 / -8 | 全部格式 | `GGML_METAL_MM_ID_MIN16_DISABLE` |
+| M2 | `08df2cc84c` | MoE mat-mat 每块 64 个条目（专家平均 >= 32 个条目时） | +90 / -25 | 全部格式 | `GGML_METAL_MM_ID_WIDE_DISABLE` |
+| A6 | `c5c666eada` | BF16 K/V 缓存的 NAX flash attention（预填充与 GQA，寄存器内转 f16） | +36 / -21 | BF16 | `GGML_METAL_FA_NAX_BF16_DISABLE` |
+| A8 | `f35ca617af` | BF16 权重的 NAX mat-mat（1024 行起） | +20 / -6 | BF16 | `GGML_METAL_MM_NAX_BF16_DISABLE` |
+| A7 | `a72e09794f` | MLA 头尺寸 192/128、576/512 的 NAX flash attention | +34 / -20 | MLA | `GGML_METAL_FA_NAX_MLA_DISABLE` |
+| A9 | `32bd81b983` | NVFP4 / TQ1_0 权重 | +308 / -7 | NVFP4、TQ1_0 | -（格式本身无开关） |
+| A3b | `89b8ebf568` | int8 的 NAX mat-mat 门槛降到 448 行 | +13 / -9 | int8 路径的量化格式 | `GGML_METAL_MM_NAX_MIN_ROWS` |
+| A5b | `d6f5b44417` | 融合 GLU 把激活写进 mat-mat 自己的结果（修内存竞争） | +16 / -24 | 同 A3 | `GGML_METAL_GLU_MM_DISABLE` |
+| A10 | `7d8ec9dcfd` | BF16 + head size 512 / 576 的大 batch 预填充让回 tensor 内核 | +5 / -2 | BF16 | `GGML_METAL_FA_NAX_BF16_DISABLE` |
+| H3 / H5 / H3b | `0c216f16d7` | 一个提交。H3：共享 KV 头的 query 头打包进一个 NAX 注意力 tile（解码、投机解码验证；head size 128-512）。H5：同样用于量化 K/V 缓存。H3b：最多 8 个 16 行 tile、行块、运行期 KV 份数。也能通过 `kv_rows` 列表读 K/V（第 6.5 节） | +526 / -56 | -（F16 / BF16 K/V）；q4_0 / q4_1 / q5_0 / q5_1 / q8_0 / iq4_nl 缓存 | `GGML_METAL_FA_GQA_DISABLE`、`GGML_METAL_FA_GQA_Q_DISABLE` |
 | | | **合计** | **+3396 / -122** | | |
 
 ## 3. 效果
@@ -688,7 +718,29 @@ App 启动（App 的参数：262k 上下文、mmproj、MTP、`--fit-target 1024`
 
 App 启动：本分支就绪 2.2 s，上游 2.3 s。
 
-### 3.3 小结
+### 3.3 Qwen3.6-35B-A3B、Qwen3.8-Flash-Next 与 gemma-4-31B
+
+另外三个模型，只用 llama-bench 与上游对比（`-fa 1 -ub 2048`，满功率，正反序各一轮，测试间隔 2 分钟，每项取 5 次重复的中位数，两轮取平均）；这三个模型没有做 oMLX 和服务器端到端对比。
+
+- `Qwen3.6-35B-A3B-Q4_K_M.gguf`（ggml-org，20.4 GB；40 层：30 层 gated delta net + 10 层全注意力，16 个 query 头共享 2 个 KV 头，head size 256；256 个宽 512 的专家选 8，另有共享专家；专家 q4_K，注意力 q8_0）。
+- `Qwen3.8-Flash-Next-UD-IQ4_XS`（unsloth，4 个文件，93.7 GB；48 层：36 层 gated delta net + 12 层全注意力，24 个 query 头共享 2 个 KV 头，head size 256；512 个宽 640 的专家选 10，另有共享专家；gate / up 专家为 iq3_xxs / iq4_xs / iq2_s，down 专家为 q5_0 / iq4_nl / q2_0）。
+- `gemma-4-31B-it-Q4_0.gguf`（ggml-org，18.0 GB；60 层稠密；滑动窗口层 head size 256、每 KV 头 2 个 query 头，全局层 head size 512、每 KV 头 8 个；全部 q4_0）。
+
+| t/s | pp16 @0 | pp24 @0 | pp2048 @0 | tg64 @0 | pp16 @8k | pp24 @8k | pp2048 @8k | tg64 @8k |
+|---|---|---|---|---|---|---|---|---|
+| Qwen3.6-35B-A3B, 本分支 | 616 | 741 | 4538 | 103.5 | 589 | 711 | 3892 | 99.0 |
+| Qwen3.6-35B-A3B, 上游 | 613 | 504 | 3777 | 106.2 | 495 | 466 | 2769 | 100.5 |
+| 倍数 | 1.00x | 1.47x | 1.20x | 0.97x | 1.19x | 1.52x | 1.41x | 0.99x |
+| Qwen3.8-Flash-Next, 本分支 | 281 | 328 | 1544 | 51.2 | 278 | 319 | 1260 | 49.8 |
+| Qwen3.8-Flash-Next, 上游 | 233 | 128 | 1244 | 48.1 | 221 | 134 | 1006 | 46.9 |
+| 倍数 | 1.21x | 2.57x | 1.24x | 1.06x | 1.26x | 2.38x | 1.25x | 1.06x |
+| gemma-4-31B, 本分支 | 285 | 338 | 1011 | 25.1 | 243 | 284 | 807 | 23.6 |
+| gemma-4-31B, 上游 | 190 | 124 | 650 | 25.7 | 128 | 115 | 540 | 23.3 |
+| 倍数 | 1.50x | 2.73x | 1.56x | 0.98x | 1.91x | 2.47x | 1.49x | 1.01x |
+
+pp16 / pp24 相当于一次投机解码验证或一段短提示的步长。解码与上游持平：0.97-1.06 倍在本轮的噪声范围内——解码路径相同的几种配置之间，解码格子本身就有约 ±5% 的差异。
+
+### 3.4 小结
 
 - 预填充：本轮 8k 预填充服务器端到端 Qwen 1.69 倍、gemma 1.22 倍；llama-bench `pp8192 @8k` 为 1.77 / 1.21 倍（上一轮 `pp2048` 为 1.5-2.0 倍）。
 - 解码：短上下文与上游持平（0.99-1.01 倍），长上下文更快：30k 时 Qwen +4%、gemma +18%（H3 的 GQA 打包注意力）。测于上游 #29510 之前；通过 `kv_rows` 列表的 GQA 增幅见第 6.5 节。
@@ -696,6 +748,7 @@ App 启动：本分支就绪 2.2 s，上游 2.3 s。
 - 并发（App 的 4 路布局）：2-4 路合计 1.0-1.22 倍，4 路投机解码 Qwen 1.36 倍、gemma 1.18 倍。gemma 单路投机解码 0.97 倍是这一个提示上的接受率差异（0.206 对关闭 A2 门槛时 0.227，提示的数值略有不同导致生成的文本不同），不是内核变慢：这一步里被门槛影响的只有 342 token 的提示预填充。
 - 与 oMLX：8k 预填充 Qwen 慢 4%、gemma 慢 10%；30k 解码（oMLX 关 MTP）Qwen 慢 10%、gemma 快 57%；投机解码 MTP 对 MTP：Qwen 慢 13%（41.2 对 47.1）、gemma 快 21%（117.2 对 97.0）。
 - 启动与内存（上一轮）：Qwen 就绪 1.9 对 2.7 s，常驻内存 3.3 对约 21 GB；关闭思考后不再重新处理整段对话。
+- 另外三个模型（第 3.3 节，llama-bench 对上游）：pp2048 Qwen3.6-35B-A3B 1.20 / 1.41 倍（深度 0 / 8k）、Qwen3.8-Flash-Next 1.24 / 1.25 倍、gemma-4-31B 1.56 / 1.49 倍；一步 16-24 token 1.0-2.7 倍；解码持平。
 - 精度：除 I8 外的改动与上游一致到参照量级；I8 在 gemma 上有可见代价，可单独关闭（第 9 节）。
 
 ## 4. 方法
@@ -704,11 +757,12 @@ App 启动：本分支就绪 2.2 s，上游 2.3 s。
 - **先筛选，再确认。** 受算力限制的候选先在合成权重上做内核级 A/B（同一进程内交错），增幅超过 1.5% 且多轮方向一致才进入真实模型测量。保留的方案全部在满功率（`powermode 0`）下确认，本文所有数字都是满功率数据。
 - **交错测量。** 不同场次之间绝对数值会随发热状态漂移 5-15%。每次对比都在同一场次里按正序再反序运行各配置，只比较同一场次内的比值。测试之间间隔 2 分钟；漂移过大的测试段作废重测。
 - **按留一法取舍。** 一项改动看的是它在最终组合中的贡献（全部开启减去这一项），而不只是单独开启时的效果。
-- **按格式、按形状逐一验证。** 矩阵乘类改动对每一种权重格式分别在合成权重上做内核级 A/B（稠密：17408x5120 与 5120x17408；MoE：gemma-4 的专家形状），只对确实更快的格式和行数范围开启；同时比对两条路径的输出校验和。
+- **按格式、按形状逐一验证。** 矩阵乘类改动对每一种权重格式分别在合成权重上做内核级 A/B（稠密：17408x5120 与 5120x17408；MoE：gemma-4、gpt-oss、Qwen3.6-35B-A3B 与 Qwen3.8-Flash-Next 的专家形状），只对确实更快的格式和行数范围开启；同时比对两条路径的输出校验和。
 - **按模型结构验证。** 注意力类改动在 Qwen 与 gemma 的结构上测：每个 KV 头对应 6 / 8 个 query 头，head size 128 / 256 / 512。某个结构上变慢的情形用门槛排除（例如 H3 对每 KV 头 4 个 query 头的单 token 解码）。
+- **MoE 门槛以真实路由为准。** 合成的 MoE 权重用均匀随机路由，条目平均分到各个专家；真实路由并不均匀。M1 / M2 覆盖哪些格式来自合成扫描，门槛则在真实模型上确认：在 Qwen 的专家形状上，均匀路由下 M1 在 16-24 token 时看起来更慢，而在两个 Qwen MoE 模型上它都更快（第 6.2 节）。
 - **精度把关。** 每个模型都以上游的完整 logits 为基准测 KL 散度（逐 token 配对比较，比困惑度灵敏得多），并以上游自身 `-fa on` 与 `-fa off` 之间的差作为"正常数值差异"的参照；有损的改动要么改进到参照量级附近，要么写明代价并可单独关闭（见第 9 节）。
 - **固定提示。** 投机解码的速度取决于生成文本接受了多少草稿；对单项改动的端到端对比使用固定提示，并确认输出文本相同后再比较耗时。
-- **上游核查。** 每次都在上游 `master` 上重建并重新测量；本文基于 `67107ac34f`（b12164）。
+- **上游核查。** 每次都在上游 `master` 上重建并重新测量；本文基于 `80d2c0c2c5`（b12189）。第 3.1、3.2 节与第 6.1-6.5 节测于 `67107ac34f`，第 3.3 节与 M2 门槛的数据测于 `18ab62a8ec`；此后的上游提交不涉及测过的路径（唯一的 Metal 改动是 GROUP_NORM 的修复）。
 
 ## 5. 调研到的候选方案
 
@@ -769,11 +823,17 @@ A4 单独开启只有 +1.8%，在完整组合中为 +3.4%：其他部分变快�
 | | gemma-4-26B-A4B（8 个） | +1.5% / +6% / +9% / +18% |
 | H3（4 token 的一步，即投机解码验证） | Qwen / gemma | +6% 至 +55%（2k-32k），32k 时 1.2-2.0 倍 |
 | M1（一步 16 / 20 / 24 / 28 token） | gemma-4-26B-A4B | +6% / +14% / +23% / +30% |
-| | gemma-4-26B-A4B | 0 / +4.5% / +5~9% / +3~4% |
+| M2（pp1024 / pp2048 / pp4096 / 8k 上的 pp2048，`-ub 2048`，64 条目的块 vs 32） | gemma-4-26B-A4B | 0 / +4.5% / +5~9% / +3~4% |
+| | gpt-oss-20b MXFP4 | +24% / +29% / +37% / +18% |
+| M1（一步 16 / 24 token，深度 0 / 8k） | Qwen3.6-35B-A3B | 16：-1% / +1%；24：+10% / +14% |
+| | Qwen3.8-Flash-Next | 16：+8% / +14%；24：+26% / +28% |
+| M2 门槛由每专家 128 个条目降到 32（pp2048 / pp4096，`-ub 2048`） | Qwen3.6-35B-A3B | +5.3% / +4.4% |
+| | Qwen3.8-Flash-Next | +3.3% / +3.0% |
+| | gemma-4-26B-A4B | `-ub 512` 下 pp2048 / pp4096：+1.2% / +1.2%；`-ub 2048` 下 pp512：+2.5%；`-ub 2048` 下 pp2048 / pp4096：0（本来就 >= 128 个条目） |
 
 - H3：测于上游 #29510 之前，走的是稠密缓存路径（第 6.5 节）。
-- M1：上游在 32 个 token 以下对每个（token, 专家）条目各读一遍专家权重；改用 mat-mat 后每块最多 32 个条目共用一次读取。12 token 时两个模型方向相反（-3% / +7%），所以门槛定在 16。
-- M2：上游的 MoE mat-mat 每块最多 32 个条目，每块都要把专家权重反量化一次。每专家平均 128 个条目及以上时，64 条目的块对全部 25 种格式、三种专家形状都更快（+5~35%，第 7.3 节）；条目更少时半空的块得不偿失，所以只在此时启用。gemma 的 pp1024（每专家 64 个条目）低于门槛，保持原样。
+- M1：上游在 32 个 token 以下对每个（token, 专家）条目各读一遍专家权重；改用 mat-mat 后每块最多 32 个条目共用一次读取。12 token 时两个模型方向相反（-3% / +7%），所以门槛定在 16。两个 Qwen MoE 模型的 M1 数据是同一构建下与关闭 M1 的对比；16-24 token 时没有专家达到 32 个条目，与 M2 无关。
+- M2：上游的 MoE mat-mat 每块最多 32 个条目，每块都要把专家权重反量化一次。每专家平均 32 个条目及以上时，64 条目的块在三种专家形状上对全部 25 种格式都更快（+1~26%，第 7.3 节）；16 个条目时半空的块得不偿失（慢 0~13%），所以从 32 起启用。Qwen 的 MoE 模型专家多而窄（256 选 8、512 选 10），2048 个 token 时每专家也只有 40-64 个条目，更高的门槛会把它们排除在外。按真实路由，Qwen3.6-35B-A3B 在 16 个条目时仍快 2.3%，但均匀路由在这里会变慢，所以门槛保持 32。
 
 ### 6.3 解码与服务路径（Qwen3.8-27B Q5_K_M）
 
@@ -874,37 +934,37 @@ S2-c 依赖 S2-a：清零会触碰页面，缓冲区就不再是"新的"，所�
 - "原有覆盖"表示该格式在 A3/I8 最初就已支持，其效果见第 6.1 节。
 - 2-3 行跨行 mat-vec（K3）：q5_K 在 2 行比原路径快 21%，3 行快 6%（3 行 H4 更快，所以 3 行用 H4）。
 
-### 7.3 MoE 矩阵乘的内核级数据（M2：64 条目的块 vs 32 条目，合成权重，随机路由）
+### 7.3 MoE 矩阵乘的内核级数据（M2：64 条目的块 vs 32 条目，合成权重，均匀随机路由）
 
-形状：gemma-4 的 gate_up（128 专家选 8，K = 2816，N = 1408）与 down（K = 704，N = 2816）。K 不是 256 倍数的形状无法存放 K-quant 与 IQ 格式，这些格式只测 gemma gate_up。T = 128 / 512 / 2048 个 token，相当于每专家 8 / 32 / 128 个条目。两轮中位数。
+形状：gemma-4 的 gate_up（128 专家选 8，K = 2816，N = 1408）与 down（K = 704，N = 2816），gpt-oss（32 专家选 4，K = N = 2880）。K 不是 256 倍数的形状无法存放 K-quant 和大多数 IQ 格式，这些格式只测 gemma gate_up。每格依次是每专家平均 16 / 32 / 64 / 125 个条目（gemma T = 256 / 512 / 1024 / 2000 个 token，gpt-oss T = 128 / 256 / 512 / 1000）。每个进程先连续运行 1 s 再计时，让 GPU 频率稳定下来；30 次的中位数，正反序两轮的中位数，满功率。两种块大小的输出校验和完全一致。
 
-| 格式 | gemma gate_up（T = 128 / 512 / 2048） | gemma down |
-|---|---|---|
-| mxfp4 | +2%/+22%/+32% | -8%/-11%/+24% |
-| q4_0 | -7%/+14%/+14% | -25%/-3%/+10% |
-| q4_1 | -8%/-12%/+12% | -3%/+28%/+9% |
-| q5_0 | -5%/+11%/+31% | -7%/+35%/+5% |
-| q5_1 | -4%/+13%/+29% | -6%/-18%/+24% |
-| q8_0 | +3%/-0%/+20% | -1%/+9%/+13% |
-| f16 | +1%/+3%/+16% | -0%/+4%/+6% |
-| bf16 | +1%/+3%/+9% | +2%/+4%/+8% |
-| q2_K | -3%/+28%/+20% | - |
-| q3_K | +202%/+13%/+33% | - |
-| q4_K | -5%/-8%/+24% | - |
-| q5_K | -3%/+18%/+32% | - |
-| q6_K | +12%/+11%/+20% | - |
-| iq2_xxs | -9%/+18%/+21% | - |
-| iq2_xs | -4%/+15%/+19% | - |
-| iq2_s | +10%/+12%/+19% | - |
-| iq3_xxs | -26%/+23%/+21% | - |
-| iq3_s | +12%/-16%/+24% | - |
-| iq1_s | -5%/+19%/+19% | - |
-| iq1_m | +15%/+27%/+21% | - |
-| iq4_nl | -15%/+9%/+29% | -9%/-6%/+21% |
-| iq4_xs | -13%/+14%/+28% | - |
-| tq2_0 | +48%/+20%/+21% | - |
-| q1_0 | -3%/+20%/+8% | - |
-| q2_0 | +4%/-27%/+12% | -5%/-22%/+10% |
+| 格式 | gemma gate_up | gemma down | gpt-oss |
+|---|---|---|---|
+| q4_0 | -9%/+6%/+5%/+9% | -7%/+5%/+6%/+10% | -5%/+6%/+6%/+8% |
+| q4_1 | -7%/+5%/+9%/+9% | -4%/+4%/+7%/+9% | -6%/+5%/+7%/+8% |
+| q5_0 | -0%/+15%/+17%/+19% | -1%/+11%/+19%/+21% | -5%/+15%/+18%/+21% |
+| q5_1 | -1%/+13%/+13%/+19% | -2%/+13%/+20%/+21% | -2%/+12%/+15%/+21% |
+| q8_0 | -3%/+3%/+8%/+13% | -2%/+1%/+6%/+13% | -3%/+1%/+10%/+15% |
+| mxfp4 | -8%/+16%/+19%/+25% | -5%/+11%/+17%/+21% | -6%/+13%/+19%/+26% |
+| q2_K | -3%/+11%/+12%/+14% | - | - |
+| q3_K | -1%/+18%/+21%/+26% | - | - |
+| q4_K | -6%/+10%/+13%/+19% | - | - |
+| q5_K | -2%/+16%/+23%/+25% | - | - |
+| q6_K | -3%/+8%/+15%/+20% | - | - |
+| iq1_s | -6%/+11%/+13%/+16% | - | - |
+| iq1_m | -5%/+13%/+15%/+18% | - | - |
+| iq2_xxs | -7%/+7%/+15%/+17% | - | - |
+| iq2_xs | -2%/+12%/+14%/+17% | - | - |
+| iq2_s | -4%/+12%/+14%/+17% | - | - |
+| iq3_xxs | -5%/+12%/+14%/+17% | - | - |
+| iq3_s | -3%/+13%/+15%/+18% | - | - |
+| iq4_nl | -12%/+8%/+16%/+21% | -5%/+7%/+16%/+19% | -9%/+8%/+14%/+20% |
+| iq4_xs | -13%/+8%/+16%/+21% | - | - |
+| q1_0 | -5%/+5%/+3%/+5% | - | - |
+| q2_0 | -8%/+7%/+6%/+8% | -9%/+5%/+7%/+9% | -7%/+7%/+3%/+10% |
+| tq2_0 | -1%/+14%/+13%/+16% | - | - |
+| f16 | +0%/+4%/+8%/+15% | +1%/+1%/+6%/+10% | +1%/+5%/+8%/+16% |
+| bf16 | -0%/+3%/+5%/+11% | +0%/+1%/+4%/+9% | -0%/+4%/+3%/+11% |
 
 ### 7.4 解码 mat-vec 的带宽（单 token）
 
@@ -940,7 +1000,7 @@ S2-c 依赖 S2-a：清零会触碰页面，缓冲区就不再是"新的"，所�
 
 **M1：MoE mat-mat 从 16 个 token 起**（`ggml-metal-common.cpp`）。`ggml_metal_op_mul_mat_id_use_mm` 在有 tensor 单元的设备上把门槛从 32 改为 16；其他设备保持 32。
 
-**M2：MoE mat-mat 每块 64 个条目**（`kernels/mul_mm.metal`：`kernel_mul_mm_id_map0`、`kernel_mul_mm_id`；`ggml-metal-device.cpp`、`ggml-metal-ops.cpp`）。路由预处理把每个专家的条目切成块，主内核对每块把 64 行权重反量化一次并与块内的条目相乘。一个函数常量把块大小从 32 切换到 64（预处理与主内核同时切换）：64 条目的块按 16 行的四分之一块做 `matmul2d`，没有条目的四分之一块跳过；每个线程多装载一行激活；threadgroup 内存从 8 KB 增加到 16 KB。只在有 tensor 单元的设备上、专家平均至少 128 个条目时使用。
+**M2：MoE mat-mat 每块 64 个条目**（`kernels/mul_mm.metal`：`kernel_mul_mm_id_map0`、`kernel_mul_mm_id`；`ggml-metal-device.cpp`、`ggml-metal-ops.cpp`）。路由预处理把每个专家的条目切成块，主内核对每块把 64 行权重反量化一次并与块内的条目相乘。一个函数常量把块大小从 32 切换到 64（预处理与主内核同时切换）：64 条目的块按 16 行的四分之一块做 `matmul2d`，没有条目的四分之一块跳过；每个线程多装载一行激活；threadgroup 内存从 8 KB 增加到 16 KB。只在有 tensor 单元的设备上、专家平均至少 32 个条目时使用。
 
 **A6 / A7 / A8 / A10：BF16 与 MLA**（`kernels/fa_tensor.metal`、`kernels/mul_mm.metal`、`ggml-metal-ops.cpp`）。BF16 缓存按原格式读入、在寄存器里钳到 f16 再做 MMA；MLA 的 192/128 与 576/512 把 K、V 头维分开拆（576/512 的 K 用 1 个 simdgroup、V 用 4 个）；BF16 权重 1024 行起转一次 f16 后走 NAX。BF16 + head size 512 / 576 + 超过 32 个 query（GQA 批次上限）的预填充仍让回 tensor 内核。
 
@@ -952,7 +1012,7 @@ S2-c 依赖 S2-a：清零会触碰页面，缓冲区就不再是"新的"，所�
 
 ## 9. 数值精度
 
-- `test-backend-ops -b MTL0`：MUL_MAT 3892/3892（few-row 用例覆盖全部格式的 2-64 行；在 `GGML_METAL_MM_NAX_MIN_ROWS=1` 下也通过，该设置让所有符合条件的用例都走 NAX / int8 内核），MUL_MAT_ADD 384/384，MUL_MAT_ID 867/867（M2 的 32 / 64 条目两种块都通过），FLASH_ATTN_EXT 5100/5100（含 head size 128 / 256 / 512 与 MLA 的 NAX 路径，以及两个走 GQA 内核的 `kv_rows` 用例），GATED_DELTA_NET 30/30。每个提交单独编译并通过与它相关的测试。
+- `test-backend-ops -b MTL0`：MUL_MAT 3892/3892（few-row 用例覆盖全部格式的 2-64 行；在 `GGML_METAL_MM_NAX_MIN_ROWS=1` 下也通过，该设置让所有符合条件的用例都走 NAX / int8 内核），MUL_MAT_ADD 384/384，MUL_MAT_ID 1109/1109（M2 的 32 / 64 条目两种块都通过），FLASH_ATTN_EXT 5100/5100（含 head size 128 / 256 / 512 与 MLA 的 NAX 路径，以及两个走 GQA 内核的 `kv_rows` 用例），GATED_DELTA_NET 30/30。每个提交单独编译并通过与它相关的测试。
 - KL 散度（主要指标）：以上游的完整 logits 为基准（`llama-perplexity --kl-divergence-base`，8 x 2048 token，`-c 2048 -b 2048 -ub 2048 -fa on`，文本为 llama.cpp 仓库文档），逐 token 比较本分支的输出分布。每格为平均 KL 散度 / top-1 一致率。参照列是上游自己换一种等价设置（`-fa off`，或 `-ub 512`）时与它本身的差，代表"正常的数值差异"：
 
 | 模型 | 本分支，全部开启 | 本分支，关 I8 | 参照：上游 -fa off | 参照：上游 -ub 512 |
@@ -974,7 +1034,7 @@ S2-c 依赖 S2-a：清零会触碰页面，缓冲区就不再是"新的"，所�
 
 ## 10. 剩余差距
 
-1. **MoE 预填充。** gemma 的 8k 提示比 oMLX 慢 9%（30k 预填充本轮未复测）。M2 之前，gemma 的预填充大部分时间在 MUL_MAT_ID 上，只跑到稠密路径约一半的算力；M2 之后快了 24-37%，但按专家分块的 mat-mat 仍明显低于稠密路径。下一步是把 A3 那样寄存器常驻的 NAX 内核用到按专家分块的 mat-mat 上（按专家分块的 few-row 方案在大批量下更慢）。
+1. **MoE 预填充。** gemma 的 8k 提示比 oMLX 慢 9%（30k 预填充本轮未复测）。M2 之前，gemma 的预填充大部分时间在 MUL_MAT_ID 上，只跑到稠密路径约一半的算力；M2 之后快了 24-37%，但按专家分块的 mat-mat 仍明显低于稠密路径。下一步是把 A3 那样寄存器常驻的 NAX 内核用到按专家分块的 mat-mat 上（按专家分块的 few-row 方案在大批量下更慢）。第 3.3 节的 Qwen MoE 模型没有与 oMLX 对比。
 2. **Qwen 的 MTP。** 8k 时 oMLX 的 MTP 解码 57.5 t/s，本分支 42.7（上一轮，本轮未复测 8k 投机）；30k 时 47.1 对 41.2。不用投机解码时两者差 10%（25.0 对 22.5），所以差距主要在投机解码这一层（草稿长度、接受率、草稿头本身的开销），本项目只改了 Metal 后端，没有拆分这部分。
 3. **解码带宽。** 短上下文的解码已和上游持平，但离带宽上限还有距离：Qwen 2k 解码 26.0 t/s x 19.5 GB ≈ 507 GB/s，即 614 GB/s 标称带宽的 83%。oMLX 在 Qwen 上快 10%。
 4. **I8 的精度。** 在 gemma 上，I8 使 KL 散度约为上游 `-fa on`/`-fa off` 参照的 3 倍（第 9 节）。更细的分组太慢（每 32 列：Qwen -25%），Walsh-Hadamard 变换已收回一部分；彻底解决需要能逐矩阵判断激活分布的办法，目前只能整体关闭。
@@ -1014,4 +1074,4 @@ build/bin/llama-server -m gemma-4-26B-A4B-it-Q4_0.gguf -fa on -np 4 -kvu --spec-
 
 ## 关于代码
 
-本文档描述每项改动，但不逐行解释源码；代码在 `LXD-8/llama.cpp` 的 `metal-m5` 分支，基于上游 `master` 的 `67107ac34f`（b12164），每项改动一个提交（H3、H5 与 H3b 合为一个），各自可以单独关闭。如果你考虑采用其中的某项优化，我很乐意提交 PR 或以你方便的其他形式提供代码。英语不是我的母语，像本文这样的长文，我以中文为原文，再由 AI 翻译成英文。
+本文档描述每项改动，但不逐行解释源码；代码在 `LXD-8/llama.cpp` 的 `metal-m5` 分支，基于上游 `master` 的 `80d2c0c2c5`（b12189），每项改动一个提交（H3、H5 与 H3b 合为一个），各自可以单独关闭。如果你考虑采用其中的某项优化，我很乐意提交 PR 或以你方便的其他形式提供代码。英语不是我的母语，像本文这样的长文，我以中文为原文，再由 AI 翻译成英文。
