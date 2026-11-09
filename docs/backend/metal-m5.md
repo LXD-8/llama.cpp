@@ -220,7 +220,9 @@ pp16 / pp24 are steps of the size of a speculative verify or a short prompt. Dec
 - **MoE thresholds on real routing.** Synthetic MoE weights use uniform random routing, which spreads the entries evenly over the experts; real routing does not. The format coverage of M1 / M2 comes from the synthetic sweeps, but their thresholds are confirmed on real models: on the Qwen expert shapes M1 looks slower with uniform routing at 16-24 tokens, while on both Qwen MoE models it is faster (section 6.2).
 - **Accuracy gate.** For every model the KL divergence to the full upstream logits is measured (paired per token, far more sensitive than perplexity), with the difference between upstream's own `-fa on` and `-fa off` as the reference for an ordinary numerical difference; a lossy change is either brought close to that reference or its cost is stated and it can be switched off on its own (section 9).
 - **Fixed prompts.** Speculative decoding speed depends on how many drafts the generated text accepts; end-to-end comparisons of single changes use fixed prompts and compare times only after checking that the output text is identical.
-- **Upstream check.** Every round is rebuilt and re-measured on upstream `master`; this document is based on `1945793e00` (b12229). Sections 3.1, 3.2 and 6.1-6.5 were measured on `67107ac34f`, section 3.3 and the M2 threshold data on `18ab62a8ec`; the upstream commits since then do not change the measured kernels' results (the Metal changes are a GROUP_NORM fix, a Top-K determinism change, an out-of-bounds guard in the vector FA path, and a TRI select fix).
+- **Upstream check.** Earlier rounds were rebuilt and re-measured on upstream `master`; this document is based on `1945793e00` (b12229). Sections 3.1, 3.2 and 6.1-6.5 were measured on `67107ac34f`, section 3.3 and the M2 threshold data on `18ab62a8ec`; the upstream commits since then do not change the measured kernels' results (the Metal changes are a GROUP_NORM fix, a Top-K determinism change, an out-of-bounds guard in the vector FA path, and a TRI select fix).
+
+**Rebase check (b12229).** The branch was rebased from b12211 to b12229 (18 upstream commits) and checked commit by commit: none of the upstream changes duplicates or replaces one of the 22 changes, and none makes one unnecessary, so no change was removed. The only upstream change that touches one of the kernels used here is the out-of-bounds guard in the vector FA path; the NAX and tensor kernels added here already bound their output rows. The benchmark numbers below were not re-run for this rebase.
 
 ## 5. Candidates found by research
 
@@ -762,7 +764,9 @@ pp16 / pp24 相当于一次投机解码验证或一段短提示的步长。解�
 - **MoE 门槛以真实路由为准。** 合成的 MoE 权重用均匀随机路由，条目平均分到各个专家；真实路由并不均匀。M1 / M2 覆盖哪些格式来自合成扫描，门槛则在真实模型上确认：在 Qwen 的专家形状上，均匀路由下 M1 在 16-24 token 时看起来更慢，而在两个 Qwen MoE 模型上它都更快（第 6.2 节）。
 - **精度把关。** 每个模型都以上游的完整 logits 为基准测 KL 散度（逐 token 配对比较，比困惑度灵敏得多），并以上游自身 `-fa on` 与 `-fa off` 之间的差作为"正常数值差异"的参照；有损的改动要么改进到参照量级附近，要么写明代价并可单独关闭（见第 9 节）。
 - **固定提示。** 投机解码的速度取决于生成文本接受了多少草稿；对单项改动的端到端对比使用固定提示，并确认输出文本相同后再比较耗时。
-- **上游核查。** 每次都在上游 `master` 上重建并重新测量；本文基于 `1945793e00`（b12229）。第 3.1、3.2 节与第 6.1-6.5 节测于 `67107ac34f`，第 3.3 节与 M2 门槛的数据测于 `18ab62a8ec`；此后的上游提交不改变测过内核的结果（Metal 改动只有 GROUP_NORM 的修复、Top-K 的确定性调整、vector FA 路径的越界保护，以及 TRI 的 select 修复）。
+- **上游核查。** 此前各轮都在上游 `master` 上重建并重新测量；本文基于 `1945793e00`（b12229）。第 3.1、3.2 节与第 6.1-6.5 节测于 `67107ac34f`，第 3.3 节与 M2 门槛的数据测于 `18ab62a8ec`；此后的上游提交不改变测过内核的结果（Metal 改动只有 GROUP_NORM 的修复、Top-K 的确定性调整、vector FA 路径的越界保护，以及 TRI 的 select 修复）。
+
+**Rebase 核查（b12229）。** 分支从 b12211 rebase 到 b12229（18 个上游提交），并逐个提交核对：没有上游改动重复或替代这 22 项改动，也没有让任何一项变得不必要，因此没有删除改动。唯一涉及这里所用内核的上游改动是 vector FA 路径的越界保护；这里新增的 NAX 与 tensor 内核本来就会裁剪输出行。下面的基准数字没有为这次 rebase 重新测量。
 
 ## 5. 调研到的候选方案
 
