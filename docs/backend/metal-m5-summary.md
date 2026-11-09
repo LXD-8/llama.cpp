@@ -70,7 +70,7 @@ MoE prefill is still 3-9% behind oMLX (the per-expert mat-mat is still clearly s
 
 ## Code and use of AI
 
-The code is on the `metal-m5` branch of `LXD-8/llama.cpp`, based on upstream `master` at `1945793e00` (b12229), one commit per change (H3, H5 and H3b are one commit). The goals, test methodology and decisions are my own; AI tools were used for research, writing code, testing and writing the documents, and their output was reviewed by me. The Chinese version is the original; the English version was translated by AI.
+The code is on the `metal-m5` branch of `LXD-8/llama.cpp`, based on upstream `master` at `1945793e00` (b12229), one commit per change (H3, H5 and H3b are one commit). The b12229 rebase was checked commit by commit: no upstream change duplicates or replaces these optimizations, and no optimization was removed. The goals, test methodology and decisions are my own; AI tools were used for research, writing code, testing and writing the documents, and their output was reviewed by me. The Chinese version is the original; the English version was translated by AI.
 
 ---
 
@@ -146,4 +146,4 @@ MoE 预填充仍比 oMLX 慢 3-9%（按专家分块的 mat-mat 仍明显慢于�
 
 ## 代码与 AI 使用说明
 
-代码在 `LXD-8/llama.cpp` 的 `metal-m5` 分支，基于上游 `master` 的 `1945793e00`（b12229），每项改动一个提交（H3、H5 与 H3b 合为一个）。项目目标、测试方法和取舍由我决定；调研、编写代码、测试和撰写文档时使用了 AI 工具，产出经过我人工检查。中文为原文，英文版由 AI 翻译。
+代码在 `LXD-8/llama.cpp` 的 `metal-m5` 分支，基于上游 `master` 的 `1945793e00`（b12229），每项改动一个提交（H3、H5 与 H3b 合为一个）。本次 b12229 rebase 逐个提交核对过：没有上游改动重复或替代这些优化，也没有删除任何优化。项目目标、测试方法和取舍由我决定；调研、编写代码、测试和撰写文档时使用了 AI 工具，产出经过我人工检查。中文为原文，英文版由 AI 翻译。
