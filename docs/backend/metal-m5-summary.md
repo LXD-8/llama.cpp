@@ -2,7 +2,7 @@
 
 [English](#llamacpp-metal-optimizations-for-apple-m5-nax-short-version) | [中文](#apple-m5nax上的-llamacpp-metal-优化简略版)
 
-This project optimizes the Metal backend of llama.cpp on Apple M5, with the goal that every kind of model (dense, MoE, different attention structures) and weight format runs close to the hardware limit, covering prefill, decode, speculative decoding, concurrency, short prompts, start-up and the multi-turn conversation cache. 22 code commits on upstream `master` at `8c2c4c39c5` (after b12361), one commit per change (H3, H5 and H3b are one commit), each can be switched off on its own. Test machine: MacBook Pro (Mac17,6), Apple M5 Max, 40-core GPU, 128 GB, macOS 27.2. See the [full report](metal-m5.md).
+This project optimizes the Metal backend of llama.cpp on Apple M5, with the goal that every kind of model (dense, MoE, different attention structures) and weight format runs close to the hardware limit, covering prefill, decode, speculative decoding, concurrency, short prompts, start-up and the multi-turn conversation cache. 22 code commits on upstream `master` at `32bdc3a89e` (after b12377), one commit per change (H3, H5 and H3b are one commit), each can be switched off on its own. Test machine: MacBook Pro (Mac17,6), Apple M5 Max, 40-core GPU, 128 GB, macOS 27.2. See the [full report](metal-m5.md).
 
 All changes on, compared with upstream and oMLX (full power, server end to end; oMLX with INT8 prefill on, KV quantization off on both sides; oMLX MTP is off for the decode column and on for the speculative column):
 
@@ -70,7 +70,7 @@ MoE prefill is still 3-9% behind oMLX (the per-expert mat-mat is still clearly s
 
 ## Code and use of AI
 
-The code is on the `metal-m5` branch of `LXD-8/llama.cpp`, based on upstream `master` at `8c2c4c39c5` (after b12361), one commit per change (H3, H5 and H3b are one commit). The latest rebase (8c2c4c39c5, 21 upstream commits, past b12361) was checked commit by commit: no upstream change duplicates or replaces these optimizations, and no optimization was removed; the new commits contain no Metal change (the llama/ggml prunes and the 1.0.0 bump remove or renumber code this branch does not touch). The goals, test methodology and decisions are my own; AI tools were used for research, writing code, testing and writing the documents, and their output was reviewed by me. The Chinese version is the original; the English version was translated by AI.
+The code is on the `metal-m5` branch of `LXD-8/llama.cpp`, based on upstream `master` at `32bdc3a89e` (after b12377), one commit per change (H3, H5 and H3b are one commit). The latest rebase (32bdc3a89e, 14 upstream commits, past b12377) was checked commit by commit: no upstream change duplicates or replaces these optimizations, and no optimization was removed; the new commits contain no Metal change that overlaps this branch (the only Metal change is a 64-bit destination-offset cast in `mul_vec_q_n_f32_impl`, a kernel this branch does not modify). The goals, test methodology and decisions are my own; AI tools were used for research, writing code, testing and writing the documents, and their output was reviewed by me. The Chinese version is the original; the English version was translated by AI.
 
 ---
 
@@ -78,7 +78,7 @@ The code is on the `metal-m5` branch of `LXD-8/llama.cpp`, based on upstream `ma
 
 [English](#llamacpp-metal-optimizations-for-apple-m5-nax-short-version) | [中文](#apple-m5nax上的-llamacpp-metal-优化简略版)
 
-本项目优化 llama.cpp 的 Metal 后端在 Apple M5 上的性能，目标是让各种模型（稠密、MoE、不同注意力结构）和量化格式都基本达到硬件上限，范围包括预填充、解码、投机解码、并发、短提示、启动和多轮对话缓存。22 个代码提交，每项改动一个提交（H3、H5 与 H3b 合为一个）、可单独关闭，基于上游 `master` 的 `8c2c4c39c5`（已过 b12361）。测试设备：MacBook Pro（Mac17,6），Apple M5 Max，40 核 GPU，128 GB，macOS 27.2。详见[完整报告](metal-m5.md)。
+本项目优化 llama.cpp 的 Metal 后端在 Apple M5 上的性能，目标是让各种模型（稠密、MoE、不同注意力结构）和量化格式都基本达到硬件上限，范围包括预填充、解码、投机解码、并发、短提示、启动和多轮对话缓存。22 个代码提交，每项改动一个提交（H3、H5 与 H3b 合为一个）、可单独关闭，基于上游 `master` 的 `32bdc3a89e`（已过 b12377）。测试设备：MacBook Pro（Mac17,6），Apple M5 Max，40 核 GPU，128 GB，macOS 27.2。详见[完整报告](metal-m5.md)。
 
 全部改动开启，与上游、oMLX 对比（满功率，服务器端到端；oMLX 开启 INT8 预填充，两边都关 KV 量化；oMLX 的 MTP 在解码列关闭、投机解码列开启）：
 
@@ -146,4 +146,4 @@ MoE 预填充仍比 oMLX 慢 3-9%（按专家分块的 mat-mat 仍明显慢于�
 
 ## 代码与 AI 使用说明
 
-代码在 `LXD-8/llama.cpp` 的 `metal-m5` 分支，基于上游 `master` 的 `8c2c4c39c5`（已过 b12361），每项改动一个提交（H3、H5 与 H3b 合为一个）。最近一次 rebase（8c2c4c39c5，21 个上游提交，已过 b12361）逐个提交核对过：没有上游改动重复或替代这些优化，也没有删除任何优化；新提交没有 Metal 改动（上游对 llama / ggml 的裁剪与 1.0.0 版本号提升删除或重编号的代码，本分支都没有涉及）。项目目标、测试方法和取舍由我决定；调研、编写代码、测试和撰写文档时使用了 AI 工具，产出经过我人工检查。中文为原文，英文版由 AI 翻译。
+代码在 `LXD-8/llama.cpp` 的 `metal-m5` 分支，基于上游 `master` 的 `32bdc3a89e`（已过 b12377），每项改动一个提交（H3、H5 与 H3b 合为一个）。最近一次 rebase（32bdc3a89e，14 个上游提交，已过 b12377）逐个提交核对过：没有上游改动重复或替代这些优化，也没有删除任何优化；新提交没有与本分支重叠的 Metal 改动（唯一的 Metal 改动是 `mul_vec_q_n_f32_impl` 中目标偏移量的 64 位转换，本分支没有修改这个内核）。项目目标、测试方法和取舍由我决定；调研、编写代码、测试和撰写文档时使用了 AI 工具，产出经过我人工检查。中文为原文，英文版由 AI 翻译。

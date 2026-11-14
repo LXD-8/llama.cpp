@@ -2,7 +2,7 @@
 
 [English](#llamacpp-metal-optimizations-for-apple-m5-nax-for-every-model-and-weight-format) | [中文](#apple-m5nax上的-llamacpp-metal-优化面向各种模型与量化格式)
 
-This project optimizes the Metal backend of llama.cpp on Apple M5, with the goal that every kind of model (dense, MoE, different attention structures) and every weight format runs close to the hardware limit of the machine. It covers prompt processing (prefill), decode, speculative decoding (MTP / DFlash), concurrency, short prompts, start-up and the multi-turn conversation cache. All changes are based on upstream `master` at `8c2c4c39c5` (after b12361): 22 code commits, one per change (H3, H5 and H3b are one commit), each can be switched off on its own.
+This project optimizes the Metal backend of llama.cpp on Apple M5, with the goal that every kind of model (dense, MoE, different attention structures) and every weight format runs close to the hardware limit of the machine. It covers prompt processing (prefill), decode, speculative decoding (MTP / DFlash), concurrency, short prompts, start-up and the multi-turn conversation cache. All changes are based on upstream `master` at `32bdc3a89e` (after b12377): 22 code commits, one per change (H3, H5 and H3b are one commit), each can be switched off on its own.
 
 The table compares all changes on with upstream and oMLX (M5 Max, full power, server end to end, streaming client, temperature 0; oMLX with its INT8 prefill on, KV quantization off on both sides):
 
@@ -220,7 +220,7 @@ pp16 / pp24 are steps of the size of a speculative verify or a short prompt. Dec
 - **MoE thresholds on real routing.** Synthetic MoE weights use uniform random routing, which spreads the entries evenly over the experts; real routing does not. The format coverage of M1 / M2 comes from the synthetic sweeps, but their thresholds are confirmed on real models: on the Qwen expert shapes M1 looks slower with uniform routing at 16-24 tokens, while on both Qwen MoE models it is faster (section 6.2).
 - **Accuracy gate.** For every model the KL divergence to the full upstream logits is measured (paired per token, far more sensitive than perplexity), with the difference between upstream's own `-fa on` and `-fa off` as the reference for an ordinary numerical difference; a lossy change is either brought close to that reference or its cost is stated and it can be switched off on its own (section 9).
 - **Fixed prompts.** Speculative decoding speed depends on how many drafts the generated text accepts; end-to-end comparisons of single changes use fixed prompts and compare times only after checking that the output text is identical.
-- **Upstream check.** Earlier rounds were rebuilt and re-measured on upstream `master`; this document is based on `8c2c4c39c5` (after b12361). Sections 3.1, 3.2 and 6.1-6.5 were measured on `67107ac34f`, section 3.3 and the M2 threshold data on `18ab62a8ec`; no upstream commit since those measurements changes a kernel measured here (the Metal changes in between are a GROUP_NORM fix, a Top-K determinism change, an out-of-bounds guard in the vector FA path, a TRI select fix, an out-of-bounds guard in the SOLVE_TRI kernel, and the MUL_MAT src1 precision gating, which only adds a support check and leaves the kernels unchanged).
+- **Upstream check.** Earlier rounds were rebuilt and re-measured on upstream `master`; this document is based on `32bdc3a89e` (after b12377). Sections 3.1, 3.2 and 6.1-6.5 were measured on `67107ac34f`, section 3.3 and the M2 threshold data on `18ab62a8ec`; no upstream commit since those measurements changes a kernel measured here (the Metal changes in between are a GROUP_NORM fix, a Top-K determinism change, an out-of-bounds guard in the vector FA path, a TRI select fix, an out-of-bounds guard in the SOLVE_TRI kernel, and the MUL_MAT src1 precision gating, which only adds a support check and leaves the kernels unchanged).
 
 **Rebase check (b12257).** The branch was rebased from b12229 to `17701e48d7` (b12257, 28 upstream commits) and checked commit by commit: none of the upstream changes duplicates or replaces one of the 22 changes, and none makes one unnecessary, so no change was removed. The 28 commits contain no Metal change; the only overlap is in the Web UI settings lists (both sides add keys/entries) and `tests/test-backend-ops.cpp` (both sides add cases), where the merge keeps both. The benchmark numbers below were not re-run for this rebase.
 
@@ -229,6 +229,8 @@ pp16 / pp24 are steps of the size of a speculative verify or a short prompt. Dec
 **Rebase check (0fb8f15770).** The branch was rebased from `b8abe41a50` to `0fb8f15770` (44 upstream commits, past b12318) and checked commit by commit: none of the upstream changes duplicates or replaces one of the 22 changes, and none makes one unnecessary, so no change was removed. The only Metal change is an out-of-bounds guard in the SOLVE_TRI kernel (#32103), which touches no kernel measured here. Upstream also removed the non-fused Gated Delta Net graph, which leaves the fused `GATED_DELTA_NET` op - the one this branch's kernel optimizes - as the only path. The remaining conflicts are in the Web UI settings (upstream removed the JS sandbox key while this branch adds the thinking-cache key, so the removed key is dropped and the new one kept) and in `tests/test-backend-ops.cpp` (upstream renamed the MUL_MAT fusion test cases; both sides add cases, so the rename is kept and both sets of cases remain). The benchmark numbers below were not re-run for this rebase.
 
 **Rebase check (8c2c4c39c5).** The branch was rebased from `0fb8f15770` to `8c2c4c39c5` (21 upstream commits, past b12361) and checked commit by commit: none of the upstream changes duplicates or replaces one of the 22 changes, and none makes one unnecessary, so no change was removed. The new commits contain no Metal change: the llama and ggml prunes (deprecated API, `GGML_OP_ADD1` / `DIAG_MASK_*`) remove code this branch does not touch, and the 1.0.0 bump only changes the reported version string. The merged `moe-cache` move and the server / grammar / CUDA / Vulkan / Hexagon / examples changes do not overlap. No source conflict occurred; only the base version in this document needed to be updated. The benchmark numbers below were not re-run for this rebase.
+
+**Rebase check (b12377).** The branch was rebased from `8c2c4c39c5` to `32bdc3a89e` (14 upstream commits, past b12377) and checked commit by commit: none of the upstream changes duplicates or replaces one of the 22 changes, and none makes one unnecessary, so no change was removed. The only Metal change is a 64-bit cast for the destination offset in `mul_vec_q_n_f32_impl` (#32221); this branch does not modify that kernel, and its own new mat-vec kernels already index the destination with 64-bit arithmetic. The BF16 RMS_NORM support (#32135) only narrows the Metal support check for that op and leaves every kernel unchanged. The remaining commits are Hexagon, CUDA, Vulkan, CI, requirements, the chat-template cleanup, a speculative-decoding warning and a Web UI `.npmrc` change, none of which overlaps. The last commit is a move-only refactor of the DFlash / DSpark speculative decoding (`common/` and `src/models/`), with no kernel change and no file this branch modifies. No source conflict occurred; only the base version in this document needed to be updated. The benchmark numbers below were not re-run for this rebase.
 
 ## 5. Candidates found by research
 
@@ -542,7 +544,7 @@ build/bin/llama-server -m gemma-4-26B-A4B-it-Q4_0.gguf -fa on -np 4 -kvu --spec-
 
 ## About the code
 
-This document describes every change but does not explain the source line by line; the code is on the `metal-m5` branch of `LXD-8/llama.cpp`, based on upstream `master` at `8c2c4c39c5` (after b12361), one commit per change (H3, H5 and H3b are one commit), each of which can be switched off on its own. If you are considering adopting any of these optimizations, I am happy to submit a PR or to provide the code in any other form that suits you. English is not my native language; for a long text like this one, the Chinese version is the original and AI translated it into English.
+This document describes every change but does not explain the source line by line; the code is on the `metal-m5` branch of `LXD-8/llama.cpp`, based on upstream `master` at `32bdc3a89e` (after b12377), one commit per change (H3, H5 and H3b are one commit), each of which can be switched off on its own. If you are considering adopting any of these optimizations, I am happy to submit a PR or to provide the code in any other form that suits you. English is not my native language; for a long text like this one, the Chinese version is the original and AI translated it into English.
 
 ---
 
@@ -552,7 +554,7 @@ This document describes every change but does not explain the source line by lin
 
 中文为原文，英文版由 AI 基于中文版翻译。/ The Chinese version is the original; the English version is an AI translation of it.
 
-本项目优化 llama.cpp 的 Metal 后端在 Apple M5 上的性能，目标是让各种模型（稠密、MoE、不同注意力结构）和各种量化格式都基本达到这台机器的硬件上限。范围包括提示处理（预填充）、解码、投机解码（MTP / DFlash）、并发、短提示、启动和多轮对话缓存。全部改动基于上游 `master` 的 `8c2c4c39c5`（已过 b12361）：22 个代码提交，每项改动一个提交（H3、H5 与 H3b 合为一个提交），每项都可以单独关闭。
+本项目优化 llama.cpp 的 Metal 后端在 Apple M5 上的性能，目标是让各种模型（稠密、MoE、不同注意力结构）和各种量化格式都基本达到这台机器的硬件上限。范围包括提示处理（预填充）、解码、投机解码（MTP / DFlash）、并发、短提示、启动和多轮对话缓存。全部改动基于上游 `master` 的 `32bdc3a89e`（已过 b12377）：22 个代码提交，每项改动一个提交（H3、H5 与 H3b 合为一个提交），每项都可以单独关闭。
 
 下表是全部改动开启时、与上游和 oMLX 的对比（M5 Max，满功率，服务器端到端，流式客户端，temperature 0；oMLX 开启其 INT8 预填充，两边都关闭 KV 量化）：
 
@@ -770,7 +772,7 @@ pp16 / pp24 相当于一次投机解码验证或一段短提示的步长。解�
 - **MoE 门槛以真实路由为准。** 合成的 MoE 权重用均匀随机路由，条目平均分到各个专家；真实路由并不均匀。M1 / M2 覆盖哪些格式来自合成扫描，门槛则在真实模型上确认：在 Qwen 的专家形状上，均匀路由下 M1 在 16-24 token 时看起来更慢，而在两个 Qwen MoE 模型上它都更快（第 6.2 节）。
 - **精度把关。** 每个模型都以上游的完整 logits 为基准测 KL 散度（逐 token 配对比较，比困惑度灵敏得多），并以上游自身 `-fa on` 与 `-fa off` 之间的差作为"正常数值差异"的参照；有损的改动要么改进到参照量级附近，要么写明代价并可单独关闭（见第 9 节）。
 - **固定提示。** 投机解码的速度取决于生成文本接受了多少草稿；对单项改动的端到端对比使用固定提示，并确认输出文本相同后再比较耗时。
-- **上游核查。** 此前各轮都在上游 `master` 上重建并重新测量；本文基于 `8c2c4c39c5`（已过 b12361）。第 3.1、3.2 节与第 6.1-6.5 节测于 `67107ac34f`，第 3.3 节与 M2 门槛的数据测于 `18ab62a8ec`；那些测量之后没有任何上游提交改变这里测过的内核（其间 Metal 改动只有 GROUP_NORM 的修复、Top-K 的确定性调整、vector FA 路径的越界保护、TRI 的 select 修复、SOLVE_TRI 内核的越界保护，以及 MUL_MAT 的 src1 精度门控；后者只增加支持性检查，不改内核）。
+- **上游核查。** 此前各轮都在上游 `master` 上重建并重新测量；本文基于 `32bdc3a89e`（已过 b12377）。第 3.1、3.2 节与第 6.1-6.5 节测于 `67107ac34f`，第 3.3 节与 M2 门槛的数据测于 `18ab62a8ec`；那些测量之后没有任何上游提交改变这里测过的内核（其间 Metal 改动只有 GROUP_NORM 的修复、Top-K 的确定性调整、vector FA 路径的越界保护、TRI 的 select 修复、SOLVE_TRI 内核的越界保护，以及 MUL_MAT 的 src1 精度门控；后者只增加支持性检查，不改内核）。
 
 **Rebase 核查（b12257）。** 分支从 b12229 rebase 到 `17701e48d7`（b12257，28 个上游提交），并逐个提交核对：没有上游改动重复或替代这 22 项改动，也没有让任何一项变得不必要，因此没有删除改动。这 28 个提交没有 Metal 改动；唯一的交集是 Web UI 的设置键/条目（双方都是新增）与 `tests/test-backend-ops.cpp`（双方都是新增用例），合并时两边都保留。下面的基准数字没有为这次 rebase 重新测量。
 
@@ -779,6 +781,8 @@ pp16 / pp24 相当于一次投机解码验证或一段短提示的步长。解�
 **Rebase 核查（0fb8f15770）。** 分支从 `b8abe41a50` rebase 到 `0fb8f15770`（44 个上游提交，已过 b12318），并逐个提交核对：没有上游改动重复或替代这 22 项改动，也没有让任何一项变得不必要，因此没有删除改动。唯一的 Metal 改动是 SOLVE_TRI 内核的越界保护（#32103），不涉及这里测过的任何内核。上游还删除了非融合的 Gated Delta Net 图，只剩下融合的 `GATED_DELTA_NET` 算子，也就是本分支内核优化的那条路径。其余冲突在 Web UI 设置（上游删除了 JS sandbox 设置键，本分支新增思考缓存键，因此丢弃被删除的键、保留新键）与 `tests/test-backend-ops.cpp`（上游重命名了 MUL_MAT 融合测试用例，双方都新增用例，因此保留重命名并保留双方用例）。下面的基准数字没有为这次 rebase 重新测量。
 
 **Rebase 核查（8c2c4c39c5）。** 分支从 `0fb8f15770` rebase 到 `8c2c4c39c5`（21 个上游提交，已过 b12361），并逐个提交核对：没有上游改动重复或替代这 22 项改动，也没有让任何一项变得不必要，因此没有删除改动。新提交没有 Metal 改动：上游对 llama 与 ggml 的裁剪（废弃 API、`GGML_OP_ADD1` / `DIAG_MASK_*`）删除的代码本分支都没有涉及，1.0.0 的版本号提升只影响报告的版本字符串。合入的 `moe-cache` 搬移以及 server / grammar / CUDA / Vulkan / Hexagon / examples 改动与本分支没有重叠。本次没有源码冲突，只需同步本文档中的版本基座。下面的基准数字没有为这次 rebase 重新测量。
+
+**Rebase 核查（b12377）。** 分支从 `8c2c4c39c5` rebase 到 `32bdc3a89e`（14 个上游提交，已过 b12377），并逐个提交核对：没有上游改动重复或替代这 22 项改动，也没有让任何一项变得不必要，因此没有删除改动。唯一的 Metal 改动是 `mul_vec_q_n_f32_impl` 中目标偏移量的 64 位转换（#32221）；本分支没有修改这个内核，本分支新增的 mat-vec 内核本来就用 64 位算术索引目标。BF16 RMS_NORM 支持（#32135）只是收紧了该算子的 Metal 支持检查，没有改任何内核。其余提交是 Hexagon、CUDA、Vulkan、CI、依赖版本、chat 模板清理、投机解码告警和 Web UI 的 `.npmrc`，都没有重叠。最后一个提交是对 DFlash / DSpark 投机解码的搬移式重构（`common/` 与 `src/models/`），不改内核，也不涉及本分支修改的文件。本次没有源码冲突，只需同步本文档中的版本基座。下面的基准数字没有为这次 rebase 重新测量。
 
 ## 5. 调研到的候选方案
 
@@ -1092,4 +1096,4 @@ build/bin/llama-server -m gemma-4-26B-A4B-it-Q4_0.gguf -fa on -np 4 -kvu --spec-
 
 ## 关于代码
 
-本文档描述每项改动，但不逐行解释源码；代码在 `LXD-8/llama.cpp` 的 `metal-m5` 分支，基于上游 `master` 的 `8c2c4c39c5`（已过 b12361），每项改动一个提交（H3、H5 与 H3b 合为一个），各自可以单独关闭。如果你考虑采用其中的某项优化，我很乐意提交 PR 或以你方便的其他形式提供代码。英语不是我的母语，像本文这样的长文，我以中文为原文，再由 AI 翻译成英文。
+本文档描述每项改动，但不逐行解释源码；代码在 `LXD-8/llama.cpp` 的 `metal-m5` 分支，基于上游 `master` 的 `32bdc3a89e`（已过 b12377），每项改动一个提交（H3、H5 与 H3b 合为一个），各自可以单独关闭。如果你考虑采用其中的某项优化，我很乐意提交 PR 或以你方便的其他形式提供代码。英语不是我的母语，像本文这样的长文，我以中文为原文，再由 AI 翻译成英文。
