@@ -2,7 +2,7 @@
 
 [English](#llamacpp-metal-optimizations-for-apple-m5-nax-short-version) | [中文](#apple-m5nax上的-llamacpp-metal-优化简略版)
 
-This project optimizes the Metal backend of llama.cpp on Apple M5, with the goal that every kind of model (dense, MoE, different attention structures) and weight format runs close to the hardware limit, covering prefill, decode, speculative decoding, concurrency, short prompts, start-up and the multi-turn conversation cache. 22 code commits on upstream `master` at `98d67c8d53` (after b12512), one commit per change (H3, H5 and H3b are one commit), each can be switched off on its own. Test machine: MacBook Pro (Mac17,6), Apple M5 Max, 40-core GPU, 128 GB, macOS 27.2. See the [full report](metal-m5.md).
+This project optimizes the Metal backend of llama.cpp on Apple M5, with the goal that every kind of model (dense, MoE, different attention structures) and weight format runs close to the hardware limit, covering prefill, decode, speculative decoding, concurrency, short prompts, start-up and the multi-turn conversation cache. 22 code commits on upstream `master` at `9d6f04fa99` (after b12561), one commit per change (H3, H5 and H3b are one commit), each can be switched off on its own. Test machine: MacBook Pro (Mac17,6), Apple M5 Max, 40-core GPU, 128 GB, macOS 27.2. See the [full report](metal-m5.md).
 
 All changes on, compared with upstream and oMLX (full power, server end to end; oMLX with INT8 prefill on, KV quantization off on both sides; oMLX MTP is off for the decode column and on for the speculative column):
 
@@ -70,7 +70,7 @@ MoE prefill is still 3-9% behind oMLX (the per-expert mat-mat is still clearly s
 
 ## Code and use of AI
 
-The code is on the `metal-m5` branch of `LXD-8/llama.cpp`, based on upstream `master` at `98d67c8d53` (after b12512), one commit per change (H3, H5 and H3b are one commit). The latest rebase (98d67c8d53, 71 upstream commits, past b12512) was checked commit by commit: no upstream change duplicates or replaces these optimizations, and no optimization was removed; only the new CONV_2D Metal kernel and one `GGML_OP_DIAG` support check touch the Metal backend, and the shared `test-backend-ops` case list gains cases on both sides without duplicates (the CUDA / SYCL / Vulkan / OpenCL work, the server slot scheduler, the hybrid-cache fix, the jinja / chat-template work and the new model backends do not overlap). The Web UI moved to `ui/apps/chat` (#32032); S1 went with it unchanged in its new path. The goals, test methodology and decisions are my own; AI tools were used for research, writing code, testing and writing the documents, and their output was reviewed by me. The Chinese version is the original; the English version was translated by AI.
+The code is on the `metal-m5` branch of `LXD-8/llama.cpp`, based on upstream `master` at `9d6f04fa99` (after b12561), one commit per change (H3, H5 and H3b are one commit). The latest rebase (9d6f04fa99, 54 upstream commits, past b12561) was checked commit by commit: no upstream change duplicates or replaces these optimizations, and no optimization was removed; only the tensor-API CONV_2D kernel with split-K (#32542) and an `NSMakeRange` fix in the buffer clear path (#32602) touch the Metal backend, and the shared `test-backend-ops` case list gains cases on both sides without duplicates (the CUDA / SYCL / Vulkan / OpenCL / WebGPU work, the graph-node budget, the recurrent-state NaN fix and the new model backends do not overlap). The new UI reasoning-effort picker (#32632) does not change the thinking-off path, so S1 is unchanged. The installed engine now pins the b12375 build that Llama.app 0.48.0 expects and embeds its prebuilt UI. The goals, test methodology and decisions are my own; AI tools were used for research, writing code, testing and writing the documents, and their output was reviewed by me. The Chinese version is the original; the English version was translated by AI.
 
 ---
 
@@ -78,7 +78,7 @@ The code is on the `metal-m5` branch of `LXD-8/llama.cpp`, based on upstream `ma
 
 [English](#llamacpp-metal-optimizations-for-apple-m5-nax-short-version) | [中文](#apple-m5nax上的-llamacpp-metal-优化简略版)
 
-本项目优化 llama.cpp 的 Metal 后端在 Apple M5 上的性能，目标是让各种模型（稠密、MoE、不同注意力结构）和量化格式都基本达到硬件上限，范围包括预填充、解码、投机解码、并发、短提示、启动和多轮对话缓存。22 个代码提交，每项改动一个提交（H3、H5 与 H3b 合为一个）、可单独关闭，基于上游 `master` 的 `98d67c8d53`（已过 b12512）。测试设备：MacBook Pro（Mac17,6），Apple M5 Max，40 核 GPU，128 GB，macOS 27.2。详见[完整报告](metal-m5.md)。
+本项目优化 llama.cpp 的 Metal 后端在 Apple M5 上的性能，目标是让各种模型（稠密、MoE、不同注意力结构）和量化格式都基本达到硬件上限，范围包括预填充、解码、投机解码、并发、短提示、启动和多轮对话缓存。22 个代码提交，每项改动一个提交（H3、H5 与 H3b 合为一个）、可单独关闭，基于上游 `master` 的 `9d6f04fa99`（已过 b12561）。测试设备：MacBook Pro（Mac17,6），Apple M5 Max，40 核 GPU，128 GB，macOS 27.2。详见[完整报告](metal-m5.md)。
 
 全部改动开启，与上游、oMLX 对比（满功率，服务器端到端；oMLX 开启 INT8 预填充，两边都关 KV 量化；oMLX 的 MTP 在解码列关闭、投机解码列开启）：
 
@@ -146,4 +146,4 @@ MoE 预填充仍比 oMLX 慢 3-9%（按专家分块的 mat-mat 仍明显慢于�
 
 ## 代码与 AI 使用说明
 
-代码在 `LXD-8/llama.cpp` 的 `metal-m5` 分支，基于上游 `master` 的 `98d67c8d53`（已过 b12512），每项改动一个提交（H3、H5 与 H3b 合为一个）。最近一次 rebase（98d67c8d53，71 个上游提交，已过 b12512）逐个提交核对过：没有上游改动重复或替代这些优化，也没有删除任何优化；这段范围里只有新增的 CONV_2D Metal 内核和一处 `GGML_OP_DIAG` 支持性检查碰到 Metal 后端，唯一被双方修改的 `test-backend-ops` 用例列表两边都是新增用例、没有重复（CUDA / SYCL / Vulkan / OpenCL 的后端工作、server 的 slot 调度、hybrid 缓存修复、jinja / 聊天模板改动与新的模型后端都不重叠）。Web UI 迁移到了 `ui/apps/chat`（#32032），S1 随之迁移，除路径外没有变化。项目目标、测试方法和取舍由我决定；调研、编写代码、测试和撰写文档时使用了 AI 工具，产出经过我人工检查。中文为原文，英文版由 AI 翻译。
+代码在 `LXD-8/llama.cpp` 的 `metal-m5` 分支，基于上游 `master` 的 `9d6f04fa99`（已过 b12561），每项改动一个提交（H3、H5 与 H3b 合为一个）。最近一次 rebase（9d6f04fa99，54 个上游提交，已过 b12561）逐个提交核对过：没有上游改动重复或替代这些优化，也没有删除任何优化；这段范围里只有 tensor API 的 CONV_2D 内核及其 split-K（#32542）和缓冲区清零路径里的一处 `NSMakeRange` 修复（#32602）碰到 Metal 后端，唯一被双方修改的 `test-backend-ops` 用例列表两边都是新增用例、没有重复（CUDA / SYCL / Vulkan / OpenCL / WebGPU 的后端工作、graph 节点预算、递推状态的 NaN 修复与新的模型后端都不重叠）。新的 UI 推理强度选择器（#32632）没有改动关闭思考的路径，S1 保持不变。安装的引擎改为固定为 Llama.app 0.48.0 期望的 b12375 构建，并内嵌其预构建 UI。项目目标、测试方法和取舍由我决定；调研、编写代码、测试和撰写文档时使用了 AI 工具，产出经过我人工检查。中文为原文，英文版由 AI 翻译。
