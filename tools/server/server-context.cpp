@@ -5188,6 +5188,9 @@ server_context_meta server_context::get_meta() const {
         }
     }
 
+    json chat_template_caps = common_chat_templates_get_caps(impl->chat_params.tmpls.get());
+    chat_template_caps["supports_reasoning_budget"] = common_chat_templates_support_reasoning_budget(impl->chat_params.tmpls.get());
+
     return server_context_meta {
         /* build_info              */ std::string(llama_build_info()),
         /* model_name              */ impl->model_name,
@@ -5208,7 +5211,7 @@ server_context_meta server_context::get_meta() const {
         /* pooling_type            */ llama_pooling_type(impl->ctx_tgt),
 
         /* chat_params             */ impl->chat_params,
-        /* chat_template_caps      */ common_chat_templates_get_caps(impl->chat_params.tmpls.get()),
+        /* chat_template_caps      */ chat_template_caps,
 
         /* bos_token_str           */ bos_token_str,
         /* eos_token_str           */ eos_token_str,

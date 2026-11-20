@@ -349,6 +349,29 @@ bool common_chat_templates_support_enable_thinking(const common_chat_templates *
     return params.supports_thinking;
 }
 
+bool common_chat_templates_support_reasoning_budget(const common_chat_templates * chat_templates) {
+    if (chat_templates == nullptr) {
+        return false;
+    }
+
+    common_chat_templates_inputs inputs;
+    inputs.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+    common_chat_msg msg;
+    msg.role    = "user";
+    msg.content = "test";
+    inputs.messages = { msg };
+    inputs.enable_thinking = true;
+    inputs.add_generation_prompt = true;
+    inputs.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+
+    try {
+        const auto params = common_chat_templates_apply(chat_templates, inputs);
+        return !params.thinking_end_tags.empty();
+    } catch (const std::exception &) {
+        return false;
+    }
+}
+
 std::vector<common_chat_msg> common_chat_msgs_parse_oaicompat(const json & messages) {
     std::vector<common_chat_msg> msgs;
 

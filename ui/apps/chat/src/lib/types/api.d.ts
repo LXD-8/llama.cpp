@@ -297,6 +297,8 @@ export interface ApiLlamaCppServerProps {
 	chat_template_caps?: {
 		/** reasoning_effort values the chat template renders distinctly, from lowest to highest */
 		reasoning_effort_levels?: string[];
+		/** true when a zero thinking budget ends thinking without changing the rendered prompt */
+		supports_reasoning_budget?: boolean;
 	};
 	bos_token: string;
 	eos_token: string;

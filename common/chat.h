@@ -455,6 +455,8 @@ common_reasoning_format common_reasoning_format_from_name(const std::string & fo
 common_chat_tool_choice common_chat_tool_choice_parse_oaicompat(const std::string & tool_choice);
 
 bool common_chat_templates_support_enable_thinking(const common_chat_templates * chat_templates);
+// true when the template exposes thinking end tags, so a zero reasoning budget can end thinking without changing the prompt
+bool common_chat_templates_support_reasoning_budget(const common_chat_templates * chat_templates);
 
 // Parses a JSON array of messages in OpenAI's chat completion API format.
 std::vector<common_chat_msg> common_chat_msgs_parse_oaicompat(const common_json & messages);

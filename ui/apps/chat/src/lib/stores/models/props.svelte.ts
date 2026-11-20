@@ -117,6 +117,27 @@ export class ModelPropsManager {
 		return detectThinkingSupport(props?.chat_template ?? '');
 	}
 
+	/**
+	 * Check if a specific model can end thinking with a zero budget without
+	 * changing the rendered prompt: the template must expose thinking end tags.
+	 * Otherwise the chat template switch is the only way to turn thinking off.
+	 */
+	checkModelSupportsReasoningBudget(modelId: string): boolean {
+		if (!serverStore.isRouterMode) {
+			return serverStore.props?.chat_template_caps?.supports_reasoning_budget ?? false;
+		}
+
+		if (!modelId) return false;
+
+		if (!this.cache.get(modelId)) {
+			this.fetchModelProps(modelId);
+		}
+
+		const props = this.getModelProps(modelId);
+
+		return props?.chat_template_caps?.supports_reasoning_budget ?? false;
+	}
+
 	constructor(private host: ModelPropsHost) {}
 
 	/** Fetch modalities for all loaded models from /props endpoint. */

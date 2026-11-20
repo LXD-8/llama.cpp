@@ -682,7 +682,7 @@ export const SETTINGS_REGISTRY: SettingsSectionEntry[] = [
 			},
 			{
 				defaultValue: true,
-				help: 'Turn thinking off with a zero thinking budget instead of the chat template switch. Templates that put reasoning instructions at the top of the prompt (e.g. Qwen3.8) otherwise change the whole prompt, and the server re-processes the entire conversation each time thinking is switched on or off.',
+				help: 'Turn thinking off with a zero thinking budget instead of the chat template switch. Templates that put reasoning instructions at the top of the prompt (e.g. Qwen3.8) otherwise change the whole prompt, and the server re-processes the entire conversation each time thinking is switched on or off. When the template has no thinking end tag, the chat template switch is used instead and the conversation may be processed again.',
 				key: SETTINGS_KEYS.KEEP_CACHE_THINKING_OFF,
 				label: 'Keep conversation cache when thinking is off',
 				type: SettingsFieldType.CHECKBOX
